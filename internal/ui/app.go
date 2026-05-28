@@ -25,8 +25,7 @@ var (
 	headerStyle = lipgloss.NewStyle().
 			Bold(true).
 			Foreground(lipgloss.Color("15")).
-			Background(lipgloss.Color("237")).
-			Padding(0, 1)
+			Background(lipgloss.Color("237"))
 
 	titleStyle = lipgloss.NewStyle().
 			Bold(true).
@@ -42,20 +41,30 @@ var (
 
 // ── 列定义 ────────────────────────────────────────────────────────────────────
 
-var cols = []struct {
+type tableAlign int
+
+const (
+	alignLeft tableAlign = iota
+	alignRight
+)
+
+type tableColumn struct {
 	header string
 	width  int
-}{
-	{"代码", 10},
-	{"名称", 10},
-	{"最新价", 9},
-	{"涨跌额", 9},
-	{"涨跌幅", 9},
-	{"今开", 9},
-	{"最高", 9},
-	{"最低", 9},
-	{"成交量", 11},
-	{"成交额", 11},
+	align  tableAlign
+}
+
+var cols = []tableColumn{
+	{"代码", 8, alignLeft},
+	{"名称", 13, alignLeft},
+	{"最新价", 9, alignRight},
+	{"涨跌额", 9, alignRight},
+	{"涨跌幅", 9, alignRight},
+	{"今开", 9, alignRight},
+	{"最高", 9, alignRight},
+	{"最低", 9, alignRight},
+	{"成交量", 11, alignRight},
+	{"成交额", 11, alignRight},
 }
 
 // ── 消息 ─────────────────────────────────────────────────────────────────────
@@ -311,12 +320,17 @@ func (m Model) renderChart() string {
 
 	series := [][]float64{redS, greenS}
 	colors := []asciigraph.AnsiColor{
-		asciigraph.Red,   // 高于昨收
-		asciigraph.Green, // 低于等于昨收
+		asciigraph.AnsiColor(211), // Mocha red: 高于昨收
+		asciigraph.AnsiColor(151), // Mocha green: 低于等于昨收
+	}
+	chars := []asciigraph.CharSet{
+		asciigraph.DefaultCharSet,
+		asciigraph.DefaultCharSet,
 	}
 	if showBaseline {
 		series = append(series, closeS)
-		colors = append(colors, asciigraph.Magenta) // 昨收参考线
+		colors = append(colors, asciigraph.AnsiColor(183)) // Mocha mauve: 昨收参考线
+		chars = append(chars, asciigraph.CreateCharSet("┈"))
 	}
 
 	chartStr := asciigraph.PlotMany(series,
@@ -326,6 +340,9 @@ func (m Model) renderChart() string {
 		asciigraph.LowerBound(lower),
 		asciigraph.UpperBound(upper),
 		asciigraph.SeriesColors(colors...),
+		asciigraph.SeriesChars(chars...),
+		asciigraph.AxisColor(asciigraph.AnsiColor(60)),
+		asciigraph.LabelColor(asciigraph.AnsiColor(103)),
 	)
 	sb.WriteString(chartStr + "\n")
 
@@ -538,7 +555,7 @@ func renderTimeAxis(points []api.MinutePoint, chartW, yAxisW int) string {
 func renderHeader() string {
 	var parts []string
 	for _, c := range cols {
-		parts = append(parts, headerStyle.Width(c.width).Render(c.header))
+		parts = append(parts, headerStyle.Render(tableCell(c.header, c)))
 	}
 	return strings.Join(parts, " ")
 }
@@ -564,16 +581,16 @@ func renderRow(s api.Stock, selected bool) string {
 	fp := func(v float64) string { return fmt.Sprintf("%.*f", p, v) }
 
 	cells := []string{
-		padRight(s.Code, cols[0].width),
-		padRight(s.Name, cols[1].width),
-		priceStyle.Render(padLeft(fp(s.Price), cols[2].width)),
-		changeStyle.Render(padLeft(fmt.Sprintf("%s%.*f", sign, p, s.Change), cols[3].width)),
-		changeStyle.Render(padLeft(fmt.Sprintf("%s%.*f%%", sign, p, s.ChangePct), cols[4].width)),
-		padLeft(fp(s.Open), cols[5].width),
-		red.Render(padLeft(fp(s.High), cols[6].width)),
-		green.Render(padLeft(fp(s.Low), cols[7].width)),
-		dim.Render(padLeft(formatVolume(s.Volume), cols[8].width)),
-		dim.Render(padLeft(formatAmount(s.Amount), cols[9].width)),
+		tableCell(s.Code, cols[0]),
+		tableCell(s.Name, cols[1]),
+		priceStyle.Render(tableCell(fp(s.Price), cols[2])),
+		changeStyle.Render(tableCell(fmt.Sprintf("%s%.*f", sign, p, s.Change), cols[3])),
+		changeStyle.Render(tableCell(fmt.Sprintf("%s%.*f%%", sign, p, s.ChangePct), cols[4])),
+		tableCell(fp(s.Open), cols[5]),
+		red.Render(tableCell(fp(s.High), cols[6])),
+		green.Render(tableCell(fp(s.Low), cols[7])),
+		dim.Render(tableCell(formatVolume(s.Volume), cols[8])),
+		dim.Render(tableCell(formatAmount(s.Amount), cols[9])),
 	}
 
 	row := strings.Join(cells, " ")
@@ -592,6 +609,13 @@ func tableWidth() int {
 		}
 	}
 	return w
+}
+
+func tableCell(s string, c tableColumn) string {
+	if c.align == alignRight {
+		return padLeft(s, c.width)
+	}
+	return padRight(s, c.width)
 }
 
 // ── 命令 ─────────────────────────────────────────────────────────────────────

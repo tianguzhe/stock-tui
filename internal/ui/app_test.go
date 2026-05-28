@@ -155,6 +155,52 @@ func TestPadRightKeepsWideCharactersInsideWidth(t *testing.T) {
 	}
 }
 
+func TestTableHeaderAndRowsShareColumnWidth(t *testing.T) {
+	stock := api.Stock{
+		Code:      "sh600519",
+		Name:      "贵州茅台",
+		Price:     1275.96,
+		Change:    -2.34,
+		ChangePct: -0.18,
+		Open:      1278.00,
+		High:      1280.00,
+		Low:       1270.00,
+		Volume:    45890,
+		Amount:    589548,
+		Precision: 2,
+	}
+
+	header := renderHeader()
+	row := renderRow(stock, false)
+	if visWidth(header) != tableWidth() {
+		t.Fatalf("header width = %d, want %d", visWidth(header), tableWidth())
+	}
+	if visWidth(row) != tableWidth() {
+		t.Fatalf("row width = %d, want %d", visWidth(row), tableWidth())
+	}
+}
+
+func TestNameColumnShowsHongliETFName(t *testing.T) {
+	stock := api.Stock{
+		Code:      "sh515180",
+		Name:      "红利ETF易方达",
+		Price:     1.384,
+		Change:    -0.003,
+		ChangePct: -0.22,
+		Open:      1.386,
+		High:      1.394,
+		Low:       1.382,
+		Volume:    45890,
+		Amount:    589548,
+		Precision: 3,
+	}
+
+	row := stripANSI(renderRow(stock, false))
+	if !strings.Contains(row, "红利ETF易方达") {
+		t.Fatalf("row = %q, want full fund name", row)
+	}
+}
+
 func stripANSI(s string) string {
 	re := regexp.MustCompile(`\x1b\[[0-9;]*m`)
 	return re.ReplaceAllString(s, "")
