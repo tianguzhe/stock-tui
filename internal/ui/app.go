@@ -1,0 +1,739 @@
+package ui
+
+import (
+	"fmt"
+	"math"
+	"strings"
+	"time"
+
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
+	"github.com/guptarohit/asciigraph"
+	"stock-tui/internal/api"
+)
+
+// ── 样式 ──────────────────────────────────────────────────────────────────────
+
+var (
+	red    = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
+	green  = lipgloss.NewStyle().Foreground(lipgloss.Color("46"))
+	dim    = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
+	cyan   = lipgloss.NewStyle().Foreground(lipgloss.Color("51"))
+	white  = lipgloss.NewStyle().Foreground(lipgloss.Color("255"))
+	yellow = lipgloss.NewStyle().Foreground(lipgloss.Color("226"))
+
+	headerStyle = lipgloss.NewStyle().
+			Bold(true).
+			Foreground(lipgloss.Color("15")).
+			Background(lipgloss.Color("237")).
+			Padding(0, 1)
+
+	titleStyle = lipgloss.NewStyle().
+			Bold(true).
+			Foreground(lipgloss.Color("214"))
+
+	selectedStyle = lipgloss.NewStyle().
+			Background(lipgloss.Color("236"))
+
+	sectionStyle = lipgloss.NewStyle().
+			Bold(true).
+			Foreground(lipgloss.Color("39"))
+)
+
+// ── 列定义 ────────────────────────────────────────────────────────────────────
+
+var cols = []struct {
+	header string
+	width  int
+}{
+	{"代码", 10},
+	{"名称", 10},
+	{"最新价", 9},
+	{"涨跌额", 9},
+	{"涨跌幅", 9},
+	{"今开", 9},
+	{"最高", 9},
+	{"最低", 9},
+	{"成交量", 11},
+	{"成交额", 11},
+}
+
+// ── 消息 ─────────────────────────────────────────────────────────────────────
+
+type tickMsg time.Time
+type stocksMsg []api.Stock
+type stocksErrMsg struct{ err error }
+type minuteMsg struct {
+	code   string
+	result *api.MinuteResult
+}
+type minuteErrMsg struct{ err error }
+
+// ── Model ────────────────────────────────────────────────────────────────────
+
+type Model struct {
+	codes        []string
+	stocks       []api.Stock
+	selected     int
+	loading      bool
+	err          error
+	updated      time.Time
+	interval     time.Duration
+	autoRefresh  bool
+	width        int
+	height       int
+	minute       *api.MinuteResult
+	minuteCode   string
+	loadingChart bool
+	chartErr     error
+}
+
+func New(codes []string, interval time.Duration) Model {
+	return Model{
+		codes:       codes,
+		loading:     true,
+		interval:    interval,
+		autoRefresh: true,
+	}
+}
+
+func (m Model) Init() tea.Cmd {
+	return tea.Batch(fetchStocks(m.codes), tick(m.interval))
+}
+
+func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+
+	case tea.WindowSizeMsg:
+		m.width = msg.Width
+		m.height = msg.Height
+
+	case tickMsg:
+		// 自动刷新关闭时丢弃 tick，不再续期
+		if !m.autoRefresh {
+			return m, nil
+		}
+		m.loading = true
+		return m, tea.Batch(fetchStocks(m.codes), tick(m.interval))
+
+	case stocksMsg:
+		m.stocks = []api.Stock(msg)
+		m.loading = false
+		m.err = nil
+		m.updated = time.Now()
+		// 刷新选中股票的分时数据
+		if len(m.stocks) > 0 {
+			code := m.stocks[m.selected].Code
+			m.loadingChart = true
+			return m, fetchMinute(code)
+		}
+
+	case stocksErrMsg:
+		m.err = msg.err
+		m.loading = false
+
+	case minuteMsg:
+		// 只接受当前选中股票的结果，丢弃过期响应
+		selectedCode := ""
+		if len(m.stocks) > 0 && m.selected < len(m.stocks) {
+			selectedCode = m.stocks[m.selected].Code
+		}
+		if msg.code == selectedCode {
+			m.minute = msg.result
+			m.minuteCode = msg.code
+			m.loadingChart = false
+			m.chartErr = nil
+		}
+
+	case minuteErrMsg:
+		m.chartErr = msg.err
+		m.loadingChart = false
+
+	case tea.KeyMsg:
+		switch msg.String() {
+		case "q", "ctrl+c":
+			return m, tea.Quit
+		case "r":
+			m.autoRefresh = !m.autoRefresh
+			if m.autoRefresh {
+				// 开启时立即刷新并重启 tick 循环
+				m.loading = true
+				m.loadingChart = true
+				var chartCmd tea.Cmd
+				if len(m.stocks) > 0 {
+					chartCmd = fetchMinute(m.stocks[m.selected].Code)
+				}
+				return m, tea.Batch(fetchStocks(m.codes), chartCmd, tick(m.interval))
+			}
+		case "up", "k":
+			if m.selected > 0 {
+				m.selected--
+				m.minute = nil
+				m.loadingChart = true
+				return m, fetchMinute(m.stocks[m.selected].Code)
+			}
+		case "down", "j":
+			if m.selected < len(m.stocks)-1 {
+				m.selected++
+				m.minute = nil
+				m.loadingChart = true
+				return m, fetchMinute(m.stocks[m.selected].Code)
+			}
+		}
+	}
+
+	return m, nil
+}
+
+func (m Model) View() string {
+	if m.width == 0 {
+		return "正在加载..."
+	}
+
+	var sb strings.Builder
+
+	// ── 标题栏 ─────────────────────────────────────────────────────────────
+	var refreshTag string
+	if m.autoRefresh {
+		refreshTag = green.Render("[自动刷新:开]")
+	} else {
+		refreshTag = dim.Render("[自动刷新:关]")
+	}
+	status := refreshTag + " " + dim.Render("刷新中...")
+	if !m.loading && !m.updated.IsZero() {
+		status = refreshTag + " " + dim.Render("更新: "+m.updated.Format("15:04:05"))
+	}
+	title := titleStyle.Render("股票实时行情")
+	gap := m.width - visWidth(title) - visWidth(status) - 2
+	if gap < 0 {
+		gap = 0
+	}
+	sb.WriteString(title + strings.Repeat(" ", gap) + status + "\n")
+
+	if m.err != nil {
+		sb.WriteString(red.Render("  ✗ "+m.err.Error()) + "\n")
+	}
+	sb.WriteString("\n")
+
+	// ── 报价表格 ──────────────────────────────────────────────────────────
+	sb.WriteString(renderHeader() + "\n")
+	sb.WriteString(dim.Render(strings.Repeat("─", tableWidth())) + "\n")
+
+	if len(m.stocks) == 0 {
+		sb.WriteString(dim.Render("  正在加载...") + "\n")
+	} else {
+		for i, s := range m.stocks {
+			sb.WriteString(renderRow(s, i == m.selected) + "\n")
+		}
+	}
+
+	// ── 分时走势图 ────────────────────────────────────────────────────────
+	sb.WriteString("\n")
+	chartSection := m.renderChart()
+	sb.WriteString(chartSection)
+
+	// ── 帮助栏 ────────────────────────────────────────────────────────────
+	sb.WriteString("\n")
+	sb.WriteString(dim.Render("  ↑↓/jk 切换股票   r 自动刷新开/关   q 退出"))
+
+	return sb.String()
+}
+
+// ── 折线图渲染 ───────────────────────────────────────────────────────────────
+
+func (m Model) renderChart() string {
+	var sb strings.Builder
+
+	// 分隔标题
+	var chartTitle string
+	if len(m.stocks) > 0 && m.selected < len(m.stocks) {
+		s := m.stocks[m.selected]
+		chartTitle = fmt.Sprintf(" 分时走势  %s (%s) ", s.Name, s.Code)
+	} else {
+		chartTitle = " 分时走势 "
+	}
+	totalW := tableWidth()
+	leftW := (totalW - visWidth(chartTitle)) / 2
+	if leftW < 0 {
+		leftW = 0
+	}
+	divider := dim.Render(strings.Repeat("─", leftW)) +
+		sectionStyle.Render(chartTitle) +
+		dim.Render(strings.Repeat("─", max(0, totalW-leftW-visWidth(chartTitle))))
+	sb.WriteString(divider + "\n")
+
+	// 错误或加载状态
+	if m.loadingChart {
+		sb.WriteString(dim.Render("  正在加载分时数据...") + "\n")
+		return sb.String()
+	}
+	if m.chartErr != nil {
+		sb.WriteString(red.Render("  ✗ "+m.chartErr.Error()) + "\n")
+		return sb.String()
+	}
+	if m.minute == nil || len(m.minute.Points) == 0 {
+		sb.WriteString(dim.Render("  暂无分时数据（可能为非交易时间）") + "\n")
+		return sb.String()
+	}
+
+	points := m.minute.Points
+
+	s := m.stocks[m.selected]
+	prec := m.minute.Precision
+	if prec == 0 {
+		prec = s.Precision
+	}
+
+	baseline := m.minute.PClose
+	if baseline == 0 {
+		baseline = s.Close
+	}
+	if baseline == 0 && len(points) > 0 {
+		baseline = points[0].Price
+	}
+	lower, upper, showBaseline := minuteChartBounds(points, baseline, prec)
+	redS, greenS, closeS := splitMinuteSeries(points, baseline, showBaseline)
+
+	// 计算图表尺寸，Y 轴宽度按 asciigraph 实际标签宽度对齐。
+	yAxisW := chartYAxisWidth(lower, upper, prec)
+	chartW := m.width - yAxisW - 2
+	if chartW < 30 {
+		chartW = 30
+	}
+	fixedRows := 3 + 2 + len(m.stocks) + 3
+	chartH := m.height - fixedRows
+	if chartH < 6 {
+		chartH = 6
+	}
+	if chartH > 18 {
+		chartH = 18
+	}
+
+	series := [][]float64{redS, greenS}
+	colors := []asciigraph.AnsiColor{
+		asciigraph.Red,   // 高于昨收
+		asciigraph.Green, // 低于等于昨收
+	}
+	if showBaseline {
+		series = append(series, closeS)
+		colors = append(colors, asciigraph.Magenta) // 昨收参考线
+	}
+
+	chartStr := asciigraph.PlotMany(series,
+		asciigraph.Width(chartW),
+		asciigraph.Height(chartH),
+		asciigraph.Precision(uint(prec)),
+		asciigraph.LowerBound(lower),
+		asciigraph.UpperBound(upper),
+		asciigraph.SeriesColors(colors...),
+	)
+	sb.WriteString(chartStr + "\n")
+
+	// X 轴时间标签
+	sb.WriteString(renderTimeAxis(points, chartW, yAxisW) + "\n")
+	sb.WriteString(renderMinuteSummary(points, baseline, prec) + "\n")
+
+	return sb.String()
+}
+
+func splitMinuteSeries(points []api.MinutePoint, baseline float64, showBaseline bool) ([]float64, []float64, []float64) {
+	nan := math.NaN()
+	redS := make([]float64, len(points))
+	greenS := make([]float64, len(points))
+	closeS := make([]float64, len(points))
+
+	for i, p := range points {
+		above := p.Price > baseline
+		if above {
+			redS[i] = p.Price
+			greenS[i] = nan
+		} else {
+			greenS[i] = p.Price
+			redS[i] = nan
+		}
+		if showBaseline {
+			closeS[i] = baseline
+		} else {
+			closeS[i] = nan
+		}
+
+		if i > 0 {
+			prevAbove := points[i-1].Price > baseline
+			if prevAbove != above {
+				redS[i] = p.Price
+				greenS[i] = p.Price
+			}
+		}
+	}
+
+	return redS, greenS, closeS
+}
+
+func minuteChartBounds(points []api.MinutePoint, baseline float64, prec int) (float64, float64, bool) {
+	values := make([]float64, 0, len(points)+2)
+	for _, p := range points {
+		if p.Price > 0 {
+			values = append(values, p.Price)
+		}
+	}
+	if len(values) == 0 && baseline > 0 {
+		values = append(values, baseline)
+	}
+
+	low, high := minMax(values)
+	if low == 0 && high == 0 {
+		return 0, 1, false
+	}
+
+	span := high - low
+	tick := priceTick(prec)
+	if span <= 0 {
+		base := math.Abs(high)
+		if base < 1 {
+			base = 1
+		}
+		span = math.Max(base*0.0002, tick*4)
+	}
+	padding := span * 0.08
+	minPadding := math.Max(math.Abs(baseline)*0.0002, tick)
+	if padding < minPadding {
+		padding = minPadding
+	}
+
+	lower := low - padding
+	upper := high + padding
+
+	showBaseline := baseline >= lower && baseline <= upper
+	if !showBaseline && baseline > 0 {
+		focusedSpan := upper - lower
+		expandedLow := math.Min(lower, baseline)
+		expandedHigh := math.Max(upper, baseline)
+		expandedSpan := expandedHigh - expandedLow
+		if expandedSpan <= focusedSpan*2.2 {
+			extraPadding := math.Max(padding, focusedSpan*0.05)
+			lower = expandedLow - extraPadding
+			upper = expandedHigh + extraPadding
+			showBaseline = true
+		}
+	}
+
+	return lower, upper, showBaseline
+}
+
+func chartYAxisWidth(lower, upper float64, prec int) int {
+	maxLabelWidth := len(fmt.Sprintf("%.*f", prec, upper))
+	if w := len(fmt.Sprintf("%.*f", prec, lower)); w > maxLabelWidth {
+		maxLabelWidth = w
+	}
+	return maxLabelWidth + 3
+}
+
+func priceTick(prec int) float64 {
+	if prec <= 0 {
+		return 1
+	}
+	return math.Pow10(-prec)
+}
+
+func renderMinuteSummary(points []api.MinutePoint, baseline float64, prec int) string {
+	if len(points) == 0 {
+		return ""
+	}
+	last := points[len(points)-1]
+	low, high := minutePointRange(points)
+	change := last.Price - baseline
+	changePct := 0.0
+	if baseline != 0 {
+		changePct = change / baseline * 100
+	}
+	sign := "+"
+	if change < 0 {
+		sign = ""
+	}
+	style := red
+	if change < 0 {
+		style = green
+	}
+	fp := func(v float64) string { return fmt.Sprintf("%.*f", prec, v) }
+
+	parts := []string{
+		"最新 " + fp(last.Price),
+		fmt.Sprintf("较昨收 %s%.*f (%s%.*f%%)", sign, prec, change, sign, prec, changePct),
+		"分时高 " + fp(high),
+		"分时低 " + fp(low),
+		"时间 " + last.Time,
+	}
+	return "  " + style.Render(parts[0]+"  "+parts[1]) + dim.Render("  "+strings.Join(parts[2:], "  "))
+}
+
+func minutePointRange(points []api.MinutePoint) (float64, float64) {
+	if len(points) == 0 {
+		return 0, 0
+	}
+	low, high := points[0].Price, points[0].Price
+	for _, p := range points[1:] {
+		if p.Price < low {
+			low = p.Price
+		}
+		if p.Price > high {
+			high = p.Price
+		}
+	}
+	return low, high
+}
+
+// ── X 轴时间标签 ─────────────────────────────────────────────────────────────
+
+func renderTimeAxis(points []api.MinutePoint, chartW, yAxisW int) string {
+	n := len(points)
+	if n == 0 {
+		return ""
+	}
+	if chartW <= 0 {
+		chartW = 1
+	}
+	if n == 1 {
+		return strings.Repeat(" ", yAxisW) + dim.Render(points[0].Time)
+	}
+
+	// 从实际数据中均匀取时间标签，窄屏时自动减少，避免重叠。
+	labelCount := min(5, max(2, chartW/9))
+	row := strings.Repeat(" ", yAxisW)
+	pos := yAxisW
+	used := map[int]bool{}
+
+	for i := 0; i < labelCount; i++ {
+		// 数据中对应的点索引
+		dataIdx := i * (n - 1) / (labelCount - 1)
+		if used[dataIdx] {
+			continue
+		}
+		used[dataIdx] = true
+		label := points[dataIdx].Time
+
+		// 该点在图表宽度中的 x 像素位置
+		xPos := yAxisW + int(float64(dataIdx)/float64(n-1)*float64(chartW))
+		// 居中标签
+		xPos -= len(label) / 2
+		if xPos < pos {
+			xPos = pos
+		}
+		if xPos+len(label) > yAxisW+chartW {
+			xPos = yAxisW + chartW - len(label)
+		}
+
+		spaces := xPos - pos
+		if spaces < 0 {
+			spaces = 0
+		}
+		row += strings.Repeat(" ", spaces) + dim.Render(label)
+		pos = xPos + len(label)
+	}
+
+	return row
+}
+
+// ── 表格渲染 ─────────────────────────────────────────────────────────────────
+
+func renderHeader() string {
+	var parts []string
+	for _, c := range cols {
+		parts = append(parts, headerStyle.Width(c.width).Render(c.header))
+	}
+	return strings.Join(parts, " ")
+}
+
+func renderRow(s api.Stock, selected bool) string {
+	// 超过开盘价显示红色，否则绿色
+	aboveOpen := s.Price > s.Open
+	priceStyle := red
+	if !aboveOpen {
+		priceStyle = green
+	}
+	changeUp := s.Change >= 0
+	changeStyle := red
+	if !changeUp {
+		changeStyle = green
+	}
+	sign := "+"
+	if s.Change < 0 {
+		sign = ""
+	}
+
+	p := s.Precision
+	fp := func(v float64) string { return fmt.Sprintf("%.*f", p, v) }
+
+	cells := []string{
+		padRight(s.Code, cols[0].width),
+		padRight(s.Name, cols[1].width),
+		priceStyle.Render(padLeft(fp(s.Price), cols[2].width)),
+		changeStyle.Render(padLeft(fmt.Sprintf("%s%.*f", sign, p, s.Change), cols[3].width)),
+		changeStyle.Render(padLeft(fmt.Sprintf("%s%.*f%%", sign, p, s.ChangePct), cols[4].width)),
+		padLeft(fp(s.Open), cols[5].width),
+		red.Render(padLeft(fp(s.High), cols[6].width)),
+		green.Render(padLeft(fp(s.Low), cols[7].width)),
+		dim.Render(padLeft(formatVolume(s.Volume), cols[8].width)),
+		dim.Render(padLeft(formatAmount(s.Amount), cols[9].width)),
+	}
+
+	row := strings.Join(cells, " ")
+	if selected {
+		row = selectedStyle.Render(row)
+	}
+	return row
+}
+
+func tableWidth() int {
+	w := 0
+	for i, c := range cols {
+		w += c.width
+		if i < len(cols)-1 {
+			w++
+		}
+	}
+	return w
+}
+
+// ── 命令 ─────────────────────────────────────────────────────────────────────
+
+func fetchStocks(codes []string) tea.Cmd {
+	return func() tea.Msg {
+		stocks, err := api.FetchStocks(codes)
+		if err != nil {
+			return stocksErrMsg{err}
+		}
+		return stocksMsg(stocks)
+	}
+}
+
+func fetchMinute(code string) tea.Cmd {
+	return func() tea.Msg {
+		result, err := api.FetchMinute(code)
+		if err != nil {
+			return minuteErrMsg{err}
+		}
+		return minuteMsg{code: code, result: result}
+	}
+}
+
+func tick(d time.Duration) tea.Cmd {
+	return tea.Tick(d, func(t time.Time) tea.Msg {
+		return tickMsg(t)
+	})
+}
+
+// ── 辅助函数 ─────────────────────────────────────────────────────────────────
+
+func padRight(s string, w int) string {
+	s = truncateWidth(s, w)
+	vw := visWidth(s)
+	if vw >= w {
+		return s
+	}
+	return s + strings.Repeat(" ", w-vw)
+}
+
+func padLeft(s string, w int) string {
+	s = truncateWidth(s, w)
+	vw := visWidth(s)
+	if vw >= w {
+		return s
+	}
+	return strings.Repeat(" ", w-vw) + s
+}
+
+func truncateWidth(s string, w int) string {
+	if w <= 0 {
+		return ""
+	}
+	var sb strings.Builder
+	used := 0
+	for _, c := range s {
+		cw := charWidth(c)
+		if used+cw > w {
+			break
+		}
+		sb.WriteRune(c)
+		used += cw
+	}
+	return sb.String()
+}
+
+func charWidth(c rune) int {
+	if c > 0x2E80 {
+		return 2
+	}
+	return 1
+}
+
+func runeWidth(r []rune) int {
+	w := 0
+	for _, c := range r {
+		w += charWidth(c)
+	}
+	return w
+}
+
+func visWidth(s string) int {
+	// 去掉 ANSI escape codes 再计算视觉宽度
+	inEsc := false
+	w := 0
+	for _, c := range s {
+		if c == '\x1b' {
+			inEsc = true
+			continue
+		}
+		if inEsc {
+			if c == 'm' {
+				inEsc = false
+			}
+			continue
+		}
+		w += charWidth(c)
+	}
+	return w
+}
+
+func formatVolume(v float64) string {
+	if v >= 1e4 {
+		return fmt.Sprintf("%.0f万手", v/1e4)
+	}
+	return fmt.Sprintf("%.0f手", v)
+}
+
+func formatAmount(a float64) string {
+	if a >= 1e4 {
+		return fmt.Sprintf("%.2f亿", a/1e4)
+	}
+	return fmt.Sprintf("%.0f万", math.Round(a))
+}
+
+func minMax(data []float64) (float64, float64) {
+	if len(data) == 0 {
+		return 0, 0
+	}
+	mn, mx := data[0], data[0]
+	for _, v := range data[1:] {
+		if v < mn {
+			mn = v
+		}
+		if v > mx {
+			mx = v
+		}
+	}
+	return mn, mx
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
