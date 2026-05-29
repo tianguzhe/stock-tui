@@ -232,7 +232,12 @@ func fillCHOP(candles []Candle, results []Result) {
 		sumTR := 0.0
 		for j := start; j <= i; j++ {
 			if j == 0 {
-				continue // first bar has no previous close, so no true range
+				// First bar has no previous close; its true range degenerates
+				// to High-Low. It must still be counted: its high/low already
+				// feed rangeHL, so dropping it would let sumTR < rangeHL and
+				// push CHOP negative during the warmup window.
+				sumTR += candles[j].High - candles[j].Low
+				continue
 			}
 			sumTR += trueRange(candles[j], candles[j-1].Close)
 		}

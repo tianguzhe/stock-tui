@@ -88,7 +88,26 @@ func TestCalculateSampleValues(t *testing.T) {
 	assertNear(t, "sample PDI", last.DMI.PDI, 30.5731, 1e-4)
 	assertNear(t, "sample CMI", last.CMI, 73.3333, 1e-4)
 	assertNear(t, "sample BIAS6", last.BIAS.BIAS6, 2.9536, 1e-4)
-	assertNear(t, "sample CHOP", last.CHOP, 38.6202, 1e-4)
+	assertNear(t, "sample CHOP", last.CHOP, 42.5969, 1e-4)
+}
+
+// TestCalculateCHOPStaysNonNegative guards the warmup window: the first bar's
+// high/low feed rangeHL, so its true range must also feed sumTR, otherwise an
+// early bar with a wide range drives sum(TR)/rangeHL below 1 and CHOP negative.
+// Choppiness Index is defined on [0,100]; a negative value is meaningless.
+func TestCalculateCHOPStaysNonNegative(t *testing.T) {
+	// First bar has a very wide range; the rest are calm. This is the shape
+	// that produced CHOP < 0 when the first bar was dropped from sum(TR).
+	candles := []Candle{{High: 110, Low: 90, Close: 100}}
+	for i := 1; i < 20; i++ {
+		candles = append(candles, Candle{High: 101, Low: 99, Close: 100})
+	}
+
+	for i, r := range Calculate(candles) {
+		if r.CHOP < 0 || r.CHOP > 100 {
+			t.Fatalf("CHOP[%d] = %v, want within [0,100]", i, r.CHOP)
+		}
+	}
 }
 
 func assertNear(t *testing.T, name string, got, want, tol float64) {
