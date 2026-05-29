@@ -67,6 +67,17 @@ var cols = []tableColumn{
 	{"成交额", 11, alignRight},
 }
 
+var bossCols = []tableColumn{
+	{"链路", 5, alignLeft},
+	{"进程", 6, alignLeft},
+	{"当前", 10, alignRight},
+	{"基线", 10, alignRight},
+	{"峰值", 10, alignRight},
+	{"谷值", 10, alignRight},
+	{"采样", 6, alignRight},
+	{"变化%", 7, alignRight},
+}
+
 // ── 消息 ─────────────────────────────────────────────────────────────────────
 
 type tickMsg time.Time
@@ -98,14 +109,16 @@ type Model struct {
 	minuteCode   string
 	loadingChart bool
 	chartErr     error
+	bossMode     bool
 }
 
-func New(codes []string, interval time.Duration) Model {
+func New(codes []string, interval time.Duration, bossMode bool) Model {
 	return Model{
 		codes:       codes,
 		loading:     true,
 		interval:    interval,
 		autoRefresh: true,
+		bossMode:    bossMode,
 	}
 }
 
@@ -132,6 +145,17 @@ func (m Model) selectedStock() (api.Stock, bool) {
 		return api.Stock{}, false
 	}
 	return m.stocks[m.selected], true
+}
+
+func (m Model) tableColumns() []tableColumn {
+	if m.bossMode {
+		return bossCols
+	}
+	return cols
+}
+
+func (m Model) displayTableWidth() int {
+	return tableWidthFor(m.tableColumns())
 }
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -237,16 +261,32 @@ func (m Model) View() string {
 
 	// ── 标题栏 ─────────────────────────────────────────────────────────────
 	var refreshTag string
+	titleText := "股票实时行情"
+	loadingText := "刷新中..."
+	updatedText := "更新: "
+	helpText := "  ↑↓/jk 切换股票   r 自动刷新开/关   q 退出"
+	if m.bossMode {
+		titleText = "网络吞吐监控"
+		loadingText = "采样中..."
+		updatedText = "同步: "
+		helpText = "  ↑↓/jk 切换链路   r 自动采样开/关   q 退出"
+	}
 	if m.autoRefresh {
-		refreshTag = green.Render("[自动刷新:开]")
+		if m.bossMode {
+			refreshTag = green.Render("[采样:自动]")
+		} else {
+			refreshTag = green.Render("[自动刷新:开]")
+		}
+	} else if m.bossMode {
+		refreshTag = dim.Render("[采样:暂停]")
 	} else {
 		refreshTag = dim.Render("[自动刷新:关]")
 	}
-	status := refreshTag + " " + dim.Render("刷新中...")
+	status := refreshTag + " " + dim.Render(loadingText)
 	if !m.loading && !m.updated.IsZero() {
-		status = refreshTag + " " + dim.Render("更新: "+m.updated.Format("15:04:05"))
+		status = refreshTag + " " + dim.Render(updatedText+m.updated.Format("15:04:05"))
 	}
-	title := titleStyle.Render("股票实时行情")
+	title := titleStyle.Render(titleText)
 	gap := m.width - visWidth(title) - visWidth(status) - 2
 	if gap < 0 {
 		gap = 0
@@ -254,19 +294,32 @@ func (m Model) View() string {
 	sb.WriteString(title + strings.Repeat(" ", gap) + status + "\n")
 
 	if m.err != nil {
-		sb.WriteString(red.Render("  ✗ "+m.err.Error()) + "\n")
+		if m.bossMode {
+			sb.WriteString(red.Render("  ! 链路异常: 采样失败") + "\n")
+		} else {
+			sb.WriteString(red.Render("  ✗ "+m.err.Error()) + "\n")
+		}
 	}
 	sb.WriteString("\n")
 
 	// ── 报价表格 ──────────────────────────────────────────────────────────
-	sb.WriteString(renderHeader() + "\n")
-	sb.WriteString(dim.Render(strings.Repeat("─", tableWidth())) + "\n")
+	columns := m.tableColumns()
+	sb.WriteString(renderHeaderFor(columns) + "\n")
+	sb.WriteString(dim.Render(strings.Repeat("─", tableWidthFor(columns))) + "\n")
 
 	if len(m.stocks) == 0 {
-		sb.WriteString(dim.Render("  正在加载...") + "\n")
+		emptyText := "  正在加载..."
+		if m.bossMode {
+			emptyText = "  正在采样..."
+		}
+		sb.WriteString(dim.Render(emptyText) + "\n")
 	} else {
 		for i, s := range m.stocks {
-			sb.WriteString(renderRow(s, i == m.selected) + "\n")
+			if m.bossMode {
+				sb.WriteString(renderBossRow(s, i, i == m.selected) + "\n")
+			} else {
+				sb.WriteString(renderRow(s, i == m.selected) + "\n")
+			}
 		}
 	}
 
@@ -277,7 +330,7 @@ func (m Model) View() string {
 
 	// ── 帮助栏 ────────────────────────────────────────────────────────────
 	sb.WriteString("\n")
-	sb.WriteString(dim.Render("  ↑↓/jk 切换股票   r 自动刷新开/关   q 退出"))
+	sb.WriteString(dim.Render(helpText))
 
 	return sb.String()
 }
@@ -289,12 +342,18 @@ func (m Model) renderChart() string {
 
 	// 分隔标题
 	var chartTitle string
-	if stock, ok := m.selectedStock(); ok {
+	if m.bossMode {
+		if _, ok := m.selectedStock(); ok {
+			chartTitle = fmt.Sprintf(" 流量趋势  %s ", bossLinkName(m.selected))
+		} else {
+			chartTitle = " 流量趋势 "
+		}
+	} else if stock, ok := m.selectedStock(); ok {
 		chartTitle = fmt.Sprintf(" 分时走势  %s (%s) ", stock.Name, stock.Code)
 	} else {
 		chartTitle = " 分时走势 "
 	}
-	totalW := tableWidth()
+	totalW := m.displayTableWidth()
 	leftW := (totalW - visWidth(chartTitle)) / 2
 	if leftW < 0 {
 		leftW = 0
@@ -306,15 +365,23 @@ func (m Model) renderChart() string {
 
 	// 错误或加载状态
 	if m.loadingChart {
-		sb.WriteString(dim.Render("  正在加载分时数据...") + "\n")
+		loadingText := "  正在加载分时数据..."
+		if m.bossMode {
+			loadingText = "  正在加载采样数据..."
+		}
+		sb.WriteString(dim.Render(loadingText) + "\n")
 		return sb.String()
 	}
 	if m.chartErr != nil {
-		sb.WriteString(red.Render("  ✗ "+m.chartErr.Error()) + "\n")
+		if m.bossMode {
+			sb.WriteString(red.Render("  ! 采样异常") + "\n")
+		} else {
+			sb.WriteString(red.Render("  ✗ "+m.chartErr.Error()) + "\n")
+		}
 		return sb.String()
 	}
 	if m.minute == nil || len(m.minute.Points) == 0 {
-		sb.WriteString(dim.Render("  暂无分时数据（可能为非交易时间）") + "\n")
+		sb.WriteString(dim.Render(m.noChartDataText()) + "\n")
 		return sb.String()
 	}
 
@@ -322,7 +389,7 @@ func (m Model) renderChart() string {
 
 	stock, ok := m.selectedStock()
 	if !ok {
-		sb.WriteString(dim.Render("  暂无分时数据（可能为非交易时间）") + "\n")
+		sb.WriteString(dim.Render(m.noChartDataText()) + "\n")
 		return sb.String()
 	}
 	prec := m.minute.Precision
@@ -338,7 +405,6 @@ func (m Model) renderChart() string {
 		baseline = points[0].Price
 	}
 	lower, upper, showBaseline := minuteChartBounds(points, baseline, prec)
-	redS, greenS, closeS := splitMinuteSeries(points, baseline, showBaseline)
 
 	// 计算图表尺寸，Y 轴宽度按 asciigraph 实际标签宽度对齐。
 	yAxisW := chartYAxisWidth(lower, upper, prec)
@@ -355,39 +421,59 @@ func (m Model) renderChart() string {
 		chartH = 18
 	}
 
-	series := [][]float64{redS, greenS}
-	colors := []asciigraph.AnsiColor{
-		asciigraph.AnsiColor(211), // Mocha red: 高于昨收
-		asciigraph.AnsiColor(151), // Mocha green: 低于等于昨收
-	}
-	chars := []asciigraph.CharSet{
-		asciigraph.DefaultCharSet,
-		asciigraph.DefaultCharSet,
-	}
-	if showBaseline {
-		series = append(series, closeS)
-		colors = append(colors, asciigraph.AnsiColor(183)) // Mocha mauve: 昨收参考线
-		chars = append(chars, asciigraph.CreateCharSet("┈"))
-	}
-
-	chartStr := asciigraph.PlotMany(series,
+	chartOptions := []asciigraph.Option{
 		asciigraph.Width(chartW),
 		asciigraph.Height(chartH),
 		asciigraph.Precision(uint(prec)),
 		asciigraph.LowerBound(lower),
 		asciigraph.UpperBound(upper),
-		asciigraph.SeriesColors(colors...),
-		asciigraph.SeriesChars(chars...),
-		asciigraph.AxisColor(asciigraph.AnsiColor(60)),
-		asciigraph.LabelColor(asciigraph.AnsiColor(103)),
-	)
+	}
+	var series [][]float64
+	if m.bossMode {
+		series = [][]float64{minutePrices(points)}
+	} else {
+		redS, greenS, closeS := splitMinuteSeries(points, baseline, showBaseline)
+		series = [][]float64{redS, greenS}
+		colors := []asciigraph.AnsiColor{
+			asciigraph.AnsiColor(211), // Mocha red: 高于昨收
+			asciigraph.AnsiColor(151), // Mocha green: 低于等于昨收
+		}
+		chars := []asciigraph.CharSet{
+			asciigraph.DefaultCharSet,
+			asciigraph.DefaultCharSet,
+		}
+		if showBaseline {
+			series = append(series, closeS)
+			colors = append(colors, asciigraph.AnsiColor(183)) // Mocha mauve: 昨收参考线
+			chars = append(chars, asciigraph.CreateCharSet("┈"))
+		}
+		chartOptions = append(chartOptions,
+			asciigraph.SeriesColors(colors...),
+			asciigraph.SeriesChars(chars...),
+			asciigraph.AxisColor(asciigraph.AnsiColor(60)),
+			asciigraph.LabelColor(asciigraph.AnsiColor(103)),
+		)
+	}
+
+	chartStr := asciigraph.PlotMany(series, chartOptions...)
 	sb.WriteString(chartStr + "\n")
 
 	// X 轴时间标签
 	sb.WriteString(renderTimeAxis(points, chartW, yAxisW) + "\n")
-	sb.WriteString(renderMinuteSummary(points, baseline, prec) + "\n")
+	open := stock.Open
+	if open == 0 {
+		open = baseline
+	}
+	sb.WriteString(renderMinuteSummary(points, baseline, open, prec, m.bossMode) + "\n")
 
 	return sb.String()
+}
+
+func (m Model) noChartDataText() string {
+	if m.bossMode {
+		return "  暂无采样数据"
+	}
+	return "  暂无分时数据（可能为非交易时间）"
 }
 
 func splitMinuteSeries(points []api.MinutePoint, baseline float64, showBaseline bool) ([]float64, []float64, []float64) {
@@ -421,6 +507,14 @@ func splitMinuteSeries(points []api.MinutePoint, baseline float64, showBaseline 
 	}
 
 	return redS, greenS, closeS
+}
+
+func minutePrices(points []api.MinutePoint) []float64 {
+	prices := make([]float64, len(points))
+	for i, p := range points {
+		prices[i] = p.Price
+	}
+	return prices
 }
 
 func minuteChartBounds(points []api.MinutePoint, baseline float64, prec int) (float64, float64, bool) {
@@ -489,12 +583,24 @@ func priceTick(prec int) float64 {
 	return math.Pow10(-prec)
 }
 
-func renderMinuteSummary(points []api.MinutePoint, baseline float64, prec int) string {
+func renderMinuteSummary(points []api.MinutePoint, baseline, open float64, prec int, bossMode bool) string {
 	if len(points) == 0 {
 		return ""
 	}
 	last := points[len(points)-1]
 	low, high := minutePointRange(points)
+	fp := func(v float64) string { return fmt.Sprintf("%.*f", prec, v) }
+	if bossMode {
+		parts := []string{
+			"当前 " + fp(last.Price),
+			"基线 " + fp(open),
+			"峰值 " + fp(high),
+			"谷值 " + fp(low),
+			"采样 " + last.Time,
+		}
+		return "  " + dim.Render(strings.Join(parts, "  "))
+	}
+
 	change := last.Price - baseline
 	changePct := 0.0
 	if baseline != 0 {
@@ -508,7 +614,6 @@ func renderMinuteSummary(points []api.MinutePoint, baseline float64, prec int) s
 	if change < 0 {
 		style = green
 	}
-	fp := func(v float64) string { return fmt.Sprintf("%.*f", prec, v) }
 
 	parts := []string{
 		"最新 " + fp(last.Price),
@@ -590,8 +695,12 @@ func renderTimeAxis(points []api.MinutePoint, chartW, yAxisW int) string {
 // ── 表格渲染 ─────────────────────────────────────────────────────────────────
 
 func renderHeader() string {
+	return renderHeaderFor(cols)
+}
+
+func renderHeaderFor(columns []tableColumn) string {
 	var parts []string
-	for _, c := range cols {
+	for _, c := range columns {
 		parts = append(parts, headerStyle.Render(tableCell(c.header, c)))
 	}
 	return strings.Join(parts, " ")
@@ -637,11 +746,46 @@ func renderRow(s api.Stock, selected bool) string {
 	return row
 }
 
+func renderBossRow(s api.Stock, index int, selected bool) string {
+	p := s.Precision
+	fp := func(v float64) string { return fmt.Sprintf("%.*fM/s", p, v) }
+	changeSign := "+"
+	if s.ChangePct < 0 {
+		changeSign = ""
+	}
+	changePct := fmt.Sprintf("%s%.*f%%", changeSign, p, s.ChangePct)
+
+	cells := []string{
+		tableCell(bossLinkName(index), bossCols[0]),
+		tableCell(fmt.Sprintf("svc-%02d", index+1), bossCols[1]),
+		tableCell(fp(s.Price), bossCols[2]),
+		tableCell(fp(s.Open), bossCols[3]),
+		tableCell(fp(s.High), bossCols[4]),
+		tableCell(fp(s.Low), bossCols[5]),
+		dim.Render(tableCell(formatSamples(s.Volume), bossCols[6])),
+		tableCell(changePct, bossCols[7]),
+	}
+
+	row := strings.Join(cells, " ")
+	if selected {
+		row = selectedStyle.Render(row)
+	}
+	return row
+}
+
+func bossLinkName(index int) string {
+	return fmt.Sprintf("eth%d", index)
+}
+
 func tableWidth() int {
+	return tableWidthFor(cols)
+}
+
+func tableWidthFor(columns []tableColumn) int {
 	w := 0
-	for i, c := range cols {
+	for i, c := range columns {
 		w += c.width
-		if i < len(cols)-1 {
+		if i < len(columns)-1 {
 			w++
 		}
 	}
@@ -767,6 +911,13 @@ func formatAmount(a float64) string {
 		return fmt.Sprintf("%.2f亿", a/1e4)
 	}
 	return fmt.Sprintf("%.0f万", math.Round(a))
+}
+
+func formatSamples(v float64) string {
+	if v >= 1e4 {
+		return fmt.Sprintf("%.0fk", v/1e3)
+	}
+	return fmt.Sprintf("%.0f", v)
 }
 
 func minMax(data []float64) (float64, float64) {

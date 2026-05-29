@@ -6,6 +6,7 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 
 	"stock-tui/internal/api"
 )
@@ -277,6 +278,95 @@ func TestNameColumnShowsHongliETFName(t *testing.T) {
 	row := stripANSI(renderRow(stock, false))
 	if !strings.Contains(row, "红利ETF易方达") {
 		t.Fatalf("row = %q, want full fund name", row)
+	}
+}
+
+func TestBossModeMasksStockTextAndShowsNetworkMetrics(t *testing.T) {
+	m := Model{
+		bossMode:    true,
+		width:       120,
+		height:      28,
+		autoRefresh: true,
+		updated:     time.Date(2026, 5, 28, 14, 30, 0, 0, time.Local),
+		stocks: []api.Stock{
+			{
+				Code:      "sh600519",
+				Name:      "贵州茅台",
+				Price:     1275.96,
+				Open:      1278.00,
+				Close:     1303.00,
+				High:      1280.00,
+				Low:       1270.00,
+				ChangePct: 5.00,
+				Volume:    45890,
+				Precision: 2,
+			},
+		},
+		minute: &api.MinuteResult{
+			PClose:    1303.00,
+			Precision: 2,
+			Points: []api.MinutePoint{
+				{Time: "09:31", Price: 1274.50},
+				{Time: "09:32", Price: 1275.96},
+			},
+		},
+	}
+
+	got := stripANSI(m.View())
+	for _, secret := range []string{"股票", "贵州茅台", "sh600519", "涨跌", "成交"} {
+		if strings.Contains(got, secret) {
+			t.Fatalf("boss view contains %q: %q", secret, got)
+		}
+	}
+	for _, want := range []string{"网络吞吐监控", "eth0", "1275.96", "1278.00", "1280.00", "1270.00", "变化%", "+5.00%"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("boss view = %q, want %q", got, want)
+		}
+	}
+	if strings.Contains(got, "状态") {
+		t.Fatalf("boss view contains old status column: %q", got)
+	}
+	if tableWidthFor(bossCols) > 80 {
+		t.Fatalf("boss table width = %d, want <= 80", tableWidthFor(bossCols))
+	}
+}
+
+func TestBossModeSummaryUsesNeutralLabels(t *testing.T) {
+	points := []api.MinutePoint{
+		{Time: "09:31", Price: 9.8},
+		{Time: "09:32", Price: 10.2},
+	}
+
+	got := stripANSI(renderMinuteSummary(points, 10, 9.9, 2, true))
+	for _, secret := range []string{"最新", "较昨收", "分时高", "分时低"} {
+		if strings.Contains(got, secret) {
+			t.Fatalf("boss summary contains %q: %q", secret, got)
+		}
+	}
+	for _, want := range []string{"当前 10.20", "基线 9.90", "峰值 10.20", "谷值 9.80"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("boss summary = %q, want %q", got, want)
+		}
+	}
+}
+
+func TestBossModeMasksErrors(t *testing.T) {
+	m := Model{
+		bossMode: true,
+		width:    80,
+		height:   24,
+		err:      errors.New("无此股票数据: sh600519"),
+		chartErr: errors.New("无此股票数据: sh600519"),
+	}
+
+	got := stripANSI(m.View())
+	if strings.Contains(got, "sh600519") || strings.Contains(got, "股票") {
+		t.Fatalf("boss error view leaks sensitive text: %q", got)
+	}
+	for _, want := range []string{"链路异常", "采样失败"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("boss error view = %q, want %q", got, want)
+		}
 	}
 }
 
