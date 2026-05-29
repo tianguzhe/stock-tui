@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"errors"
 	"math"
 	"regexp"
 	"strings"
@@ -177,6 +178,84 @@ func TestTableHeaderAndRowsShareColumnWidth(t *testing.T) {
 	}
 	if visWidth(row) != tableWidth() {
 		t.Fatalf("row width = %d, want %d", visWidth(row), tableWidth())
+	}
+}
+
+func TestUpdateClampsSelectedWhenStocksShrink(t *testing.T) {
+	m := Model{
+		selected: 2,
+		stocks: []api.Stock{
+			{Code: "sh600519", Name: "贵州茅台"},
+			{Code: "sh601318", Name: "中国平安"},
+			{Code: "sz000858", Name: "五粮液"},
+		},
+	}
+
+	updated, _ := m.Update(stocksMsg{
+		{Code: "sh600519", Name: "贵州茅台"},
+	})
+	got := updated.(Model)
+
+	if got.selected != 0 {
+		t.Fatalf("selected = %d, want clamped to 0", got.selected)
+	}
+}
+
+func TestRenderChartHandlesStaleMinuteWithoutSelectedStock(t *testing.T) {
+	m := Model{
+		width:    80,
+		height:   24,
+		selected: 1,
+		minute: &api.MinuteResult{
+			PClose:    10,
+			Precision: 2,
+			Points: []api.MinutePoint{
+				{Time: "09:31", Price: 10.1},
+			},
+		},
+	}
+
+	got := stripANSI(m.renderChart())
+	if !strings.Contains(got, "暂无分时数据") {
+		t.Fatalf("renderChart() = %q, want no-data message", got)
+	}
+}
+
+func TestUpdateIgnoresStaleMinuteError(t *testing.T) {
+	staleErr := errors.New("stale minute request")
+	m := Model{
+		stocks:       []api.Stock{{Code: "sh600519", Name: "贵州茅台"}},
+		selected:     0,
+		loadingChart: true,
+	}
+
+	updated, _ := m.Update(minuteErrMsg{code: "sz000001", err: staleErr})
+	got := updated.(Model)
+
+	if got.chartErr != nil {
+		t.Fatalf("chartErr = %v, want nil for stale minute error", got.chartErr)
+	}
+	if !got.loadingChart {
+		t.Fatal("loadingChart = false, want unchanged for stale minute error")
+	}
+}
+
+func TestUpdateAcceptsCurrentMinuteError(t *testing.T) {
+	currentErr := errors.New("current minute request")
+	m := Model{
+		stocks:       []api.Stock{{Code: "sh600519", Name: "贵州茅台"}},
+		selected:     0,
+		loadingChart: true,
+	}
+
+	updated, _ := m.Update(minuteErrMsg{code: "sh600519", err: currentErr})
+	got := updated.(Model)
+
+	if !errors.Is(got.chartErr, currentErr) {
+		t.Fatalf("chartErr = %v, want %v", got.chartErr, currentErr)
+	}
+	if got.loadingChart {
+		t.Fatal("loadingChart = true, want false for current minute error")
 	}
 }
 

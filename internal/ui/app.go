@@ -76,7 +76,10 @@ type minuteMsg struct {
 	code   string
 	result *api.MinuteResult
 }
-type minuteErrMsg struct{ err error }
+type minuteErrMsg struct {
+	code string
+	err  error
+}
 
 // ── Model ────────────────────────────────────────────────────────────────────
 
@@ -110,6 +113,27 @@ func (m Model) Init() tea.Cmd {
 	return tea.Batch(fetchStocks(m.codes), tick(m.interval))
 }
 
+func (m *Model) clampSelected() {
+	if len(m.stocks) == 0 {
+		m.selected = 0
+		return
+	}
+	if m.selected < 0 {
+		m.selected = 0
+		return
+	}
+	if m.selected >= len(m.stocks) {
+		m.selected = len(m.stocks) - 1
+	}
+}
+
+func (m Model) selectedStock() (api.Stock, bool) {
+	if len(m.stocks) == 0 || m.selected < 0 || m.selected >= len(m.stocks) {
+		return api.Stock{}, false
+	}
+	return m.stocks[m.selected], true
+}
+
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 
@@ -127,15 +151,19 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case stocksMsg:
 		m.stocks = []api.Stock(msg)
+		m.clampSelected()
 		m.loading = false
 		m.err = nil
 		m.updated = time.Now()
 		// 刷新选中股票的分时数据
-		if len(m.stocks) > 0 {
-			code := m.stocks[m.selected].Code
+		if stock, ok := m.selectedStock(); ok {
 			m.loadingChart = true
-			return m, fetchMinute(code)
+			return m, fetchMinute(stock.Code)
 		}
+		m.minute = nil
+		m.minuteCode = ""
+		m.loadingChart = false
+		m.chartErr = nil
 
 	case stocksErrMsg:
 		m.err = msg.err
@@ -143,11 +171,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case minuteMsg:
 		// 只接受当前选中股票的结果，丢弃过期响应
-		selectedCode := ""
-		if len(m.stocks) > 0 && m.selected < len(m.stocks) {
-			selectedCode = m.stocks[m.selected].Code
-		}
-		if msg.code == selectedCode {
+		if stock, ok := m.selectedStock(); ok && msg.code == stock.Code {
 			m.minute = msg.result
 			m.minuteCode = msg.code
 			m.loadingChart = false
@@ -155,8 +179,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case minuteErrMsg:
-		m.chartErr = msg.err
-		m.loadingChart = false
+		if stock, ok := m.selectedStock(); ok && msg.code == stock.Code {
+			m.chartErr = msg.err
+			m.loadingChart = false
+		}
 
 	case tea.KeyMsg:
 		switch msg.String() {
@@ -167,10 +193,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.autoRefresh {
 				// 开启时立即刷新并重启 tick 循环
 				m.loading = true
-				m.loadingChart = true
 				var chartCmd tea.Cmd
-				if len(m.stocks) > 0 {
-					chartCmd = fetchMinute(m.stocks[m.selected].Code)
+				if stock, ok := m.selectedStock(); ok {
+					m.loadingChart = true
+					chartCmd = fetchMinute(stock.Code)
+				} else {
+					m.loadingChart = false
 				}
 				return m, tea.Batch(fetchStocks(m.codes), chartCmd, tick(m.interval))
 			}
@@ -179,14 +207,20 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.selected--
 				m.minute = nil
 				m.loadingChart = true
-				return m, fetchMinute(m.stocks[m.selected].Code)
+				if stock, ok := m.selectedStock(); ok {
+					return m, fetchMinute(stock.Code)
+				}
+				m.loadingChart = false
 			}
 		case "down", "j":
 			if m.selected < len(m.stocks)-1 {
 				m.selected++
 				m.minute = nil
 				m.loadingChart = true
-				return m, fetchMinute(m.stocks[m.selected].Code)
+				if stock, ok := m.selectedStock(); ok {
+					return m, fetchMinute(stock.Code)
+				}
+				m.loadingChart = false
 			}
 		}
 	}
@@ -255,9 +289,8 @@ func (m Model) renderChart() string {
 
 	// 分隔标题
 	var chartTitle string
-	if len(m.stocks) > 0 && m.selected < len(m.stocks) {
-		s := m.stocks[m.selected]
-		chartTitle = fmt.Sprintf(" 分时走势  %s (%s) ", s.Name, s.Code)
+	if stock, ok := m.selectedStock(); ok {
+		chartTitle = fmt.Sprintf(" 分时走势  %s (%s) ", stock.Name, stock.Code)
 	} else {
 		chartTitle = " 分时走势 "
 	}
@@ -287,15 +320,19 @@ func (m Model) renderChart() string {
 
 	points := m.minute.Points
 
-	s := m.stocks[m.selected]
+	stock, ok := m.selectedStock()
+	if !ok {
+		sb.WriteString(dim.Render("  暂无分时数据（可能为非交易时间）") + "\n")
+		return sb.String()
+	}
 	prec := m.minute.Precision
 	if prec == 0 {
-		prec = s.Precision
+		prec = stock.Precision
 	}
 
 	baseline := m.minute.PClose
 	if baseline == 0 {
-		baseline = s.Close
+		baseline = stock.Close
 	}
 	if baseline == 0 && len(points) > 0 {
 		baseline = points[0].Price
@@ -634,7 +671,7 @@ func fetchMinute(code string) tea.Cmd {
 	return func() tea.Msg {
 		result, err := api.FetchMinute(code)
 		if err != nil {
-			return minuteErrMsg{err}
+			return minuteErrMsg{code: code, err: err}
 		}
 		return minuteMsg{code: code, result: result}
 	}

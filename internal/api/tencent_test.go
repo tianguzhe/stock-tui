@@ -1,6 +1,9 @@
 package api
 
-import "testing"
+import (
+	"net/http"
+	"testing"
+)
 
 func TestParseStockTencentQuote(t *testing.T) {
 	raw := "1~贵州茅台~600519~1275.98~1303.00~1290.00~45890~21472~24418~1275.82~4~1275.60~3~1275.50~2~1275.40~2~1275.37~1~1275.98~71~1276.00~7~1276.30~2~1276.50~3~1276.55~1~~20260528161414~-27.02~-2.07~1304.00~1271.00~1275.98/45890/5895475019~45890~589548~0.37"
@@ -28,6 +31,32 @@ func TestParseStockTencentQuote(t *testing.T) {
 	}
 	if got.Precision != 2 {
 		t.Fatalf("Precision = %d, want 2", got.Precision)
+	}
+}
+
+func TestParseStocksPayloadUsesResponseCode(t *testing.T) {
+	raw := `v_sz000001="1~贵州茅台~600519~1275.98~1303.00~1290.00~45890~21472~24418~1275.82~4~1275.60~3~1275.50~2~1275.40~2~1275.37~1~1275.98~71~1276.00~7~1276.30~2~1276.50~3~1276.55~1~~20260528161414~-27.02~-2.07~1304.00~1271.00~1275.98/45890/5895475019~45890~589548~0.37";
+v_sh600519="1~贵州茅台~600519~1275.98~1303.00~1290.00~45890~21472~24418~1275.82~4~1275.60~3~1275.50~2~1275.40~2~1275.37~1~1275.98~71~1276.00~7~1276.30~2~1276.50~3~1276.55~1~~20260528161414~-27.02~-2.07~1304.00~1271.00~1275.98/45890/5895475019~45890~589548~0.37";`
+
+	got := parseStocksPayload(raw)
+	if len(got) != 2 {
+		t.Fatalf("len(stocks) = %d, want 2", len(got))
+	}
+	if got[0].Code != "sz000001" {
+		t.Fatalf("first Code = %q, want sz000001", got[0].Code)
+	}
+	if got[1].Code != "sh600519" {
+		t.Fatalf("second Code = %q, want sh600519", got[1].Code)
+	}
+}
+
+func TestCheckResponseStatusRejectsNonOK(t *testing.T) {
+	err := checkResponseStatus(&http.Response{
+		StatusCode: http.StatusBadGateway,
+		Status:     "502 Bad Gateway",
+	})
+	if err == nil {
+		t.Fatal("checkResponseStatus() error = nil, want error")
 	}
 }
 

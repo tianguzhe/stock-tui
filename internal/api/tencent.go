@@ -29,19 +29,23 @@ type Stock struct {
 	UpdatedAt time.Time
 }
 
-var reStock = regexp.MustCompile(`v_[a-z]{2}\d+="([^"]+)"`)
+var reStock = regexp.MustCompile(`v_([a-z]{2}\d+)="([^"]+)"`)
 
 func FetchStocks(codes []string) ([]Stock, error) {
 	url := fmt.Sprintf("https://qt.gtimg.cn/q=%s", strings.Join(codes, ","))
 
-	req, _ := http.NewRequest("GET", url, nil)
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")
-	req.Header.Set("Referer", "https://finance.qq.com")
+	req, err := newTencentRequest(url)
+	if err != nil {
+		return nil, err
+	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("请求失败: %w", err)
 	}
 	defer resp.Body.Close()
+	if err := checkResponseStatus(resp); err != nil {
+		return nil, err
+	}
 
 	reader := transform.NewReader(resp.Body, simplifiedchinese.GBK.NewDecoder())
 	body, err := io.ReadAll(reader)
@@ -49,21 +53,25 @@ func FetchStocks(codes []string) ([]Stock, error) {
 		return nil, fmt.Errorf("解码失败: %w", err)
 	}
 
-	matches := reStock.FindAllStringSubmatch(string(body), -1)
+	return parseStocksPayload(string(body)), nil
+}
+
+func parseStocksPayload(body string) []Stock {
+	matches := reStock.FindAllStringSubmatch(body, -1)
 	stocks := make([]Stock, 0, len(matches))
 
-	for i, m := range matches {
-		if len(m) < 2 {
+	for _, m := range matches {
+		if len(m) < 3 {
 			continue
 		}
-		s, err := parseStock(codes[i], m[1])
+		s, err := parseStock(m[1], m[2])
 		if err != nil {
 			continue
 		}
 		stocks = append(stocks, s)
 	}
 
-	return stocks, nil
+	return stocks
 }
 
 func parseStock(code, raw string) (Stock, error) {
