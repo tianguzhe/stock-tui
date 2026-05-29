@@ -288,11 +288,7 @@ func (m Model) View() string {
 	sb.WriteString(title + strings.Repeat(" ", gap) + status + "\n")
 
 	if m.err != nil {
-		if m.bossMode {
-			sb.WriteString(red.Render("  ! 链路异常: 采样失败") + "\n")
-		} else {
-			sb.WriteString(red.Render("  ✗ "+m.err.Error()) + "\n")
-		}
+		sb.WriteString(red.Render("  ✗ "+m.err.Error()) + "\n")
 	}
 	sb.WriteString("\n")
 
@@ -302,11 +298,7 @@ func (m Model) View() string {
 	sb.WriteString(dim.Render(strings.Repeat("─", tableWidthFor(columns))) + "\n")
 
 	if len(m.stocks) == 0 {
-		emptyText := "  正在加载..."
-		if m.bossMode {
-			emptyText = "  正在采样..."
-		}
-		sb.WriteString(dim.Render(emptyText) + "\n")
+		sb.WriteString(dim.Render("  正在加载...") + "\n")
 	} else {
 		for i, s := range m.stocks {
 			if m.bossMode {
@@ -384,10 +376,12 @@ func (m Model) renderBossMeters() string {
 	memFill := pricePosition(selected)
 	netFill := volumeShare(selected, m.stocks)
 
+	active := min(len(m.stocks), 1)
 	taskLine := fmt.Sprintf(
-		"Tasks: %d total, 1 running, %d selected",
+		"Tasks: %d total, %d running, %d selected",
 		len(m.stocks),
-		min(len(m.stocks), 1),
+		active,
+		active,
 	)
 	loadLine := fmt.Sprintf(
 		"Load average: %.2f%%   Uptime: %s",
