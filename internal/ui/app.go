@@ -68,14 +68,15 @@ var cols = []tableColumn{
 }
 
 var bossCols = []tableColumn{
-	{"链路", 5, alignLeft},
-	{"进程", 6, alignLeft},
-	{"当前", 10, alignRight},
-	{"基线", 10, alignRight},
-	{"峰值", 10, alignRight},
-	{"谷值", 10, alignRight},
-	{"采样", 6, alignRight},
-	{"变化%", 7, alignRight},
+	{"PID", 5, alignRight},
+	{"USER", 5, alignLeft},
+	{"S", 1, alignLeft},
+	{"CUR", 8, alignRight},
+	{"OPEN", 8, alignRight},
+	{"HIGH", 8, alignRight},
+	{"LOW", 8, alignRight},
+	{"CPU%", 7, alignRight},
+	{"COMMAND", 7, alignLeft},
 }
 
 // ── 消息 ─────────────────────────────────────────────────────────────────────
@@ -101,6 +102,7 @@ type Model struct {
 	loading      bool
 	err          error
 	updated      time.Time
+	startedAt    time.Time
 	interval     time.Duration
 	autoRefresh  bool
 	width        int
@@ -119,6 +121,7 @@ func New(codes []string, interval time.Duration, bossMode bool) Model {
 		interval:    interval,
 		autoRefresh: true,
 		bossMode:    bossMode,
+		startedAt:   time.Now(),
 	}
 }
 
@@ -256,6 +259,9 @@ func (m Model) View() string {
 	if m.width == 0 {
 		return "正在加载..."
 	}
+	if m.bossMode {
+		return m.renderBossView()
+	}
 
 	var sb strings.Builder
 
@@ -265,20 +271,8 @@ func (m Model) View() string {
 	loadingText := "刷新中..."
 	updatedText := "更新: "
 	helpText := "  ↑↓/jk 切换股票   r 自动刷新开/关   q 退出"
-	if m.bossMode {
-		titleText = "网络吞吐监控"
-		loadingText = "采样中..."
-		updatedText = "同步: "
-		helpText = "  ↑↓/jk 切换链路   r 自动采样开/关   q 退出"
-	}
 	if m.autoRefresh {
-		if m.bossMode {
-			refreshTag = green.Render("[采样:自动]")
-		} else {
-			refreshTag = green.Render("[自动刷新:开]")
-		}
-	} else if m.bossMode {
-		refreshTag = dim.Render("[采样:暂停]")
+		refreshTag = green.Render("[自动刷新:开]")
 	} else {
 		refreshTag = dim.Render("[自动刷新:关]")
 	}
@@ -335,6 +329,171 @@ func (m Model) View() string {
 	return sb.String()
 }
 
+func (m Model) renderBossView() string {
+	var sb strings.Builder
+
+	status := green.Render("[采样:自动]")
+	if !m.autoRefresh {
+		status = dim.Render("[采样:暂停]")
+	}
+	syncText := "采样中..."
+	if !m.loading && !m.updated.IsZero() {
+		syncText = "同步: " + m.updated.Format("15:04:05")
+	}
+	title := titleStyle.Render("htop - system monitor")
+	right := status + " " + dim.Render(syncText)
+	gap := m.width - visWidth(title) - visWidth(right) - 2
+	if gap < 0 {
+		gap = 0
+	}
+	sb.WriteString(title + strings.Repeat(" ", gap) + right + "\n")
+
+	if m.err != nil {
+		sb.WriteString(red.Render("  ! 链路异常: 采样失败") + "\n")
+	}
+
+	sb.WriteString(m.renderBossMeters())
+	sb.WriteString("\n")
+
+	sb.WriteString(renderHeaderFor(bossCols) + "\n")
+	sb.WriteString(dim.Render(strings.Repeat("─", tableWidthFor(bossCols))) + "\n")
+	if len(m.stocks) == 0 {
+		sb.WriteString(dim.Render("  collecting samples...") + "\n")
+	} else {
+		for i, s := range m.stocks {
+			sb.WriteString(renderBossRow(s, i, i == m.selected) + "\n")
+		}
+	}
+
+	sb.WriteString("\n")
+	sb.WriteString(m.renderChart())
+	sb.WriteString("\n")
+	sb.WriteString(dim.Render("  F1 Help  F2 Setup  F3 Search  F5 Tree  r Refresh  q Quit"))
+
+	return sb.String()
+}
+
+func (m Model) renderBossMeters() string {
+	selected, ok := m.selectedStock()
+	if !ok {
+		selected = api.Stock{Precision: 2}
+	}
+
+	avgChange := averageAbsChangePct(m.stocks)
+	cpuFill := clamp01(math.Abs(selected.ChangePct) / 10)
+	memFill := pricePosition(selected)
+	netFill := volumeShare(selected, m.stocks)
+
+	taskLine := fmt.Sprintf(
+		"Tasks: %d total, 1 running, %d selected",
+		len(m.stocks),
+		min(len(m.stocks), 1),
+	)
+	loadLine := fmt.Sprintf(
+		"Load average: %.2f%%   Uptime: %s",
+		avgChange,
+		m.uptimeText(),
+	)
+
+	p := selected.Precision
+	if p == 0 {
+		p = 2
+	}
+	current := fmt.Sprintf("%.*f", p, selected.Price)
+	open := fmt.Sprintf("%.*f", p, selected.Open)
+	high := fmt.Sprintf("%.*f", p, selected.High)
+	low := fmt.Sprintf("%.*f", p, selected.Low)
+	cpuText := formatSignedPercent(selected.ChangePct, p)
+	volumeText := formatSamples(selected.Volume)
+	maxVolume := formatSamples(maxStockVolume(m.stocks))
+
+	lines := []string{
+		taskLine,
+		loadLine,
+		renderBossMeter("CPU", cpuFill, cpuText),
+		renderBossMeter("Mem", memFill, current+" / "+open),
+		renderBossMeter("Net", netFill, volumeText+" / "+maxVolume),
+		dim.Render("Range: " + low + ".." + high),
+	}
+
+	return strings.Join(lines, "\n") + "\n"
+}
+
+func (m Model) uptimeText() string {
+	if m.startedAt.IsZero() {
+		if m.updated.IsZero() {
+			return "00:00:00"
+		}
+		return m.updated.Format("15:04:05")
+	}
+	elapsed := time.Since(m.startedAt).Round(time.Second)
+	if elapsed < 0 {
+		elapsed = 0
+	}
+	hours := int(elapsed / time.Hour)
+	elapsed -= time.Duration(hours) * time.Hour
+	minutes := int(elapsed / time.Minute)
+	elapsed -= time.Duration(minutes) * time.Minute
+	seconds := int(elapsed / time.Second)
+	return fmt.Sprintf("%02d:%02d:%02d", hours, minutes, seconds)
+}
+
+func renderBossMeter(label string, fill float64, text string) string {
+	const width = 18
+	filled := int(math.Round(clamp01(fill) * width))
+	if filled > width {
+		filled = width
+	}
+	bar := strings.Repeat("|", filled) + strings.Repeat(" ", width-filled)
+	return fmt.Sprintf("%-3s[%s] %s", label, bar, text)
+}
+
+func averageAbsChangePct(stocks []api.Stock) float64 {
+	if len(stocks) == 0 {
+		return 0
+	}
+	total := 0.0
+	for _, stock := range stocks {
+		total += math.Abs(stock.ChangePct)
+	}
+	return total / float64(len(stocks))
+}
+
+func pricePosition(stock api.Stock) float64 {
+	if stock.High <= stock.Low {
+		return 0
+	}
+	return clamp01((stock.Price - stock.Low) / (stock.High - stock.Low))
+}
+
+func volumeShare(selected api.Stock, stocks []api.Stock) float64 {
+	maxVolume := maxStockVolume(stocks)
+	if maxVolume <= 0 {
+		return 0
+	}
+	return clamp01(selected.Volume / maxVolume)
+}
+
+func maxStockVolume(stocks []api.Stock) float64 {
+	maxVolume := 0.0
+	for _, stock := range stocks {
+		if stock.Volume > maxVolume {
+			maxVolume = stock.Volume
+		}
+	}
+	return maxVolume
+}
+
+func clamp01(v float64) float64 {
+	if v < 0 {
+		return 0
+	}
+	if v > 1 {
+		return 1
+	}
+	return v
+}
+
 // ── 折线图渲染 ───────────────────────────────────────────────────────────────
 
 func (m Model) renderChart() string {
@@ -343,11 +502,7 @@ func (m Model) renderChart() string {
 	// 分隔标题
 	var chartTitle string
 	if m.bossMode {
-		if _, ok := m.selectedStock(); ok {
-			chartTitle = fmt.Sprintf(" 流量趋势  %s ", bossLinkName(m.selected))
-		} else {
-			chartTitle = " 流量趋势 "
-		}
+		chartTitle = " History "
 	} else if stock, ok := m.selectedStock(); ok {
 		chartTitle = fmt.Sprintf(" 分时走势  %s (%s) ", stock.Name, stock.Code)
 	} else {
@@ -413,6 +568,9 @@ func (m Model) renderChart() string {
 		chartW = 30
 	}
 	fixedRows := 3 + 2 + len(m.stocks) + 3
+	if m.bossMode {
+		fixedRows += 6
+	}
 	chartH := m.height - fixedRows
 	if chartH < 6 {
 		chartH = 6
@@ -748,22 +906,25 @@ func renderRow(s api.Stock, selected bool) string {
 
 func renderBossRow(s api.Stock, index int, selected bool) string {
 	p := s.Precision
-	fp := func(v float64) string { return fmt.Sprintf("%.*fM/s", p, v) }
-	changeSign := "+"
-	if s.ChangePct < 0 {
-		changeSign = ""
+	if p == 0 {
+		p = 2
 	}
-	changePct := fmt.Sprintf("%s%.*f%%", changeSign, p, s.ChangePct)
+	fp := func(v float64) string { return fmt.Sprintf("%.*f", p, v) }
+	state := "S"
+	if selected {
+		state = "R"
+	}
 
 	cells := []string{
-		tableCell(bossLinkName(index), bossCols[0]),
-		tableCell(fmt.Sprintf("svc-%02d", index+1), bossCols[1]),
-		tableCell(fp(s.Price), bossCols[2]),
-		tableCell(fp(s.Open), bossCols[3]),
-		tableCell(fp(s.High), bossCols[4]),
-		tableCell(fp(s.Low), bossCols[5]),
-		dim.Render(tableCell(formatSamples(s.Volume), bossCols[6])),
-		tableCell(changePct, bossCols[7]),
+		tableCell(fmt.Sprintf("%d", 1000+index), bossCols[0]),
+		tableCell(fmt.Sprintf("svc%02d", index+1), bossCols[1]),
+		tableCell(state, bossCols[2]),
+		tableCell(fp(s.Price), bossCols[3]),
+		tableCell(fp(s.Open), bossCols[4]),
+		tableCell(fp(s.High), bossCols[5]),
+		tableCell(fp(s.Low), bossCols[6]),
+		tableCell(formatSignedPercent(s.ChangePct, p), bossCols[7]),
+		tableCell(fmt.Sprintf("net.rx%d", index), bossCols[8]),
 	}
 
 	row := strings.Join(cells, " ")
@@ -773,8 +934,12 @@ func renderBossRow(s api.Stock, index int, selected bool) string {
 	return row
 }
 
-func bossLinkName(index int) string {
-	return fmt.Sprintf("eth%d", index)
+func formatSignedPercent(v float64, prec int) string {
+	sign := "+"
+	if v < 0 {
+		sign = ""
+	}
+	return fmt.Sprintf("%s%.*f%%", sign, prec, v)
 }
 
 func tableWidth() int {

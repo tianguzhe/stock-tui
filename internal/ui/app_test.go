@@ -318,13 +318,33 @@ func TestBossModeMasksStockTextAndShowsNetworkMetrics(t *testing.T) {
 			t.Fatalf("boss view contains %q: %q", secret, got)
 		}
 	}
-	for _, want := range []string{"网络吞吐监控", "eth0", "1275.96", "1278.00", "1280.00", "1270.00", "变化%", "+5.00%"} {
+	for _, want := range []string{
+		"htop - system monitor",
+		"CPU[",
+		"Mem[",
+		"Net[",
+		"Tasks:",
+		"Load average:",
+		"Uptime:",
+		"PID",
+		"USER",
+		"CPU%",
+		"COMMAND",
+		"net.rx0",
+		"1275.96",
+		"1278.00",
+		"1280.00",
+		"1270.00",
+		"+5.00%",
+	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("boss view = %q, want %q", got, want)
 		}
 	}
-	if strings.Contains(got, "状态") {
-		t.Fatalf("boss view contains old status column: %q", got)
+	for _, oldText := range []string{"状态", "变化%"} {
+		if strings.Contains(got, oldText) {
+			t.Fatalf("boss view contains old column text %q: %q", oldText, got)
+		}
 	}
 	if tableWidthFor(bossCols) > 80 {
 		t.Fatalf("boss table width = %d, want <= 80", tableWidthFor(bossCols))
