@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"stock-tui/internal/api"
+
+	"github.com/charmbracelet/lipgloss"
 )
 
 func TestMinuteChartBoundsIncludeBaselineAndPadding(t *testing.T) {
@@ -106,6 +108,19 @@ func TestSplitMinuteSeriesCanHidePreviousCloseLine(t *testing.T) {
 	}
 }
 
+func TestMinuteBaselineFallbacks(t *testing.T) {
+	point := api.MinutePoint{Time: "09:31", Price: 9.8}
+	if got := minuteBaseline(&api.MinuteResult{PClose: 10, Points: []api.MinutePoint{point}}, api.Stock{Close: 9.9}); got != 10 {
+		t.Fatalf("baseline = %v, want previous close", got)
+	}
+	if got := minuteBaseline(&api.MinuteResult{Points: []api.MinutePoint{point}}, api.Stock{Close: 9.9}); got != 9.9 {
+		t.Fatalf("baseline = %v, want stock close", got)
+	}
+	if got := minuteBaseline(&api.MinuteResult{Points: []api.MinutePoint{point}}, api.Stock{}); got != 9.8 {
+		t.Fatalf("baseline = %v, want first point price", got)
+	}
+}
+
 func TestRenderTimeAxisSinglePoint(t *testing.T) {
 	got := stripANSI(renderTimeAxis([]api.MinutePoint{{Time: "09:31", Price: 10}}, 20, 4))
 	if !strings.Contains(got, "09:31") {
@@ -150,10 +165,10 @@ func TestFormatVolumeAndAmount(t *testing.T) {
 	}
 }
 
-func TestPadRightKeepsWideCharactersInsideWidth(t *testing.T) {
-	got := padRight("贵州茅台ABC", 10)
-	if visWidth(got) != 10 {
-		t.Fatalf("visWidth(%q) = %d, want 10", got, visWidth(got))
+func TestTableCellKeepsWideCharactersInsideWidth(t *testing.T) {
+	got := tableCell("贵州茅台ABC", tableColumn{width: 10, align: lipgloss.Left})
+	if lipgloss.Width(got) != 10 {
+		t.Fatalf("lipgloss.Width(%q) = %d, want 10", got, lipgloss.Width(got))
 	}
 }
 
@@ -174,11 +189,11 @@ func TestTableHeaderAndRowsShareColumnWidth(t *testing.T) {
 
 	header := renderHeader()
 	row := renderRow(stock, false)
-	if visWidth(header) != tableWidth() {
-		t.Fatalf("header width = %d, want %d", visWidth(header), tableWidth())
+	if lipgloss.Width(header) != tableWidth() {
+		t.Fatalf("header width = %d, want %d", lipgloss.Width(header), tableWidth())
 	}
-	if visWidth(row) != tableWidth() {
-		t.Fatalf("row width = %d, want %d", visWidth(row), tableWidth())
+	if lipgloss.Width(row) != tableWidth() {
+		t.Fatalf("row width = %d, want %d", lipgloss.Width(row), tableWidth())
 	}
 }
 
