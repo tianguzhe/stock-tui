@@ -44,12 +44,15 @@ func FibRetracementOf(candles []Candle, lookback int) FibRetracement {
 	}
 	start := n - lookback
 
+	// Use >= / <= so an equal high/low retest moves the index to the LATER bar:
+	// direction below keys off which extreme is more recent, so a retested high
+	// must be treated as the recent extreme (uptrend), not the earliest one.
 	hiIdx, loIdx := start, start
 	for i := start + 1; i < n; i++ {
-		if candles[i].High > candles[hiIdx].High {
+		if candles[i].High >= candles[hiIdx].High {
 			hiIdx = i
 		}
-		if candles[i].Low < candles[loIdx].Low {
+		if candles[i].Low <= candles[loIdx].Low {
 			loIdx = i
 		}
 	}

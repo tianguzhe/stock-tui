@@ -80,6 +80,30 @@ func TestFibRetracementLookbackWindow(t *testing.T) {
 	}
 }
 
+// TestFibRetracementTieKeepsMostRecentExtreme: an early high, then a low, then
+// a retest to the SAME high. The most recent extreme is the retest high, so the
+// swing high index must be the later bar and direction must read as uptrend.
+// With strict >/< the index would stick on the earliest high (idx 0 < low idx 1)
+// and flip the direction to downtrend — the bug this guards against.
+func TestFibRetracementTieKeepsMostRecentExtreme(t *testing.T) {
+	candles := []Candle{
+		{High: 20, Low: 18, Close: 19}, // early high 20
+		{High: 12, Low: 10, Close: 11}, // low 10
+		{High: 20, Low: 17, Close: 19}, // retest to high 20 (most recent)
+	}
+	got := FibRetracementOf(candles, 0)
+
+	if got.HighIndex != 2 {
+		t.Fatalf("HighIndex = %d, want 2 (most recent equal high)", got.HighIndex)
+	}
+	if !got.Uptrend {
+		t.Fatalf("Uptrend = false, want true (recent high → awaiting pullback)")
+	}
+	if got.High != 20 || got.Low != 10 {
+		t.Fatalf("swing = %+v, want High 20 / Low 10", got)
+	}
+}
+
 // TestFibRetracementFlatWindow: a no-range window collapses every level to the
 // single price without panicking.
 func TestFibRetracementFlatWindow(t *testing.T) {
