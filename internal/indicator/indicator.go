@@ -10,14 +10,18 @@ type Candle struct {
 }
 
 type Result struct {
-	KDJ  KDJ
-	MACD MACD
-	RSI  RSI
-	WR   WR
-	DMI  DMI
-	CMI  float64
-	BIAS BIAS
-	CHOP float64
+	KDJ      KDJ
+	MACD     MACD
+	RSI      RSI
+	WR       WR
+	DMI      DMI
+	CMI      float64
+	BIAS     BIAS
+	CHOP     float64
+	ATR      ATR
+	BOLL     BOLL
+	Donchian Donchian
+	MFI      float64
 }
 
 type KDJ struct {
@@ -56,6 +60,26 @@ type BIAS struct {
 	BIAS24 float64
 }
 
+type ATR struct {
+	ATR14 float64
+	Pct   float64
+}
+
+type BOLL struct {
+	Mid       float64
+	Upper     float64
+	Lower     float64
+	PercentB  float64
+	Bandwidth float64
+}
+
+type Donchian struct {
+	Upper20 float64
+	Lower20 float64
+	Upper55 float64
+	Lower55 float64
+}
+
 func Calculate(candles []Candle) []Result {
 	results := make([]Result, len(candles))
 	if len(candles) == 0 {
@@ -70,6 +94,10 @@ func Calculate(candles []Candle) []Result {
 	fillCMI(candles, results)
 	fillBIAS(candles, results)
 	fillCHOP(candles, results)
+	fillATR(candles, results)
+	fillBOLL(candles, results)
+	fillDonchian(candles, results)
+	fillMFI(candles, results)
 
 	return results
 }
@@ -249,6 +277,107 @@ func fillCHOP(candles []Candle, results []Result) {
 	}
 }
 
+func fillATR(candles []Candle, results []Result) {
+	const period = 14
+	var atr float64
+	for i, candle := range candles {
+		tr := candle.High - candle.Low
+		if i > 0 {
+			tr = trueRange(candle, candles[i-1].Close)
+		}
+		atr = wilderRMA(atr, tr, period)
+		pct := 0.0
+		if candle.Close != 0 {
+			pct = atr / candle.Close * 100
+		}
+		results[i].ATR = ATR{ATR14: atr, Pct: pct}
+	}
+}
+
+func fillBOLL(candles []Candle, results []Result) {
+	const period = 20
+	for i := range candles {
+		start := i - period + 1
+		if start < 0 {
+			start = 0
+		}
+		count := float64(i - start + 1)
+		sum := 0.0
+		for j := start; j <= i; j++ {
+			sum += candles[j].Close
+		}
+		mid := sum / count
+
+		variance := 0.0
+		for j := start; j <= i; j++ {
+			diff := candles[j].Close - mid
+			variance += diff * diff
+		}
+		std := math.Sqrt(variance / count)
+		upper := mid + 2*std
+		lower := mid - 2*std
+
+		percentB := 50.0
+		if upper != lower {
+			percentB = (candles[i].Close - lower) / (upper - lower) * 100
+		}
+		bandwidth := 0.0
+		if mid != 0 {
+			bandwidth = (upper - lower) / mid * 100
+		}
+		results[i].BOLL = BOLL{Mid: mid, Upper: upper, Lower: lower, PercentB: percentB, Bandwidth: bandwidth}
+	}
+}
+
+func fillDonchian(candles []Candle, results []Result) {
+	for i := range candles {
+		low20, high20 := highLow(candles, i, 20)
+		low55, high55 := highLow(candles, i, 55)
+		results[i].Donchian = Donchian{
+			Upper20: high20,
+			Lower20: low20,
+			Upper55: high55,
+			Lower55: low55,
+		}
+	}
+}
+
+func fillMFI(candles []Candle, results []Result) {
+	const period = 14
+	results[0].MFI = 50
+	posFlow := make([]float64, len(candles))
+	negFlow := make([]float64, len(candles))
+	prevTP := typicalPrice(candles[0])
+	for i := 1; i < len(candles); i++ {
+		tp := typicalPrice(candles[i])
+		flow := tp * candles[i].Volume
+		switch {
+		case tp > prevTP:
+			posFlow[i] = flow
+		case tp < prevTP:
+			negFlow[i] = flow
+		}
+		start := i - period + 1
+		if start < 1 {
+			start = 1
+		}
+		pos, neg := 0.0, 0.0
+		for j := start; j <= i; j++ {
+			pos += posFlow[j]
+			neg += negFlow[j]
+		}
+		switch {
+		case pos == 0 && neg == 0:
+			results[i].MFI = 50
+		case neg == 0:
+			results[i].MFI = 100
+		default:
+			results[i].MFI = 100 - 100/(1+pos/neg)
+		}
+		prevTP = tp
+	}
+}
+
 func ema(prev, value float64, period int) float64 {
 	return prev*(float64(period)-1)/(float64(period)+1) + value*2/(float64(period)+1)
 }
@@ -324,6 +453,10 @@ func trueRange(candle Candle, previousClose float64) float64 {
 		math.Abs(candle.High-previousClose),
 		math.Abs(candle.Low-previousClose),
 	)
+}
+
+func typicalPrice(candle Candle) float64 {
+	return (candle.High + candle.Low + candle.Close) / 3
 }
 
 func maxFloat(values ...float64) float64 {

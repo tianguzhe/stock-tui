@@ -62,6 +62,7 @@ GET https://ifzq.gtimg.cn/appstock/app/fqkline/get?param=sh600580,day,,,320,qfq
 - 周期：`day` / `week` / `month`；起止日留空取最近 N 根。
 - 复权：`qfq` 前复权 / `hfq` 后复权 / 空 不复权。
 - 返回 JSON：`data.sh600580.qfqday`(周K 为 `qfqweek`)。
+- ⚠️ **`qfqday` 可能缺失,需回退 `day` 键**:部分标的(实测如 ETF `sz159611`)即使请求 `qfq` 也不返回 `qfqday`,价格序列落在 `day`。原因是该标的无复权事件——对它 `qfq`/`hfq`/不复权三种请求返回的 `day` 数值完全相同,腾讯只给一条原始序列;有复权事件的标的(如 `sz000001`、`sz159915`)才返回 `qfqday`。`day` 与 `qfqday` **字段顺序一致**(`[日期,开,收,高,低,量]`),解析时 `qfqday` 为空则回退 `day` 即可。
 - **每根 K 字段顺序：`[日期, 开, 收, 高, 低, 量]`**(O,C,H,L)。
 
 > ⚠️ 注意是 **开、收、高、低**，收在高/低之前，与新浪不同。
@@ -163,5 +164,5 @@ candles = append(candles, indicator.Candle{
     Close:  toF(b.Close),
     Volume: toF(b.Volume),
 })
-res := indicator.Calculate(candles) // → KDJ/MACD/RSI/WR/DMI/CMI/BIAS/CHOP
+res := indicator.Calculate(candles) // → KDJ/MACD/RSI/WR/DMI/CMI/BIAS/CHOP/ATR/BOLL/Donchian/MFI
 ```

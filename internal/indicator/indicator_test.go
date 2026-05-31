@@ -31,6 +31,11 @@ func TestCalculateConstantSeriesStaysNeutral(t *testing.T) {
 	assertNear(t, "BIAS6", last.BIAS.BIAS6, 0, 1e-9)
 	assertNear(t, "DMI.ADX", last.DMI.ADX, 0, 1e-9)
 	assertNear(t, "CHOP", last.CHOP, 50, 1e-9)
+	assertNear(t, "ATR14", last.ATR.ATR14, 0, 1e-9)
+	assertNear(t, "BOLL.Mid", last.BOLL.Mid, 10, 1e-9)
+	assertNear(t, "BOLL.PercentB", last.BOLL.PercentB, 50, 1e-9)
+	assertNear(t, "Donchian.Upper20", last.Donchian.Upper20, 10, 1e-9)
+	assertNear(t, "MFI", last.MFI, 50, 1e-9)
 }
 
 func TestCalculateUptrendSignalsPositiveMomentum(t *testing.T) {
@@ -64,6 +69,18 @@ func TestCalculateUptrendSignalsPositiveMomentum(t *testing.T) {
 	if last.CHOP >= 50 {
 		t.Fatalf("CHOP = %v, want trending (low choppiness)", last.CHOP)
 	}
+	if last.ATR.ATR14 <= 0 || last.ATR.Pct <= 0 {
+		t.Fatalf("ATR = %+v, want positive volatility", last.ATR)
+	}
+	if last.BOLL.PercentB <= 90 {
+		t.Fatalf("BOLL %%B = %v, want price near/above upper band in steady uptrend", last.BOLL.PercentB)
+	}
+	if last.Donchian.Upper20 != candles[len(candles)-1].High {
+		t.Fatalf("Donchian.Upper20 = %v, want latest high %v", last.Donchian.Upper20, candles[len(candles)-1].High)
+	}
+	if last.MFI <= 80 {
+		t.Fatalf("MFI = %v, want strong positive money flow", last.MFI)
+	}
 }
 
 func TestCalculateSampleValues(t *testing.T) {
@@ -89,6 +106,18 @@ func TestCalculateSampleValues(t *testing.T) {
 	assertNear(t, "sample CMI", last.CMI, 73.3333, 1e-4)
 	assertNear(t, "sample BIAS6", last.BIAS.BIAS6, 2.9536, 1e-4)
 	assertNear(t, "sample CHOP", last.CHOP, 42.5969, 1e-4)
+	assertNear(t, "sample ATR14", last.ATR.ATR14, 0.4259, 1e-4)
+	assertNear(t, "sample ATR%", last.ATR.Pct, 3.4908, 1e-4)
+	assertNear(t, "sample BOLL mid", last.BOLL.Mid, 11.36, 1e-4)
+	assertNear(t, "sample BOLL upper", last.BOLL.Upper, 12.8138, 1e-4)
+	assertNear(t, "sample BOLL lower", last.BOLL.Lower, 9.9062, 1e-4)
+	assertNear(t, "sample BOLL %B", last.BOLL.PercentB, 78.8894, 1e-4)
+	assertNear(t, "sample BOLL bandwidth", last.BOLL.Bandwidth, 25.5955, 1e-4)
+	assertNear(t, "sample Donchian upper20", last.Donchian.Upper20, 12.8, 1e-4)
+	assertNear(t, "sample Donchian lower20", last.Donchian.Lower20, 9.8, 1e-4)
+	assertNear(t, "sample Donchian upper55", last.Donchian.Upper55, 12.8, 1e-4)
+	assertNear(t, "sample Donchian lower55", last.Donchian.Lower55, 9.8, 1e-4)
+	assertNear(t, "sample MFI", last.MFI, 50, 1e-4)
 }
 
 // TestCalculateCHOPStaysNonNegative guards the warmup window: the first bar's
@@ -108,6 +137,17 @@ func TestCalculateCHOPStaysNonNegative(t *testing.T) {
 			t.Fatalf("CHOP[%d] = %v, want within [0,100]", i, r.CHOP)
 		}
 	}
+}
+
+func TestCalculateMFIDownFlow(t *testing.T) {
+	candles := make([]Candle, 20)
+	for i := range candles {
+		close := 30 - float64(i)
+		candles[i] = Candle{High: close + 0.5, Low: close - 0.5, Close: close, Volume: 1000}
+	}
+
+	last := Calculate(candles)[len(candles)-1]
+	assertNear(t, "MFI", last.MFI, 0, 1e-9)
 }
 
 func assertNear(t *testing.T, name string, got, want, tol float64) {

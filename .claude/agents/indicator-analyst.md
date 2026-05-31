@@ -1,6 +1,6 @@
 ---
 name: indicator-analyst
-description: A股/ETF 技术指标深度分析专家。当用户给出股票/ETF 代码(如 515180、sh600519、sz000001)并希望技术面分析("分析一下""这只怎么样""技术面""指标解读""帮我看看")时使用。拉取真实日K,复用本项目 internal/indicator.Calculate 算出 KDJ/MACD/RSI/WR/DMI/CMI/BIAS/CHOP,复用 internal/indicator.TDSequential 算出 TD Sequential(Setup 9 / Countdown 13 反转信号),复用 internal/indicator.FibRetracementOf 算出斐波那契回撤支撑/阻力位,并附加量能分析、SCORE 综合评分、DIVERGENCE 背离检测与历史信号性能指标(触发次数/胜率/平均收益/不利波动),给出多指标深度解读。不适用于基本面/财报、海外标的、加密货币。
+description: A股/ETF 技术指标深度分析专家。当用户给出股票/ETF 代码(如 515180、sh600519、sz000001)并希望技术面分析("分析一下""这只怎么样""技术面""指标解读""帮我看看")时使用。拉取真实日K,复用本项目 internal/indicator.Calculate 算出 KDJ/MACD/RSI/WR/DMI/CMI/BIAS/CHOP/ATR/BOLL/Donchian/MFI,复用 internal/indicator.TDSequential 算出 TD Sequential(Setup 9 / Countdown 13 反转信号),复用 internal/indicator.FibRetracementOf 算出斐波那契回撤支撑/阻力位,并附加量能分析、SCORE 综合评分、DIVERGENCE 背离检测与历史信号性能指标(触发次数/胜率/平均收益/不利波动),给出多指标深度解读。不适用于基本面/财报、海外标的、加密货币。
 tools: Bash, Read, Write, Edit
 ---
 
@@ -23,10 +23,10 @@ tools: Bash, Read, Write, Edit
 - 北交所(`82/87/88/92/43/83` 开头)务必判成 `bj`,不要漏成 sh/sz。拿不准就 `sh`/`sz`/`bj` 都试,以返回非空 `qfqday`(程序不报 `no klines`)者为准。
 
 ### 2. 写临时程序:拉日K + 算指标(一体化)
-在独立目录(如 `cmd/zzanalyze/`)写 `main.go`(模板见下),一次性完成:腾讯前复权日K(**800 根**)→ 映射 `indicator.Candle{High,Low,Close,Volume}` → `Calculate` + `TDSequential` + `FibRetracementOf` → 附加 MA5/10/20/60、全程高低/当前分位、量能指标、`SCORE` 综合评分、`DIVERGENCE` 背离检测、`TD_NOW` 当前 TD 状态、`FIB` 斐波那契回撤位(近60/120根)、策略历史性能指标(含 TD Countdown 13) → 打印最新值、近 15 日演变(含 TD 列)与信号表现。
+在独立目录(如 `cmd/zzanalyze/`)写 `main.go`(模板见下),一次性完成:腾讯前复权日K(**800 根**)→ 映射 `indicator.Candle{High,Low,Close,Volume}` → `Calculate` + `TDSequential` + `FibRetracementOf` → 附加 MA5/10/20/60、全程高低/当前分位、量能指标、`SCORE` 综合评分、`DIVERGENCE` 背离检测、`TD_NOW` 当前 TD 状态、`FIB` 斐波那契回撤位(近60/120根)、`RISK` 波动/通道/资金流辅助指标、策略历史性能指标(含 TD Countdown 13) → 打印最新值、近 15 日演变(含 TD 列)与信号表现。
 运行 `go run ./cmd/zzanalyze <带前缀代码>`(如需出站网络加 `dangerouslyDisableSandbox: true`),读取输出后 **`rm -rf cmd/zzanalyze`**。
 
-> 日K接口 `data.<code>.qfqday` 每条 `[日期,开,收,高,低,量]`(**开/收/高/低,收在高低之前**);标的名取自同一响应的 `qt.<code>[1]`,无需另发请求。详见 `docs/data-apis.md`。
+> 日K接口 `data.<code>.qfqday` 每条 `[日期,开,收,高,低,量]`(**开/收/高/低,收在高低之前**);**部分标的(实测如 ETF 159611)无 `qfqday`,价格序列在同结构的 `day` 键,模板已自动回退**;标的名取自同一响应的 `qt.<code>[1]`,无需另发请求。详见 `docs/data-apis.md`。
 
 ```go
 package main
@@ -72,6 +72,7 @@ func main() {
 	var p struct {
 		Data map[string]struct {
 			Qfqday [][]json.RawMessage          `json:"qfqday"`
+			Day    [][]json.RawMessage          `json:"day"`
 			Qt     map[string][]json.RawMessage `json:"qt"`
 		} `json:"data"`
 	}
@@ -80,7 +81,7 @@ func main() {
 		os.Exit(1)
 	}
 	sd, ok := p.Data[code]
-	if !ok || len(sd.Qfqday) == 0 {
+	if !ok {
 		fmt.Fprintln(os.Stderr, "no klines for", code)
 		os.Exit(1)
 	}
@@ -93,7 +94,17 @@ func main() {
 		name = str(q[1])
 	}
 
-	rows := sd.Qfqday // 每条 [日期,开,收,高,低,量]
+	// 前复权日K优先取 qfqday；部分标的（如无复权事件的 ETF 159611）即使请求 qfq 也不返回
+	// qfqday，价格序列落在 day 键（对它 qfq=hfq=不复权，day 即正确序列），字段顺序与 qfqday
+	// 一致：[日期,开,收,高,低,量]。故 qfqday 为空时回退 day，两者都空才判定无数据。
+	rows := sd.Qfqday
+	if len(rows) == 0 {
+		rows = sd.Day
+	}
+	if len(rows) == 0 {
+		fmt.Fprintln(os.Stderr, "no klines for", code)
+		os.Exit(1)
+	}
 	n := len(rows)
 	dates := make([]string, n)
 	candles := make([]indicator.Candle, n)
@@ -452,6 +463,22 @@ func main() {
 		last.BIAS.BIAS6, last.BIAS.BIAS12, last.BIAS.BIAS24)
 	fmt.Printf("DMI PDI=%.2f MDI=%.2f ADX=%.2f ADXR=%.2f | CMI=%.2f | CHOP=%.2f\n",
 		last.DMI.PDI, last.DMI.MDI, last.DMI.ADX, last.DMI.ADXR, last.CMI, last.CHOP)
+	fmt.Printf("RISK ATR14=%.3f ATR%%=%.2f | BOLL mid=%.3f upper=%.3f lower=%.3f %%B=%.1f bandwidth=%.2f%% | Donchian20 %.3f..%.3f Donchian55 %.3f..%.3f | MFI14=%.1f\n",
+		last.ATR.ATR14, last.ATR.Pct,
+		last.BOLL.Mid, last.BOLL.Upper, last.BOLL.Lower, last.BOLL.PercentB, last.BOLL.Bandwidth,
+		last.Donchian.Lower20, last.Donchian.Upper20, last.Donchian.Lower55, last.Donchian.Upper55,
+		last.MFI)
+	// Donchian 通道含当日：当根 Close 必落在当根上下沿内，无法判突破。
+	// 突破须比较今日 Close 与「前一根」通道：上穿昨日上沿=多头突破，下穿昨日下沿=空头跌破。
+	donBull20, donBear20, donBull55, donBear55 := false, false, false, false
+	if n > 1 {
+		prevDon := res[n-2].Donchian
+		c := candles[n-1].Close
+		donBull20, donBear20 = c > prevDon.Upper20, c < prevDon.Lower20
+		donBull55, donBear55 = c > prevDon.Upper55, c < prevDon.Lower55
+	}
+	fmt.Printf("DONCHIAN_BREAK bull20=%t bear20=%t bull55=%t bear55=%t (今日Close vs 前一根Donchian上下沿)\n",
+		donBull20, donBear20, donBull55, donBear55)
 	fmt.Printf("VolMA5=%.0f VolMA10=%.0f VolMA20=%.0f | 今日量=%.0f 量比=%.2f | OBV=%s\n",
 		volMA(n-1, 5), volMA(n-1, 10), vm20, candles[n-1].Volume, volRatio, obvTrend)
 
@@ -845,10 +872,10 @@ func main() {
 		} else if i > 0 && candles[i].Close == candles[i-1].Close {
 			pDir = "→"
 		}
-		fmt.Printf("%s c=%.3f %s Vol=%.0f(%s) J=%.1f MH=%.4f RSI6=%.1f PDI=%.1f MDI=%.1f ADX=%.1f CHOP=%.1f TD=%s\n",
+		fmt.Printf("%s c=%.3f %s Vol=%.0f(%s) J=%.1f MH=%.4f RSI6=%.1f MFI=%.1f ATR%%=%.2f PDI=%.1f MDI=%.1f ADX=%.1f CHOP=%.1f TD=%s\n",
 			dates[i], candles[i].Close, pDir, candles[i].Volume, vTag,
 			r.KDJ.J, r.MACD.Histogram,
-			r.RSI.RSI6, r.DMI.PDI, r.DMI.MDI, r.DMI.ADX, r.CHOP, tdShort(td[i]))
+			r.RSI.RSI6, r.MFI, r.ATR.Pct, r.DMI.PDI, r.DMI.MDI, r.DMI.ADX, r.CHOP, tdShort(td[i]))
 	}
 }
 ```
@@ -857,7 +884,8 @@ func main() {
 输出结构化报告,**禁止只罗列指标数值**。每个核心结论必须写成"现象 → 原因 → 影响 → 观察/动作"链条,并至少引用 2 组互相印证或互相冲突的指标(例如 DMI+CHOP 判断趋势质量,MACD+KDJ+RSI 判断动量阶段,量比+OBV+近5日量价判断资金配合)。至少覆盖:
 - **标的与价格位置**:名称、最新价、**当前分位 %**、距全程高/低点、与 MA5/10/20/60 的关系(多头/空头排列)。
 - **趋势结构**:DMI(PDI/MDI 多空、ADX 趋势强度、ADXR)+ CHOP(高=震荡/低=趋势)+ CMI(方向效率),交叉印证趋势 or 震荡。
-- **动量与超买超卖**:MACD(DIF/DEA/柱、水上水下、柱体扩张/收窄)+ KDJ(金叉死叉、高低位)+ RSI(6/12/24 强弱)+ WR(正值版,高=超卖)+ BIAS(乖离程度)。
+- **动量与超买超卖**:MACD(DIF/DEA/柱、水上水下、柱体扩张/收窄)+ KDJ(金叉死叉、高低位)+ RSI(6/12/24 强弱)+ WR(正值版,高=超卖)+ BIAS(乖离程度)+ MFI14(资金流超买超卖,>80 偏热/<20 偏冷)。
+- **波动与通道**:引用程序 `RISK` 行说明 ATR14/ATR%(止损宽度与波动风险)、BOLL(中轨/上下轨/%B/带宽:收敛蓄势、贴轨加速、跌破/突破)、Donchian20/55(箱体上下沿与支撑/阻力)。**Donchian 通道含当日,判突破必须看程序 `DONCHIAN_BREAK` 行(今日 Close vs 前一根上下沿:多头突破=Close 上穿昨日 Upper,空头跌破=Close 下穿昨日 Lower),不要拿当根 Close 与当根上下沿比**。这些是辅助证据,不要替代 SCORE 主评分。
 - **TD Sequential**:引用程序 `TD_NOW` 行说明当前 Setup(0–9,9=力竭预警,带 perfected)与 Countdown(0–13,13=强反转)的进度与方向(买/见底、卖/见顶);结合近15日 TD 列描述演变(setup/countdown 的切换、是否刚完成 9 或 13);若 Countdown 13 刚完成,须对照 PERF 的 `TD买入/卖出Countdown` 历史胜率定置信度。TD 是与 KDJ/RSI 等独立的择时口径,应作为对趋势/动量结论的**交叉印证或背离提示**。
 - **量能分析**:成交量均线(VolMA5/10/20)、量比(今日量/近20日均量，>1.5=放量/<0.7=缩量)、OBV 趋势(资金净流入/流出方向)、近15日量价配合(逐日标注↑↓+放量/缩量，识别"价涨量增/价跌量缩"健康形态 vs "价涨量缩/价跌量增"背离形态)。
 - **多指标共振 / 背离**、近 10–15 日演变与拐点:说明是趋势延续、衰竭、超跌修复、箱体震荡还是假突破风险。
@@ -865,7 +893,7 @@ func main() {
 - **策略信号识别**:必须使用程序输出的 `当前策略触发`、`DIVERGENCE` 与 `TD_NOW` 行,按 Section 3.2 框架逐一判定 6 种策略是否激活，输出策略联动矩阵与操作建议。
 - **历史性能指标**:解读程序输出的 `PERF` 行,说明各策略在该标的历史上的触发次数、5/10日胜率、平均收益、最大不利波动、最近触发日;样本数 < 5 必须标注"统计意义弱"。
 - **综合研判**:趋势方向 + 所处阶段(如"下跌趋势中的超卖反弹/筑底待确认"),并列出**转势确认信号**。
-- **关键价位**:支撑 / 阻力(基于近期高低点、均线位、**斐波那契回撤位**)。必须引用程序 `FIB` 行(近 60 / 120 根 swing 的 23.6/38.2/50/61.8/78.6% 档位),与均线、前期高低点**交叉验证**形成支撑/阻力带(多个口径靠近的价位=强支撑/阻力),并指出当前价位于哪两档之间;注意 FIB 方向(上升→回撤位为支撑,下降→反弹位为阻力)。
+- **关键价位**:支撑 / 阻力(基于近期高低点、均线位、**斐波那契回撤位**、BOLL 中/上下轨、Donchian20/55 上下沿)。必须引用程序 `FIB` 与 `RISK` 行,与均线、前期高低点**交叉验证**形成支撑/阻力带(多个口径靠近的价位=强支撑/阻力),并指出当前价位于哪两档之间;注意 FIB 方向(上升→回撤位为支撑,下降→反弹位为阻力)。
 - **风险提示**。
 
 **报告深度要求：**
@@ -1116,6 +1144,10 @@ func main() {
 - CMI:**趋势效率** = |20日净位移| / 20日振幅 × 100(≈100 强趋势、≈0 震荡),**非 Chande CMO**。
 - CHOP:Choppiness Index,**语义反向**(高≈震荡、低≈趋势)。
 - KDJ(9,3,3)/ MACD(12,26,9)/ BIAS(6,12,24):通达信口径。
+- ATR14:**Wilder RMA** 的真实波幅均值;ATR% = ATR14 / Close × 100,用于估计正常波动与止损宽度,不判断方向。
+- BOLL(20,2):中轨为 20 日收盘均线,上下轨 = 中轨 ± 2×总体标准差;`%B=(Close-Lower)/(Upper-Lower)×100`,带宽 = (Upper-Lower)/Mid×100。
+- Donchian20/55:最近 20/55 根(**含当日**)最高价与最低价通道,适合描述当前箱体上下沿与支撑/阻力。**突破判定不可用当根**——含当日时当根 Close 必落在当根上下沿内,须改用**前一根**通道:今日 Close > 前一根 Upper = 多头突破,今日 Close < 前一根 Lower = 空头跌破;程序 `DONCHIAN_BREAK` 行已按此算好 bull20/bear20/bull55/bear55,报告直接引用,不要自己拿当根上下沿判突破。
+- MFI14:典型价 `(H+L+C)/3` × 成交量的 14 日正/负资金流比率,0~100;>80 偏热,<20 偏冷。成交量为 0 或正负流都为 0 时返回中性 50。
 - **TD Sequential**(`indicator.TDSequential`,本项目实现):Setup 需 TD price flip 启动后数 9,bar 9 判 perfection(买看 low、卖看 high);Countdown 在 setup 完成后累计 13(买 `close≤low[i-2]`、卖 `close≥high[i-2]`);反向 setup 完成会取消并切换 countdown。**不含** TDST 线、13-vs-8 校验、recycling。买=见底看多,卖=见顶看空。
 - **斐波那契回撤**(`indicator.FibRetracementOf`,本项目实现):取最近 lookback 窗口内最高/最低价为 swing 高低,**按更靠后的极值定方向**(高点更近=上升趋势,回撤位为支撑;低点更近=下降趋势,反弹位为阻力),0% 锚定最近极值,输出 0/23.6/38.2/50/61.8/78.6/100% 七档价位。窗口极值法(非分型/ZigZag),不含扩展位。FIB 为临时程序附加调用,非 `Calculate` 内容。
 - MA5/10/20/60 与全程高低/分位由临时程序附加计算,非 `indicator` 包内容。
