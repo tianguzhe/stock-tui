@@ -79,7 +79,7 @@ func parseBossMode(raw string) (bool, error) {
 	}
 }
 
-// 自动为纯数字代码加市场前缀（6开头→sh，0/3开头→sz）
+// 自动为纯数字代码加市场前缀（沪市 6/5/11，深市 0/3/12/15/16/18，北交所 92/43/8x）
 func normalizeCodes(raw []string) []string {
 	out := make([]string, 0, len(raw))
 	for _, group := range raw {
@@ -88,18 +88,30 @@ func normalizeCodes(raw []string) []string {
 			if c == "" {
 				continue
 			}
-			if strings.HasPrefix(c, "sh") || strings.HasPrefix(c, "sz") || strings.HasPrefix(c, "hk") {
+			if strings.HasPrefix(c, "sh") || strings.HasPrefix(c, "sz") ||
+				strings.HasPrefix(c, "bj") || strings.HasPrefix(c, "hk") {
 				out = append(out, c)
 				continue
 			}
 			if len(c) == 6 {
-				switch c[0] {
-				case '6':
+				// 多数市场看首位即可，但 1 开头(沪市可转债 11 / 深市基金债 12、15、16、18)与
+				// 北交所(92、43、8x)必须看前两位才能区分，故先按前两位匹配，再回退到首位大类。
+				switch c[:2] {
+				case "11": // 沪市可转债
 					out = append(out, "sh"+c)
-				case '0', '3':
+				case "12", "15", "16", "18": // 深市可转债 12 / 基金 LOF/ETF 15、16 / 封基 18
 					out = append(out, "sz"+c)
+				case "43", "82", "83", "87", "88", "92": // 北交所：新三板平移 43/8x、920 新号段(前两位 92)、82 优先股
+					out = append(out, "bj"+c)
 				default:
-					out = append(out, "sh"+c)
+					switch c[0] {
+					case '6', '5': // 沪市：股票 6 / 基金 ETF 5
+						out = append(out, "sh"+c)
+					case '0', '3': // 深市：股票 0 / 创业板 3
+						out = append(out, "sz"+c)
+					default:
+						out = append(out, "sh"+c)
+					}
 				}
 			}
 		}

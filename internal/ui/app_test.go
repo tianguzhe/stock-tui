@@ -2,7 +2,6 @@ package ui
 
 import (
 	"errors"
-	"math"
 	"regexp"
 	"strings"
 	"testing"
@@ -83,28 +82,26 @@ func TestChartYAxisWidthMatchesAsciigraphLabelPad(t *testing.T) {
 	}
 }
 
-func TestSplitMinuteSeriesUsesPreviousCloseBaseline(t *testing.T) {
+func TestChartSeriesOptionsKeepsPriceContinuousAcrossBaseline(t *testing.T) {
 	points := []api.MinutePoint{
 		{Time: "09:31", Price: 9},
-		{Time: "09:32", Price: 11},
+		{Time: "09:32", Price: 10},
+		{Time: "09:33", Price: 11},
 	}
 
-	redS, greenS, closeS := splitMinuteSeries(points, 10, true)
-	if !math.IsNaN(redS[0]) || greenS[0] != 9 {
-		t.Fatalf("first point red/green = (%v, %v), want green only", redS[0], greenS[0])
+	series, _ := (Model{}).chartSeriesOptions(points, 10, true)
+	if len(series) != 2 {
+		t.Fatalf("series count = %d, want baseline + continuous price series", len(series))
 	}
-	if redS[1] != 11 || greenS[1] != 11 {
-		t.Fatalf("crossing point red/green = (%v, %v), want bridged on both series", redS[1], greenS[1])
+	for i, got := range series[0] {
+		if got != 10 {
+			t.Fatalf("baseline series[%d] = %v, want 10", i, got)
+		}
 	}
-	if closeS[0] != 10 || closeS[1] != 10 {
-		t.Fatalf("close series = %v, want constant previous close", closeS)
-	}
-}
-
-func TestSplitMinuteSeriesCanHidePreviousCloseLine(t *testing.T) {
-	_, _, closeS := splitMinuteSeries([]api.MinutePoint{{Time: "09:31", Price: 9}}, 10, false)
-	if !math.IsNaN(closeS[0]) {
-		t.Fatalf("closeS[0] = %v, want NaN when baseline line is hidden", closeS[0])
+	for i, want := range []float64{9, 10, 11} {
+		if series[1][i] != want {
+			t.Fatalf("price series[%d] = %v, want %v; full series=%v", i, series[1][i], want, series)
+		}
 	}
 }
 

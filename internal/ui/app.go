@@ -554,20 +554,30 @@ func (m Model) chartSeriesOptions(points []api.MinutePoint, baseline float64, sh
 		return [][]float64{minutePrices(points)}, nil
 	}
 
-	redS, greenS, closeS := splitMinuteSeries(points, baseline, showBaseline)
-	series := [][]float64{redS, greenS}
+	priceS := minutePrices(points)
+	priceColor := asciigraph.AnsiColor(151) // Mocha green: 低于等于昨收
+	if len(points) > 0 && points[len(points)-1].Price > baseline {
+		priceColor = asciigraph.AnsiColor(211) // Mocha red: 高于昨收
+	}
+	series := [][]float64{priceS}
 	colors := []asciigraph.AnsiColor{
-		asciigraph.AnsiColor(211), // Mocha red: 高于昨收
-		asciigraph.AnsiColor(151), // Mocha green: 低于等于昨收
+		priceColor,
 	}
 	chars := []asciigraph.CharSet{
 		asciigraph.DefaultCharSet,
-		asciigraph.DefaultCharSet,
 	}
 	if showBaseline {
-		series = append(series, closeS)
-		colors = append(colors, asciigraph.AnsiColor(183)) // Mocha mauve: 昨收参考线
-		chars = append(chars, asciigraph.CreateCharSet("┈"))
+		// Draw the reference line as a background series. The price series remains
+		// a single continuous line so crossing the reference line never splits it.
+		series = [][]float64{baselineSeries(len(points), baseline), priceS}
+		colors = []asciigraph.AnsiColor{
+			asciigraph.AnsiColor(183), // Mocha mauve: 昨收参考线
+			priceColor,
+		}
+		chars = []asciigraph.CharSet{
+			asciigraph.CreateCharSet("┈"),
+			asciigraph.DefaultCharSet,
+		}
 	}
 
 	return series, []asciigraph.Option{
@@ -585,45 +595,20 @@ func (m Model) noChartDataText() string {
 	return "  暂无分时数据（可能为非交易时间）"
 }
 
-func splitMinuteSeries(points []api.MinutePoint, baseline float64, showBaseline bool) ([]float64, []float64, []float64) {
-	nan := math.NaN()
-	redS := make([]float64, len(points))
-	greenS := make([]float64, len(points))
-	closeS := make([]float64, len(points))
-
-	for i, p := range points {
-		above := p.Price > baseline
-		if above {
-			redS[i] = p.Price
-			greenS[i] = nan
-		} else {
-			greenS[i] = p.Price
-			redS[i] = nan
-		}
-		if showBaseline {
-			closeS[i] = baseline
-		} else {
-			closeS[i] = nan
-		}
-
-		if i > 0 {
-			prevAbove := points[i-1].Price > baseline
-			if prevAbove != above {
-				redS[i] = p.Price
-				greenS[i] = p.Price
-			}
-		}
-	}
-
-	return redS, greenS, closeS
-}
-
 func minutePrices(points []api.MinutePoint) []float64 {
 	prices := make([]float64, len(points))
 	for i, p := range points {
 		prices[i] = p.Price
 	}
 	return prices
+}
+
+func baselineSeries(length int, baseline float64) []float64 {
+	series := make([]float64, length)
+	for i := range series {
+		series[i] = baseline
+	}
+	return series
 }
 
 func minuteChartBounds(points []api.MinutePoint, baseline float64, prec int) (float64, float64, bool) {
