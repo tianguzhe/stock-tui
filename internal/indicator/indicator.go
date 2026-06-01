@@ -10,20 +10,21 @@ type Candle struct {
 }
 
 type Result struct {
-	KDJ      KDJ
-	MACD     MACD
-	RSI      RSI
-	WR       WR
-	DMI      DMI
-	CMI      float64
-	BIAS     BIAS
-	CHOP     float64
-	ATR      ATR
-	BOLL     BOLL
-	Donchian Donchian
-	MFI      float64
-	SAR      SAR
-	Keltner  Keltner
+	KDJ        KDJ
+	MACD       MACD
+	RSI        RSI
+	WR         WR
+	DMI        DMI
+	CMI        float64
+	BIAS       BIAS
+	CHOP       float64
+	ATR        ATR
+	BOLL       BOLL
+	Donchian   Donchian
+	MFI        float64
+	SAR        SAR
+	Keltner    Keltner
+	SuperTrend SuperTrend
 }
 
 type KDJ struct {
@@ -100,6 +101,16 @@ type Keltner struct {
 	Squeeze bool
 }
 
+// SuperTrend is the ATR-band trend follower: a single trailing line that sits
+// below price in an uptrend (support) and above it in a downtrend (resistance),
+// plus the discrete trend stance and whether this bar flipped it. It is smoother
+// and lower-noise than SAR, better suited as a "what's the trend" readout.
+type SuperTrend struct {
+	Value    float64 // the SuperTrend line (lower band when long, upper band when short)
+	Long     bool    // true: uptrend (close above the line); false: downtrend
+	Reversed bool    // true only on the bar where the stance flipped
+}
+
 func Calculate(candles []Candle) []Result {
 	results := make([]Result, len(candles))
 	if len(candles) == 0 {
@@ -120,6 +131,7 @@ func Calculate(candles []Candle) []Result {
 	fillMFI(candles, results)
 	fillSAR(candles, results)
 	fillKeltner(candles, results) // reads results[i].BOLL, so must run after fillBOLL
+	fillSuperTrend(candles, results)
 
 	return results
 }
@@ -482,6 +494,59 @@ func fillKeltner(candles []Candle, results []Result) {
 		// (both bands collapse to the mid) is not a squeeze, so use strict <.
 		squeeze := results[i].BOLL.Upper < upper && results[i].BOLL.Lower > lower
 		results[i].Keltner = Keltner{Mid: emaClose, Upper: upper, Lower: lower, Squeeze: squeeze}
+	}
+}
+
+// fillSuperTrend computes the SuperTrend (ATR period 10, multiplier 3). Each bar
+// derives basic upper/lower bands from the HL2 midpoint ± mult*ATR; the "final"
+// bands ratchet so they only tighten toward price until breached. The stance
+// flips long when close crosses above the final upper band and short when it
+// crosses below the final lower band; the line is the lower band while long and
+// the upper band while short. ATR uses Wilder RMA seeded from the first bar, and
+// the first bar (no prior trend) defaults to long, matching the other indicators'
+// warmup style.
+func fillSuperTrend(candles []Candle, results []Result) {
+	const period = 10
+	const mult = 3.0
+	var atr, finalUpper, finalLower float64
+	long := true
+	for i, candle := range candles {
+		tr := candle.High - candle.Low
+		if i > 0 {
+			tr = trueRange(candle, candles[i-1].Close)
+		}
+		atr = wilderRMA(atr, tr, period)
+		mid := (candle.High + candle.Low) / 2
+		basicUpper := mid + mult*atr
+		basicLower := mid - mult*atr
+
+		if i == 0 {
+			finalUpper, finalLower = basicUpper, basicLower
+			results[i].SuperTrend = SuperTrend{Value: finalLower, Long: true}
+			continue
+		}
+
+		// Ratchet the final bands against the PRIOR bar's final band/close, so
+		// each band only moves closer to price unless the prior close pierced it.
+		prevClose := candles[i-1].Close
+		if basicUpper < finalUpper || prevClose > finalUpper {
+			finalUpper = basicUpper
+		}
+		if basicLower > finalLower || prevClose < finalLower {
+			finalLower = basicLower
+		}
+
+		prevLong := long
+		if long && candle.Close < finalLower {
+			long = false
+		} else if !long && candle.Close > finalUpper {
+			long = true
+		}
+		line := finalUpper
+		if long {
+			line = finalLower
+		}
+		results[i].SuperTrend = SuperTrend{Value: line, Long: long, Reversed: long != prevLong}
 	}
 }
 

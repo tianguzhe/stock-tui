@@ -46,6 +46,11 @@ func TestCalculateConstantSeriesStaysNeutral(t *testing.T) {
 	if last.Keltner.Squeeze {
 		t.Fatalf("Keltner.Squeeze = true, want false when bands collapse to the mean")
 	}
+	// A flat series never breaks SuperTrend either: it stays long at the band (=10).
+	assertNear(t, "SuperTrend.Value", last.SuperTrend.Value, 10, 1e-9)
+	if !last.SuperTrend.Long {
+		t.Fatalf("SuperTrend.Long = false, want long on a flat series")
+	}
 }
 
 func TestCalculateUptrendSignalsPositiveMomentum(t *testing.T) {
@@ -138,6 +143,10 @@ func TestCalculateSampleValues(t *testing.T) {
 	if last.Keltner.Squeeze {
 		t.Fatalf("sample Keltner.Squeeze = true, want false")
 	}
+	assertNear(t, "sample SuperTrend", last.SuperTrend.Value, 10.7996, 1e-4)
+	if !last.SuperTrend.Long {
+		t.Fatalf("sample SuperTrend.Long = false, want long in a rising sample")
+	}
 }
 
 // TestCalculateCHOPStaysNonNegative guards the warmup window: the first bar's
@@ -223,6 +232,42 @@ func TestCalculateKeltnerSqueeze(t *testing.T) {
 	}
 	if !last.Keltner.Squeeze {
 		t.Fatalf("Keltner.Squeeze = false, want true (BOLL inside Keltner)")
+	}
+}
+
+// TestCalculateSuperTrendUptrendThenReverse: a long steady climb keeps SuperTrend
+// below price in a long stance, then a sharp decline must flip it to short with
+// Reversed=true on the flip bar (it trails by ATR*3, so the legs are long enough
+// for the band to settle before the flip).
+func TestCalculateSuperTrendUptrendThenReverse(t *testing.T) {
+	var candles []Candle
+	for i := 0; i < 20; i++ {
+		c := 10 + float64(i) // rising leg
+		candles = append(candles, Candle{High: c + 0.5, Low: c - 0.5, Close: c})
+	}
+	for i := 0; i < 15; i++ {
+		c := 29 - float64(i)*2 // sharp decline
+		candles = append(candles, Candle{High: c + 0.5, Low: c - 0.5, Close: c})
+	}
+
+	res := Calculate(candles)
+	if !res[19].SuperTrend.Long {
+		t.Fatalf("bar19 SuperTrend.Long = false, want long during the uptrend")
+	}
+	if res[19].SuperTrend.Value >= candles[19].Close {
+		t.Fatalf("bar19 SuperTrend.Value = %v, want below close %v", res[19].SuperTrend.Value, candles[19].Close)
+	}
+	reversed, short := false, false
+	for i := 20; i < len(candles); i++ {
+		if res[i].SuperTrend.Reversed {
+			reversed = true
+		}
+		if !res[i].SuperTrend.Long {
+			short = true
+		}
+	}
+	if !reversed || !short {
+		t.Fatalf("decline never flipped SuperTrend to short (reversed=%v short=%v)", reversed, short)
 	}
 }
 
