@@ -36,6 +36,16 @@ func TestCalculateConstantSeriesStaysNeutral(t *testing.T) {
 	assertNear(t, "BOLL.PercentB", last.BOLL.PercentB, 50, 1e-9)
 	assertNear(t, "Donchian.Upper20", last.Donchian.Upper20, 10, 1e-9)
 	assertNear(t, "MFI", last.MFI, 50, 1e-9)
+	// A flat series never breaks the SAR, so it stays long at the seed low (=10)
+	// and Keltner collapses to the mean with no squeeze (ATR=0 → bands == mid).
+	assertNear(t, "SAR.Value", last.SAR.Value, 10, 1e-9)
+	if !last.SAR.Long {
+		t.Fatalf("SAR.Long = false, want long on a flat series")
+	}
+	assertNear(t, "Keltner.Mid", last.Keltner.Mid, 10, 1e-9)
+	if last.Keltner.Squeeze {
+		t.Fatalf("Keltner.Squeeze = true, want false when bands collapse to the mean")
+	}
 }
 
 func TestCalculateUptrendSignalsPositiveMomentum(t *testing.T) {
@@ -118,6 +128,16 @@ func TestCalculateSampleValues(t *testing.T) {
 	assertNear(t, "sample Donchian upper55", last.Donchian.Upper55, 12.8, 1e-4)
 	assertNear(t, "sample Donchian lower55", last.Donchian.Lower55, 9.8, 1e-4)
 	assertNear(t, "sample MFI", last.MFI, 50, 1e-4)
+	assertNear(t, "sample SAR", last.SAR.Value, 11.1929, 1e-4)
+	if !last.SAR.Long {
+		t.Fatalf("sample SAR.Long = false, want long in a rising sample")
+	}
+	assertNear(t, "sample Keltner mid", last.Keltner.Mid, 10.9841, 1e-4)
+	assertNear(t, "sample Keltner upper", last.Keltner.Upper, 11.4714, 1e-4)
+	assertNear(t, "sample Keltner lower", last.Keltner.Lower, 10.4968, 1e-4)
+	if last.Keltner.Squeeze {
+		t.Fatalf("sample Keltner.Squeeze = true, want false")
+	}
 }
 
 // TestCalculateCHOPStaysNonNegative guards the warmup window: the first bar's
@@ -148,6 +168,62 @@ func TestCalculateMFIDownFlow(t *testing.T) {
 
 	last := Calculate(candles)[len(candles)-1]
 	assertNear(t, "MFI", last.MFI, 0, 1e-9)
+}
+
+// TestCalculateSARUptrendThenReverse climbs steadily (SAR must trail below price
+// in a long stance) then drops sharply: somewhere in the decline the price must
+// pierce the SAR, flipping it to a short stance with Reversed=true on that bar.
+func TestCalculateSARUptrendThenReverse(t *testing.T) {
+	var candles []Candle
+	for i := 0; i < 15; i++ {
+		c := 10 + float64(i) // rising leg
+		candles = append(candles, Candle{High: c + 0.5, Low: c - 0.5, Close: c})
+	}
+	for i := 0; i < 10; i++ {
+		c := 24 - float64(i)*2 // sharp decline
+		candles = append(candles, Candle{High: c + 0.5, Low: c - 0.5, Close: c})
+	}
+
+	res := Calculate(candles)
+	if !res[14].SAR.Long {
+		t.Fatalf("bar14 SAR.Long = false, want long during the uptrend")
+	}
+	if res[14].SAR.Value >= candles[14].Close {
+		t.Fatalf("bar14 SAR.Value = %v, want below close %v", res[14].SAR.Value, candles[14].Close)
+	}
+	reversed, short := false, false
+	for i := 15; i < len(candles); i++ {
+		if res[i].SAR.Reversed {
+			reversed = true
+		}
+		if !res[i].SAR.Long {
+			short = true
+		}
+	}
+	if !reversed || !short {
+		t.Fatalf("decline never flipped SAR to short (reversed=%v short=%v)", reversed, short)
+	}
+}
+
+// TestCalculateKeltnerSqueeze holds the close flat (std=0 → BOLL collapses to the
+// mean) while every bar carries an intraday range (ATR>0 → Keltner stays wide).
+// The Bollinger band then sits entirely inside the Keltner channel = squeeze on,
+// the classic volatility-compression / breakout-pending state.
+func TestCalculateKeltnerSqueeze(t *testing.T) {
+	candles := make([]Candle, 40)
+	for i := range candles {
+		candles[i] = Candle{High: 100.5, Low: 99.5, Close: 100}
+	}
+
+	last := Calculate(candles)[len(candles)-1]
+	assertNear(t, "Keltner.Mid", last.Keltner.Mid, 100, 1e-9)
+	if !(last.Keltner.Upper > last.BOLL.Upper && last.Keltner.Lower < last.BOLL.Lower) {
+		t.Fatalf("Keltner %v..%v should bracket BOLL %v..%v",
+			last.Keltner.Lower, last.Keltner.Upper, last.BOLL.Lower, last.BOLL.Upper)
+	}
+	if !last.Keltner.Squeeze {
+		t.Fatalf("Keltner.Squeeze = false, want true (BOLL inside Keltner)")
+	}
 }
 
 func assertNear(t *testing.T, name string, got, want, tol float64) {

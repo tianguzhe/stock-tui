@@ -1,6 +1,6 @@
 ---
 name: indicator-analyst
-description: A股/ETF 技术指标深度分析专家。当用户给出股票/ETF 代码(如 515180、sh600519、sz000001)并希望技术面分析("分析一下""这只怎么样""技术面""指标解读""帮我看看")时使用。拉取真实日K,复用本项目 internal/indicator.Calculate 算出 KDJ/MACD/RSI/WR/DMI/CMI/BIAS/CHOP/ATR/BOLL/Donchian/MFI,复用 internal/indicator.TDSequential 算出 TD Sequential(Setup 9 / Countdown 13 反转信号),复用 internal/indicator.FibRetracementOf 算出斐波那契回撤支撑/阻力位,并附加量能分析、SCORE 综合评分、DIVERGENCE 背离检测与历史信号性能指标(触发次数/胜率/平均收益/不利波动),给出多指标深度解读。不适用于基本面/财报、海外标的、加密货币。
+description: A股/ETF 技术指标深度分析专家。当用户给出股票/ETF 代码(如 515180、sh600519、sz000001)并希望技术面分析("分析一下""这只怎么样""技术面""指标解读""帮我看看")时使用。拉取真实日K,复用本项目 internal/indicator.Calculate 算出 KDJ/MACD/RSI/WR/DMI/CMI/BIAS/CHOP/ATR/BOLL/Donchian/MFI/SAR/Keltner,复用 internal/indicator.TDSequential 算出 TD Sequential(Setup 9 / Countdown 13 反转信号),复用 internal/indicator.FibRetracementOf 算出斐波那契回撤支撑/阻力位,并附加量能分析、SCORE 综合评分、DIVERGENCE 背离检测与历史信号性能指标(触发次数/胜率/平均收益/不利波动),给出多指标深度解读。不适用于基本面/财报、海外标的、加密货币。
 tools: Bash, Read, Write, Edit
 ---
 
@@ -302,6 +302,9 @@ func main() {
 		RevertBear       bool
 	}
 	evalSignals := func(i int) signalState {
+		// 60 是信号计算的最小历史(需 closeMA(i,60)/MA60 窗口完整),也是下方
+		// lastSig 即时读数的下限——不是回测起点。历史回测另从 80 起以避开 Wilder
+		// 预热(见下方回测循环的说明),两者语义不同,勿一起改。
 		if i < 60 {
 			return signalState{}
 		}
@@ -407,7 +410,11 @@ func main() {
 		return d
 	}
 
-	for i := 60; i+10 < n; i++ {
+	// 回测起点取 80(高于信号最小历史 60):DMI 的 ADX 是 DX→(TR/DM) 的双层
+	// Wilder RMA,且 RMA 从 0 种子递归,约需 60 根才收敛到 <1% 预热偏差。从 60
+	// 起会让最早一批样本的 ADX 系统性偏低,污染"趋势跟随"(ADX>25)等信号的历史
+	// 统计。即时读数(上方 lastSig)仍从最新已收敛的值取,故另用 60 下限,不受此影响。
+	for i := 80; i+10 < n; i++ {
 		s := evalSignals(i)
 		d := evalDivergence(i)
 		if s.TrendBull {
@@ -468,6 +475,13 @@ func main() {
 		last.BOLL.Mid, last.BOLL.Upper, last.BOLL.Lower, last.BOLL.PercentB, last.BOLL.Bandwidth,
 		last.Donchian.Lower20, last.Donchian.Upper20, last.Donchian.Lower55, last.Donchian.Upper55,
 		last.MFI)
+	sarStance := "多(SAR在价格下方=上升停损/支撑)"
+	if !last.SAR.Long {
+		sarStance = "空(SAR在价格上方=下降停损/压力)"
+	}
+	fmt.Printf("SAR_KELT SAR=%.3f stance=%s reversed=%t | Keltner mid=%.3f upper=%.3f lower=%.3f squeeze=%t (squeeze=BOLL收进Keltner=波动压缩待突破方向)\n",
+		last.SAR.Value, sarStance, last.SAR.Reversed,
+		last.Keltner.Mid, last.Keltner.Upper, last.Keltner.Lower, last.Keltner.Squeeze)
 	// Donchian 通道含当日：当根 Close 必落在当根上下沿内，无法判突破。
 	// 突破须比较今日 Close 与「前一根」通道：上穿昨日上沿=多头突破，下穿昨日下沿=空头跌破。
 	donBull20, donBear20, donBull55, donBear55 := false, false, false, false
@@ -872,10 +886,17 @@ func main() {
 		} else if i > 0 && candles[i].Close == candles[i-1].Close {
 			pDir = "→"
 		}
-		fmt.Printf("%s c=%.3f %s Vol=%.0f(%s) J=%.1f MH=%.4f RSI6=%.1f MFI=%.1f ATR%%=%.2f PDI=%.1f MDI=%.1f ADX=%.1f CHOP=%.1f TD=%s\n",
+		sarTag := "多"
+		if !r.SAR.Long {
+			sarTag = "空"
+		}
+		if r.SAR.Reversed {
+			sarTag += "*" // 当日 SAR 翻转
+		}
+		fmt.Printf("%s c=%.3f %s Vol=%.0f(%s) J=%.1f MH=%.4f RSI6=%.1f MFI=%.1f ATR%%=%.2f PDI=%.1f MDI=%.1f ADX=%.1f CHOP=%.1f TD=%s SAR=%s\n",
 			dates[i], candles[i].Close, pDir, candles[i].Volume, vTag,
 			r.KDJ.J, r.MACD.Histogram,
-			r.RSI.RSI6, r.MFI, r.ATR.Pct, r.DMI.PDI, r.DMI.MDI, r.DMI.ADX, r.CHOP, tdShort(td[i]))
+			r.RSI.RSI6, r.MFI, r.ATR.Pct, r.DMI.PDI, r.DMI.MDI, r.DMI.ADX, r.CHOP, tdShort(td[i]), sarTag)
 	}
 }
 ```
@@ -885,7 +906,7 @@ func main() {
 - **标的与价格位置**:名称、最新价、**当前分位 %**、距全程高/低点、与 MA5/10/20/60 的关系(多头/空头排列)。
 - **趋势结构**:DMI(PDI/MDI 多空、ADX 趋势强度、ADXR)+ CHOP(高=震荡/低=趋势)+ CMI(方向效率),交叉印证趋势 or 震荡。
 - **动量与超买超卖**:MACD(DIF/DEA/柱、水上水下、柱体扩张/收窄)+ KDJ(金叉死叉、高低位)+ RSI(6/12/24 强弱)+ WR(正值版,高=超卖)+ BIAS(乖离程度)+ MFI14(资金流超买超卖,>80 偏热/<20 偏冷)。
-- **波动与通道**:引用程序 `RISK` 行说明 ATR14/ATR%(止损宽度与波动风险)、BOLL(中轨/上下轨/%B/带宽:收敛蓄势、贴轨加速、跌破/突破)、Donchian20/55(箱体上下沿与支撑/阻力)。**Donchian 通道含当日,判突破必须看程序 `DONCHIAN_BREAK` 行(今日 Close vs 前一根上下沿:多头突破=Close 上穿昨日 Upper,空头跌破=Close 下穿昨日 Lower),不要拿当根 Close 与当根上下沿比**。这些是辅助证据,不要替代 SCORE 主评分。
+- **波动与通道**:引用程序 `RISK` 行说明 ATR14/ATR%(止损宽度与波动风险)、BOLL(中轨/上下轨/%B/带宽:收敛蓄势、贴轨加速、跌破/突破)、Donchian20/55(箱体上下沿与支撑/阻力);并引用程序 `SAR_KELT` 行解读 **Keltner 通道 + Squeeze**(squeeze=true 表示 BOLL 已收进 Keltner、波动极度压缩、突破临近但**方向未定**,须配合 Donchian/量价突破定方向;squeeze=false 多为已在趋势中)与 **Parabolic SAR**(stance 多/空=当前趋势停损方向,Value=逐日移动止损价,reversed=true=当日刚翻转的择时信号;与 DMI 主方向、ATR% 止损宽度交叉印证,SAR 翻转若与 TD/背离同向则置信度更高)。**Donchian 通道含当日,判突破必须看程序 `DONCHIAN_BREAK` 行(今日 Close vs 前一根上下沿:多头突破=Close 上穿昨日 Upper,空头跌破=Close 下穿昨日 Lower),不要拿当根 Close 与当根上下沿比**。这些是辅助证据,不要替代 SCORE 主评分。
 - **TD Sequential**:引用程序 `TD_NOW` 行说明当前 Setup(0–9,9=力竭预警,带 perfected)与 Countdown(0–13,13=强反转)的进度与方向(买/见底、卖/见顶);结合近15日 TD 列描述演变(setup/countdown 的切换、是否刚完成 9 或 13);若 Countdown 13 刚完成,须对照 PERF 的 `TD买入/卖出Countdown` 历史胜率定置信度。TD 是与 KDJ/RSI 等独立的择时口径,应作为对趋势/动量结论的**交叉印证或背离提示**。
 - **量能分析**:成交量均线(VolMA5/10/20)、量比(今日量/近20日均量，>1.5=放量/<0.7=缩量)、OBV 趋势(资金净流入/流出方向)、近15日量价配合(逐日标注↑↓+放量/缩量，识别"价涨量增/价跌量缩"健康形态 vs "价涨量缩/价跌量增"背离形态)。
 - **多指标共振 / 背离**、近 10–15 日演变与拐点:说明是趋势延续、衰竭、超跌修复、箱体震荡还是假突破风险。
@@ -1148,6 +1169,8 @@ func main() {
 - BOLL(20,2):中轨为 20 日收盘均线,上下轨 = 中轨 ± 2×总体标准差;`%B=(Close-Lower)/(Upper-Lower)×100`,带宽 = (Upper-Lower)/Mid×100。
 - Donchian20/55:最近 20/55 根(**含当日**)最高价与最低价通道,适合描述当前箱体上下沿与支撑/阻力。**突破判定不可用当根**——含当日时当根 Close 必落在当根上下沿内,须改用**前一根**通道:今日 Close > 前一根 Upper = 多头突破,今日 Close < 前一根 Lower = 空头跌破;程序 `DONCHIAN_BREAK` 行已按此算好 bull20/bear20/bull55/bear55,报告直接引用,不要自己拿当根上下沿判突破。
 - MFI14:典型价 `(H+L+C)/3` × 成交量的 14 日正/负资金流比率,0~100;>80 偏热,<20 偏冷。成交量为 0 或正负流都为 0 时返回中性 50。
+- **SAR**(Parabolic SAR,Wilder):AF 0.02 起步、每创新极值 +0.02、上限 0.20;SAR 不侵入前两根价格区间,价格触破即翻转(SAR 跳到旧 EP、AF 重置)。`Value`=止损/翻转价,`Long`=多空 stance(多头 SAR 在价下作支撑/移动止损,空头在价上作压力/移动止损),`Reversed`=本根是否刚翻转(择时信号)。首根无前值,用次日收盘方向播种(单根/平开默认多)。SAR 在震荡市易频繁翻转,须配合 ADX/CHOP 区分趋势 or 震荡。
+- **Keltner**(John Carter TTM 口径):中线 EMA(Close,20),上下轨 = 中线 ± 1.5×ATR(20,Wilder RMA);`Squeeze`=BOLL(20,2σ) 完全收进 Keltner 内(`BOLL.Upper<Keltner.Upper && BOLL.Lower>Keltner.Lower`),表示波动压缩、突破临近,**只提示蓄势不指示方向**;带塌缩到中线(波动为 0)不算 squeeze。Keltner 读取已算好的 BOLL,故 `Calculate` 内在 BOLL 之后填充。
 - **TD Sequential**(`indicator.TDSequential`,本项目实现):Setup 需 TD price flip 启动后数 9,bar 9 判 perfection(买看 low、卖看 high);Countdown 在 setup 完成后累计 13(买 `close≤low[i-2]`、卖 `close≥high[i-2]`);反向 setup 完成会取消并切换 countdown。**不含** TDST 线、13-vs-8 校验、recycling。买=见底看多,卖=见顶看空。
 - **斐波那契回撤**(`indicator.FibRetracementOf`,本项目实现):取最近 lookback 窗口内最高/最低价为 swing 高低,**按更靠后的极值定方向**(高点更近=上升趋势,回撤位为支撑;低点更近=下降趋势,反弹位为阻力),0% 锚定最近极值,输出 0/23.6/38.2/50/61.8/78.6/100% 七档价位。窗口极值法(非分型/ZigZag),不含扩展位。FIB 为临时程序附加调用,非 `Calculate` 内容。
 - MA5/10/20/60 与全程高低/分位由临时程序附加计算,非 `indicator` 包内容。

@@ -22,6 +22,8 @@ type Result struct {
 	BOLL     BOLL
 	Donchian Donchian
 	MFI      float64
+	SAR      SAR
+	Keltner  Keltner
 }
 
 type KDJ struct {
@@ -80,6 +82,24 @@ type Donchian struct {
 	Lower55 float64
 }
 
+// SAR is Wilder's Parabolic SAR: the stop-and-reverse level for the current bar,
+// the trend stance it implies, and whether this bar flipped the stance.
+type SAR struct {
+	Value    float64 // SAR price: trailing stop in an uptrend, ceiling in a downtrend
+	Long     bool    // true: rising stance (SAR below price); false: falling stance
+	Reversed bool    // true only on the bar where price pierced SAR and flipped the stance
+}
+
+// Keltner is the John Carter TTM variant: EMA(20) midline with ATR(20)-based
+// bands. Squeeze is true when the Bollinger band sits entirely inside the
+// Keltner channel — volatility compression that typically precedes a breakout.
+type Keltner struct {
+	Mid     float64
+	Upper   float64
+	Lower   float64
+	Squeeze bool
+}
+
 func Calculate(candles []Candle) []Result {
 	results := make([]Result, len(candles))
 	if len(candles) == 0 {
@@ -98,6 +118,8 @@ func Calculate(candles []Candle) []Result {
 	fillBOLL(candles, results)
 	fillDonchian(candles, results)
 	fillMFI(candles, results)
+	fillSAR(candles, results)
+	fillKeltner(candles, results) // reads results[i].BOLL, so must run after fillBOLL
 
 	return results
 }
@@ -375,6 +397,91 @@ func fillMFI(candles []Candle, results []Result) {
 			results[i].MFI = 100 - 100/(1+pos/neg)
 		}
 		prevTP = tp
+	}
+}
+
+// fillSAR computes Wilder's Parabolic SAR. The acceleration factor (AF) starts
+// at 0.02, steps up by 0.02 each time the extreme point (EP) makes a new
+// favorable extreme, and caps at 0.20. The SAR is constrained so it never moves
+// into the prior two bars' price range; when price pierces it, the stance flips,
+// the SAR jumps to the old EP, EP resets to the new extreme, and AF resets.
+//
+// The first bar has no prior trend to seed from: direction is taken from the
+// first close-to-close change (defaulting to long on a single bar / flat open),
+// matching the "every bar yields a value" warmup style of the other indicators.
+func fillSAR(candles []Candle, results []Result) {
+	const step, maxAF = 0.02, 0.20
+	n := len(candles)
+
+	long := true
+	if n >= 2 {
+		long = candles[1].Close >= candles[0].Close
+	}
+	var sar, ep float64
+	af := step
+	if long {
+		sar, ep = candles[0].Low, candles[0].High
+	} else {
+		sar, ep = candles[0].High, candles[0].Low
+	}
+	results[0].SAR = SAR{Value: sar, Long: long}
+
+	for i := 1; i < n; i++ {
+		sar += af * (ep - sar)
+		reversed := false
+		if long {
+			// SAR may not penetrate the prior one/two bars' lows.
+			sar = math.Min(sar, candles[i-1].Low)
+			if i >= 2 {
+				sar = math.Min(sar, candles[i-2].Low)
+			}
+			if candles[i].Low < sar {
+				long, reversed = false, true
+				sar, ep, af = ep, candles[i].Low, step
+			} else if candles[i].High > ep {
+				ep, af = candles[i].High, math.Min(af+step, maxAF)
+			}
+		} else {
+			sar = math.Max(sar, candles[i-1].High)
+			if i >= 2 {
+				sar = math.Max(sar, candles[i-2].High)
+			}
+			if candles[i].High > sar {
+				long, reversed = true, true
+				sar, ep, af = ep, candles[i].High, step
+			} else if candles[i].Low < ep {
+				ep, af = candles[i].Low, math.Min(af+step, maxAF)
+			}
+		}
+		results[i].SAR = SAR{Value: sar, Long: long, Reversed: reversed}
+	}
+}
+
+// fillKeltner computes the John Carter TTM Keltner channel: an EMA(20) midline
+// with bands at ±1.5*ATR(20) (ATR via Wilder RMA, seeded from the first bar like
+// fillATR). Squeeze is true when the Bollinger band lies fully inside the Keltner
+// channel — a volatility squeeze that often precedes a breakout. It reads
+// results[i].BOLL, so Calculate must run fillBOLL first.
+func fillKeltner(candles []Candle, results []Result) {
+	const period = 20
+	const mult = 1.5
+	emaClose := candles[0].Close
+	var atr float64
+	for i, candle := range candles {
+		if i > 0 {
+			emaClose = ema(emaClose, candle.Close, period)
+		}
+		tr := candle.High - candle.Low
+		if i > 0 {
+			tr = trueRange(candle, candles[i-1].Close)
+		}
+		atr = wilderRMA(atr, tr, period)
+		upper := emaClose + mult*atr
+		lower := emaClose - mult*atr
+		// Squeeze: Bollinger band strictly inside Keltner. A degenerate window
+		// (both bands collapse to the mid) is not a squeeze, so use strict <.
+		squeeze := results[i].BOLL.Upper < upper && results[i].BOLL.Lower > lower
+		results[i].Keltner = Keltner{Mid: emaClose, Upper: upper, Lower: lower, Squeeze: squeeze}
 	}
 }
 
