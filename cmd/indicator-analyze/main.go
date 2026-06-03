@@ -13,6 +13,7 @@ import (
 
 	"stock-tui/internal/indicator"
 	"stock-tui/internal/market"
+	"stock-tui/internal/store"
 )
 
 const defaultBars = 800
@@ -45,11 +46,12 @@ func run(args []string) error {
 	fs := flag.NewFlagSet("indicator-analyze", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	bars := fs.Int("n", defaultBars, "number of daily bars")
+	save := fs.Bool("save", false, "persist the analysis snapshot to the SQLite store")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if fs.NArg() != 1 {
-		return fmt.Errorf("usage: go run ./cmd/indicator-analyze [-n bars] <code>")
+		return fmt.Errorf("usage: go run ./cmd/indicator-analyze [-n bars] [-save] <code>")
 	}
 
 	code, ok := market.NormalizeCode(fs.Arg(0))
@@ -64,8 +66,33 @@ func run(args []string) error {
 	if err != nil {
 		return err
 	}
-	printAnalysis(data)
+	snap := printAnalysis(data)
+	if *save {
+		if err := saveSnapshot(data, snap); err != nil {
+			return fmt.Errorf("save snapshot: %w", err)
+		}
+		fmt.Printf("SAVED %s@%s -> %s\n", snap.Code, snap.TradeDate, store.DefaultPath())
+	}
 	return nil
+}
+
+// saveSnapshot upserts the instrument (name/market from the fetched series) and
+// the analysis snapshot into the SQLite store at store.DefaultPath().
+func saveSnapshot(data seriesData, snap store.Snapshot) error {
+	st, err := store.Open(store.DefaultPath())
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+
+	mkt := ""
+	if len(data.Code) >= 2 {
+		mkt = data.Code[:2]
+	}
+	if err := st.UpsertInstrument(data.Code, data.Name, mkt, ""); err != nil {
+		return err
+	}
+	return st.SaveSnapshot(snap)
 }
 
 func fetchDailyKline(code string, bars int) (seriesData, error) {
@@ -131,7 +158,7 @@ func fetchDailyKline(code string, bars int) (seriesData, error) {
 	return seriesData{Code: code, Name: name, Dates: dates, Candles: candles}, nil
 }
 
-func printAnalysis(data seriesData) {
+func printAnalysis(data seriesData) store.Snapshot {
 	candles := data.Candles
 	dates := data.Dates
 	results := indicator.Calculate(candles)
@@ -194,12 +221,12 @@ func printAnalysis(data seriesData) {
 	fmt.Printf("SCORE total=%d delta=%+d dmi=%+d ma=%+d macd=%+d kdj=%+d rsi=%+d wr=%+d bias=%+d chopcmi=%+d volume=%+d label=%s\n",
 		score.Total, score.Delta, score.DMI, score.MA, score.MACD, score.KDJ, score.RSI, score.WR,
 		score.BIAS, score.CHOPCMI, score.Volume, score.Label)
-	fmt.Printf("当前策略触发: trendBull=%t(%d/4) trendBear=%t(%d/4) oversold=%t(%d/4) overbought=%t(%d/4) breakBull=%t(%d/3) breakBear=%t(%d/3) revertBull=%t(%d/3) revertBear=%t(%d/3) divBull=%t(%d/2,today=%t) divBear=%t(%d/2,today=%t)\n",
+	fmt.Printf("当前策略触发: trendBull=%t(%d/4) trendBear=%t(%d/4) oversold=%t(%d/4) overbought=%t(%d/4) breakBull=%t(%d/3) breakBear=%t(%d/3) revertBull=%t(%d/3) revertBear=%t(%d/3) divBull=%t(%d/1,today=%t) divBear=%t(%d/1,today=%t)\n",
 		score.Signals.TrendBull, score.Signals.TrendBullScore, score.Signals.TrendBear, score.Signals.TrendBearScore,
 		score.Signals.Oversold, score.Signals.OversoldScore, score.Signals.Overbought, score.Signals.OverboughtScore,
 		score.Signals.BreakBull, score.Signals.BreakBullScore, score.Signals.BreakBear, score.Signals.BreakBearScore,
 		score.Signals.RevertBull, score.Signals.RevertBullScore, score.Signals.RevertBear, score.Signals.RevertBearScore,
-		div.Bull, div.BullScore, div.BullToday, div.Bear, div.BearScore, div.BearToday)
+		div.Bull, div.BullScore, div.BullToday, div.Bear, div.BearScore, div.BearToday) // score /1
 	printDivergence(div, dates, candles, results)
 	printTD(tds[n-1])
 	printFib(candles, dates, 60)
@@ -208,6 +235,65 @@ func printAnalysis(data seriesData) {
 	printStreak(candles)
 	printPerf(performance(candles, dates, results, tds, obv))
 	printRecentRows(candles, dates, results, tds)
+
+	// Reuse the values already computed above; printing behavior is unchanged.
+	lastTD := tds[n-1]
+	return store.Snapshot{
+		Code:      data.Code,
+		TradeDate: dates[n-1],
+
+		Close:     lastCandle.Close,
+		ChangePct: changePct,
+
+		MA5:  meanTail(closes, 5),
+		MA10: meanTail(closes, 10),
+		MA20: meanTail(closes, 20),
+		MA60: meanTail(closes, 60),
+
+		KDJ_J:     last.KDJ.J,
+		MACD_DIF:  last.MACD.DIF,
+		MACD_DEA:  last.MACD.DEA,
+		MACD_Hist: last.MACD.Histogram,
+		RSI6:      last.RSI.RSI6,
+		WR14:      last.WR.WR14,
+		BIAS6:     last.BIAS.BIAS6,
+		BIAS24:    last.BIAS.BIAS24,
+
+		PDI:  last.DMI.PDI,
+		MDI:  last.DMI.MDI,
+		ADX:  last.DMI.ADX,
+		ADXR: last.DMI.ADXR,
+		CMI:  last.CMI,
+		CHOP: last.CHOP,
+
+		ATRPct: last.ATR.Pct,
+		BollPB: last.BOLL.PercentB,
+		BollBW: last.BOLL.Bandwidth,
+		MFI:    last.MFI,
+
+		SARLong:        last.SAR.Long,
+		SuperTrendLong: last.SuperTrend.Long,
+
+		VolRatio: volRatio,
+		OBVUp:    len(obv) >= 6 && obv[len(obv)-1] > obv[len(obv)-6],
+
+		ScoreTotal: score.Total,
+		ScoreDelta: score.Delta,
+		ScoreLabel: score.Label,
+
+		SigTrendBull:  score.Signals.TrendBull,
+		SigOverbought: score.Signals.Overbought,
+		SigOversold:   score.Signals.Oversold,
+
+		DivBull:      div.Bull,
+		DivBear:      div.Bear,
+		DivBearToday: div.BearToday,
+
+		TDSetup:     fmt.Sprintf("%s/%d", tdSignalText(lastTD.SetupSignal), lastTD.SetupCount),
+		TDCountdown: fmt.Sprintf("%s/%d", tdSignalText(lastTD.CountdownSignal), lastTD.CountdownCount),
+
+		Streak: streakValue(candles),
+	}
 }
 
 type scoreState struct {
@@ -477,28 +563,65 @@ type divergenceState struct {
 	RefHighIdx int
 }
 
+// divergence detects momentum divergence by comparing today's RSI6 against the
+// RSI6 peak/trough within the recent lookback window rather than comparing two
+// price extremes. This avoids cross-trend comparisons: a lower RSI at a higher
+// price only means divergence when momentum genuinely peaked inside the same move.
+//
+// Bear: RSI already peaked inside the window while price is still up → weakening.
+// Bull: RSI already troughed inside the window while price is still down → strengthening.
 func divergence(candles []indicator.Candle, results []indicator.Result, i int) divergenceState {
-	if i < 34 {
+	const lookback = 20
+	const minGap = 3 // ignore the last few bars to reduce single-day noise
+	if i < lookback {
 		return divergenceState{}
 	}
-	hiIdx, loIdx := windowExtremes(candles, i, 20)
-	refHiIdx, refLoIdx := windowExtremes(candles, i-15, 20)
+
+	refStart := i - lookback
+	refEnd := i - minGap
+
+	// Find the RSI6 peak and trough in [refStart, refEnd].
+	rsiPeakIdx, rsiTroughIdx := refStart, refStart
+	for j := refStart + 1; j <= refEnd; j++ {
+		if results[j].RSI.RSI6 > results[rsiPeakIdx].RSI.RSI6 {
+			rsiPeakIdx = j
+		}
+		if results[j].RSI.RSI6 < results[rsiTroughIdx].RSI.RSI6 {
+			rsiTroughIdx = j
+		}
+	}
+
 	d := divergenceState{
-		Ready: true, HighIdx: hiIdx, LowIdx: loIdx,
-		RefHighIdx: refHiIdx, RefLowIdx: refLoIdx,
+		Ready:      true,
+		HighIdx:    i, RefHighIdx: rsiPeakIdx,
+		LowIdx:     i, RefLowIdx: rsiTroughIdx,
 	}
-	lowNew := candles[loIdx].Low < candles[refLoIdx].Low
-	highNew := candles[hiIdx].High > candles[refHiIdx].High
-	if lowNew {
-		d.BullScore = countTrue(results[loIdx].MACD.DIF > results[refLoIdx].MACD.DIF, results[loIdx].RSI.RSI6 > results[refLoIdx].RSI.RSI6)
-		d.Bull = d.BullScore > 0
-		d.BullToday = d.Bull && loIdx == i
+
+	rsiNow := results[i].RSI.RSI6
+	difNow := results[i].MACD.DIF
+
+	// Bear divergence: RSI already peaked, but price is still at or above the peak
+	// day's close. Confirm we are in high territory (RSI > 60) and MACD positive.
+	if rsiNow > 60 &&
+		rsiNow < results[rsiPeakIdx].RSI.RSI6 &&
+		candles[i].Close >= candles[rsiPeakIdx].Close &&
+		difNow > 0 {
+		d.BearScore = 1
+		d.Bear = true
+		d.BearToday = true
 	}
-	if highNew {
-		d.BearScore = countTrue(results[hiIdx].MACD.DIF < results[refHiIdx].MACD.DIF, results[hiIdx].RSI.RSI6 < results[refHiIdx].RSI.RSI6)
-		d.Bear = d.BearScore > 0
-		d.BearToday = d.Bear && hiIdx == i
+
+	// Bull divergence: RSI already troughed, but price is still at or below the
+	// trough day's close. Confirm low territory (RSI < 40) and MACD negative.
+	if rsiNow < 40 &&
+		rsiNow > results[rsiTroughIdx].RSI.RSI6 &&
+		candles[i].Close <= candles[rsiTroughIdx].Close &&
+		difNow < 0 {
+		d.BullScore = 1
+		d.Bull = true
+		d.BullToday = true
 	}
+
 	return d
 }
 
@@ -617,15 +740,16 @@ func recordPerf(p *perfStat, candles []indicator.Candle, dates []string, i int) 
 
 func printDivergence(d divergenceState, dates []string, candles []indicator.Candle, results []indicator.Result) {
 	if !d.Ready {
-		fmt.Println("DIVERGENCE N/A (样本不足: 需要至少35根日K)")
+		fmt.Println("DIVERGENCE N/A (样本不足: 需要至少20根日K)")
 		return
 	}
-	fmt.Printf("DIVERGENCE bull=%t(%d/2,today=%t) bear=%t(%d/2,today=%t) | low cur=%s %.3f(DIF=%.4f RSI6=%.1f) ref=%s %.3f(DIF=%.4f RSI6=%.1f) | high cur=%s %.3f(DIF=%.4f RSI6=%.1f) ref=%s %.3f(DIF=%.4f RSI6=%.1f)\n",
-		d.Bull, d.BullScore, d.BullToday, d.Bear, d.BearScore, d.BearToday,
-		dates[d.LowIdx], candles[d.LowIdx].Low, results[d.LowIdx].MACD.DIF, results[d.LowIdx].RSI.RSI6,
-		dates[d.RefLowIdx], candles[d.RefLowIdx].Low, results[d.RefLowIdx].MACD.DIF, results[d.RefLowIdx].RSI.RSI6,
-		dates[d.HighIdx], candles[d.HighIdx].High, results[d.HighIdx].MACD.DIF, results[d.HighIdx].RSI.RSI6,
-		dates[d.RefHighIdx], candles[d.RefHighIdx].High, results[d.RefHighIdx].MACD.DIF, results[d.RefHighIdx].RSI.RSI6)
+	// Bear: today vs RSI peak reference; Bull: today vs RSI trough reference.
+	fmt.Printf("DIVERGENCE bull=%t bear=%t | rsiTrough=%s close=%.3f RSI6=%.1f -> today close=%.3f RSI6=%.1f DIF=%.4f | rsiPeak=%s close=%.3f RSI6=%.1f -> today close=%.3f RSI6=%.1f DIF=%.4f\n",
+		d.Bull, d.Bear,
+		dates[d.RefLowIdx], candles[d.RefLowIdx].Close, results[d.RefLowIdx].RSI.RSI6,
+		candles[d.LowIdx].Close, results[d.LowIdx].RSI.RSI6, results[d.LowIdx].MACD.DIF,
+		dates[d.RefHighIdx], candles[d.RefHighIdx].Close, results[d.RefHighIdx].RSI.RSI6,
+		candles[d.HighIdx].Close, results[d.HighIdx].RSI.RSI6, results[d.HighIdx].MACD.DIF)
 }
 
 func printTD(td indicator.TD) {
@@ -658,7 +782,9 @@ func printRecentExtremes(candles []indicator.Candle, dates []string, results []i
 		dates[loIdx], candles[loIdx].Low, results[loIdx].MACD.DIF, results[loIdx].RSI.RSI6)
 }
 
-func printStreak(candles []indicator.Candle) {
+// streakValue returns the current consecutive-close run length, signed:
+// positive for an up run, negative for a down run, 0 when flat or none.
+func streakValue(candles []indicator.Candle) int {
 	streak, direction := 0, 0
 	for i := len(candles) - 1; i > 0; i-- {
 		current := 0
@@ -678,10 +804,15 @@ func printStreak(candles []indicator.Candle) {
 		}
 		streak++
 	}
-	if direction > 0 {
-		fmt.Printf("连续上涨 %d 日\n", streak)
-	} else if direction < 0 {
-		fmt.Printf("连续下跌 %d 日\n", streak)
+	return streak * direction
+}
+
+func printStreak(candles []indicator.Candle) {
+	sv := streakValue(candles)
+	if sv > 0 {
+		fmt.Printf("连续上涨 %d 日\n", sv)
+	} else if sv < 0 {
+		fmt.Printf("连续下跌 %d 日\n", -sv)
 	}
 }
 

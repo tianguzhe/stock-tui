@@ -1,10 +1,15 @@
 stock-tui
 cpu
+indicator-analyze
 .ace-tool/
 .DS_Store
 .gocache/
 
 # 分析产物(每次从接口重新生成,无需版本管理)
 analysis/
+
+# 本地 SQLite 数据库(分析快照与分类,不入库)
+data/
+*.db
 
 .codegraph

@@ -8,20 +8,21 @@ tools: Bash, Read
 
 ## 0. 绝对约束
 
-- 只能用固定命令取数与计算：
+- 只能用固定命令取数与计算，并用 `-save` 把 `SCORE` 与各项技术指标落库（写入 `data/stock.db`，按 `代码+交易日` 去重 UPSERT，方便记录与分类）：
 
 ```bash
-go run ./cmd/indicator-analyze <代码>
+go run ./cmd/indicator-analyze -save <代码>
 ```
 
-- 需要更多样本时只加 `-n`，例如：
+- 需要更多样本时再加 `-n`，例如：
 
 ```bash
-go run ./cmd/indicator-analyze -n 800 600900
+go run ./cmd/indicator-analyze -save -n 800 600900
 ```
 
+- 落库成功时 CLI 末行会输出 `SAVED <代码>@<交易日> -> data/stock.db`；据此确认入库，不要凭空声称已入库。
 - 禁止创建临时 Go 程序、临时测试文件或临时脚本来重算指标。
-- 禁止修改 `internal/`、`cmd/indicator-analyze/` 或任何正式代码；本 agent 只读数据并写分析。
+- 禁止修改 `internal/`、`cmd/indicator-analyze/` 或任何正式代码；本 agent 只取数、落库(`data/stock.db`)并写分析，不改源码。
 - CLI 输出是唯一事实来源。`SCORE`、`当前策略触发`、`DIVERGENCE`、`TD_NOW`、`FIB`、`PERF` 只能引用和解释，不能重算替换。
 - 接口和市场前缀规则以 `docs/data-apis.md` 与 `internal/market.NormalizeCode` 为准。腾讯日K字段为 `[日期,开,收,高,低,量]`，CLI 已处理 `qfqday/day` 回退。
 - 出站网络失败、接口失败、样本不足时如实说明，不编造行情、名称、日期、价格或性能。
@@ -30,12 +31,12 @@ go run ./cmd/indicator-analyze -n 800 600900
 
 ## 1. 运行与异常处理
 
-1. 在项目根目录运行 CLI，优先把用户原始代码直接传入：
+1. 在项目根目录运行 CLI，优先把用户原始代码直接传入，并始终带 `-save` 落库：
 
 ```bash
-go run ./cmd/indicator-analyze 600900
-go run ./cmd/indicator-analyze sh515180
-go run ./cmd/indicator-analyze bj920819
+go run ./cmd/indicator-analyze -save 600900
+go run ./cmd/indicator-analyze -save sh515180
+go run ./cmd/indicator-analyze -save bj920819
 ```
 
 2. 裸码前缀由 CLI 内部归一化。理解规则即可，不要绕过 CLI：
