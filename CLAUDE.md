@@ -47,3 +47,32 @@
 ## 技术面分析 CLI
 - 深度技术面分析优先用固定命令 `go run ./cmd/indicator-analyze <代码>`；不要再写一次性 `cmd/<name>/main.go`。
 - `indicator-analyze` 会拉腾讯日K、处理 `qfqday/day` 回退、复用 `indicator.Calculate` / `TDSequential` / `FibRetracementOf`，并输出 SCORE、DIVERGENCE、TD、FIB、PERF 与近15日演变。
+- 批量落库：`sqlite3 data/stock.db "SELECT code FROM instrument;" | xargs -I{} go run ./cmd/indicator-analyze -save {}`
+
+## 每日复盘日志
+日志目录：`docs/journal/YYYY-MM-DD/journal.md`，按日期建文件夹，每个文件分两区：
+
+**一、昨日复盘**（开盘前填）：对照前日"明日预判"表，逐只填写实际涨跌、对否判断、止损触发记录、复盘小结。
+
+**二、今日分析**（收盘后填）：大盘环境、持仓快照（score/TD/ADX/SAR/ST/止损价/仓位）、信号解读、候补标的、操作记录、明日预判。
+
+**生成脚本**：`./scripts/gen-journal.sh [YYYY-MM-DD]`
+- 自动从 DB 读取全量最新 snapshot 填入"全量快照"表
+- 自动从昨日 journal.md 的"明日预判"章节回填预判对比表
+- 若文件已存在则跳过，幂等安全
+
+**每日工作流**：
+```bash
+# 1. 收盘后批量更新快照
+sqlite3 data/stock.db "SELECT code FROM instrument;" \
+  | xargs -I{} go run ./cmd/indicator-analyze -save {}
+# 2. 生成次日模板
+./scripts/gen-journal.sh
+# 3. 补填昨日复盘区 → 填写今日分析区 → 写明日预判
+```
+
+**日志字段含义速查**：
+- `TD`：优先显示 countdown（如 `C顶3`），无则显示 setup（如 `见顶/8`）；`见顶/8` 次日需警惕进入 countdown
+- `SAR/ST`：`多/多` = SAR 多头 + SuperTrend 多头，双确认；`空/多` 或 `多/空` = 方向混杂，需注意
+- `止损价`：对应当日 SAR 值，跌破即止；需每日从深度分析输出中手动更新
+- 量比口径：量比 < 0.8 = 缩量，> 1.5 = 放量，描述时必须附数值
