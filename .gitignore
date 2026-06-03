@@ -6,3 +6,5 @@ cpu
 
 # 分析产物(每次从接口重新生成,无需版本管理)
 analysis/
+
+.codegraph
