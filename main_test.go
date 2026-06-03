@@ -3,6 +3,8 @@ package main
 import (
 	"reflect"
 	"testing"
+
+	"stock-tui/internal/market"
 )
 
 func TestParseConfigUsesCommaSeparatedCodes(t *testing.T) {
@@ -78,7 +80,7 @@ func TestNormalizeCodesMarketPrefix(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := normalizeCodes([]string{tc.in})
+			got := market.NormalizeCodes([]string{tc.in})
 			if !reflect.DeepEqual(got, []string{tc.want}) {
 				t.Fatalf("normalizeCodes(%q) = %v, want [%s]", tc.in, got, tc.want)
 			}

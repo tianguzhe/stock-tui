@@ -44,5 +44,6 @@
   ```
 - 后续若要添加多个关键百分比标示线,按从背景到前景排序:百分比线/昨收线/开盘线在前,价格线永远最后;测试应断言价格 series 为连续原始价格序列。
 
-## 临时分析脚本
-- `internal/` 仅本 module `stock-tui` 内可 import;一次性分析写 `cmd/<name>/main.go`,`go run` 后 `rm -rf cmd/<name>` 保持源码区干净。
+## 技术面分析 CLI
+- 深度技术面分析优先用固定命令 `go run ./cmd/indicator-analyze <代码>`；不要再写一次性 `cmd/<name>/main.go`。
+- `indicator-analyze` 会拉腾讯日K、处理 `qfqday/day` 回退、复用 `indicator.Calculate` / `TDSequential` / `FibRetracementOf`，并输出 SCORE、DIVERGENCE、TD、FIB、PERF 与近15日演变。
