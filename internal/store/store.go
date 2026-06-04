@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -64,6 +65,17 @@ type Snapshot struct {
 	DivBull, DivBear, DivBearToday bool
 	TDSetup, TDCountdown           string
 	Streak                         int // positive: consecutive up days, negative: down days
+
+	// Fundamental data (populated by indicator-analyze -save via Tencent real-time API).
+	TurnoverRate float64 // 换手率 %
+	MarketCap    float64 // 总市值 亿元
+	PE           float64 // 市盈率动态
+
+	// Raw N-day price returns (%) computed from K-line data during -save.
+	Ret20, Ret60, Ret120 float64
+
+	// RS percentile rankings (0–100) computed by stockdb rs-rank after batch saves.
+	RS20, RS60, RS120 float64
 }
 
 // ScreenRow is a Screen result: the matched instrument joined with its latest snapshot.
@@ -144,11 +156,40 @@ CREATE TABLE IF NOT EXISTS snapshot (
   div_bull INTEGER, div_bear INTEGER, div_bear_today INTEGER,
   td_setup TEXT, td_countdown TEXT,
   streak INTEGER,
+  turnover_rate REAL DEFAULT 0,
+  market_cap REAL DEFAULT 0,
+  pe REAL DEFAULT 0,
+  ret20 REAL,
+  ret60 REAL,
+  ret120 REAL,
+  rs20 REAL DEFAULT 0,
+  rs60 REAL DEFAULT 0,
+  rs120 REAL DEFAULT 0,
   PRIMARY KEY (code, trade_date)
 );`
 	if _, err := s.db.Exec(schema); err != nil {
 		return fmt.Errorf("migrate schema: %w", err)
 	}
+	// Add new columns to existing databases; SQLite does not support IF NOT EXISTS
+	// in ALTER TABLE, so we ignore the "duplicate column name" error.
+	for _, col := range []string{
+		"turnover_rate REAL DEFAULT 0",
+		"market_cap REAL DEFAULT 0",
+		"pe REAL DEFAULT 0",
+		"ret20 REAL",
+		"ret60 REAL",
+		"ret120 REAL",
+		"rs20 REAL DEFAULT 0",
+		"rs60 REAL DEFAULT 0",
+		"rs120 REAL DEFAULT 0",
+	} {
+		s.db.Exec("ALTER TABLE snapshot ADD COLUMN " + col) //nolint:errcheck
+	}
+	// Clear ret values that are all-zero but were written as Go zero-values before
+	// the nDayReturn computation existed. All three being exactly 0 is impossible
+	// for real market data across 20/60/120 days.
+	s.db.Exec(`UPDATE snapshot SET ret20=NULL, ret60=NULL, ret120=NULL
+		WHERE ret20=0 AND ret60=0 AND ret120=0 AND COALESCE(ret20,0)=0`) //nolint:errcheck
 	return nil
 }
 
@@ -223,7 +264,9 @@ INSERT INTO snapshot (
   score_total, score_delta, score_label,
   sig_trend_bull, sig_overbought, sig_oversold,
   div_bull, div_bear, div_bear_today,
-  td_setup, td_countdown, streak
+  td_setup, td_countdown, streak,
+  turnover_rate, market_cap, pe,
+  ret20, ret60, ret120
 ) VALUES (
   ?, ?, ?,
   ?, ?, ?, ?, ?, ?,
@@ -232,6 +275,8 @@ INSERT INTO snapshot (
   ?, ?, ?, ?, ?, ?,
   ?, ?, ?, ?,
   ?, ?, ?, ?,
+  ?, ?, ?,
+  ?, ?, ?,
   ?, ?, ?,
   ?, ?, ?,
   ?, ?, ?,
@@ -249,7 +294,9 @@ ON CONFLICT(code, trade_date) DO UPDATE SET
   score_total=excluded.score_total, score_delta=excluded.score_delta, score_label=excluded.score_label,
   sig_trend_bull=excluded.sig_trend_bull, sig_overbought=excluded.sig_overbought, sig_oversold=excluded.sig_oversold,
   div_bull=excluded.div_bull, div_bear=excluded.div_bear, div_bear_today=excluded.div_bear_today,
-  td_setup=excluded.td_setup, td_countdown=excluded.td_countdown, streak=excluded.streak`,
+  td_setup=excluded.td_setup, td_countdown=excluded.td_countdown, streak=excluded.streak,
+  turnover_rate=excluded.turnover_rate, market_cap=excluded.market_cap, pe=excluded.pe,
+  ret20=excluded.ret20, ret60=excluded.ret60, ret120=excluded.ret120`,
 		snap.Code, snap.TradeDate, time.Now().Format(time.RFC3339),
 		snap.Close, snap.ChangePct, snap.MA5, snap.MA10, snap.MA20, snap.MA60,
 		snap.KDJ_J, snap.MACD_DIF, snap.MACD_DEA, snap.MACD_Hist,
@@ -260,7 +307,9 @@ ON CONFLICT(code, trade_date) DO UPDATE SET
 		snap.ScoreTotal, snap.ScoreDelta, snap.ScoreLabel,
 		boolToInt(snap.SigTrendBull), boolToInt(snap.SigOverbought), boolToInt(snap.SigOversold),
 		boolToInt(snap.DivBull), boolToInt(snap.DivBear), boolToInt(snap.DivBearToday),
-		snap.TDSetup, snap.TDCountdown, snap.Streak)
+		snap.TDSetup, snap.TDCountdown, snap.Streak,
+		snap.TurnoverRate, snap.MarketCap, snap.PE,
+		snap.Ret20, snap.Ret60, snap.Ret120)
 	if err != nil {
 		return fmt.Errorf("save snapshot %s@%s: %w", snap.Code, snap.TradeDate, err)
 	}
@@ -296,7 +345,12 @@ ORDER BY i.code`, tag)
 func (s *Store) History(code string, limit int) ([]Snapshot, error) {
 	rows, err := s.db.Query(`
 SELECT trade_date, close, change_pct, ma5, ma10, ma20, ma60, kdj_j, adx, adxr,
-       rsi6, score_total, score_delta, score_label, td_setup, td_countdown, streak
+       rsi6, score_total, score_delta, score_label, td_setup, td_countdown, streak,
+       COALESCE(turnover_rate,0), COALESCE(market_cap,0), COALESCE(pe,0),
+       COALESCE(ret20,0)  AS ret20,
+       COALESCE(ret60,0)  AS ret60,
+       COALESCE(ret120,0) AS ret120,
+       COALESCE(rs20,0), COALESCE(rs60,0), COALESCE(rs120,0)
 FROM snapshot WHERE code = ?
 ORDER BY trade_date DESC
 LIMIT ?`, code, limit)
@@ -307,14 +361,21 @@ LIMIT ?`, code, limit)
 
 	var out []Snapshot
 	for rows.Next() {
-		var s Snapshot
-		s.Code = code
-		if err := rows.Scan(&s.TradeDate, &s.Close, &s.ChangePct, &s.MA5, &s.MA10, &s.MA20, &s.MA60,
-			&s.KDJ_J, &s.ADX, &s.ADXR, &s.RSI6, &s.ScoreTotal, &s.ScoreDelta, &s.ScoreLabel,
-			&s.TDSetup, &s.TDCountdown, &s.Streak); err != nil {
+		var snap Snapshot
+		snap.Code = code
+		if err := rows.Scan(
+			&snap.TradeDate, &snap.Close, &snap.ChangePct,
+			&snap.MA5, &snap.MA10, &snap.MA20, &snap.MA60,
+			&snap.KDJ_J, &snap.ADX, &snap.ADXR, &snap.RSI6,
+			&snap.ScoreTotal, &snap.ScoreDelta, &snap.ScoreLabel,
+			&snap.TDSetup, &snap.TDCountdown, &snap.Streak,
+			&snap.TurnoverRate, &snap.MarketCap, &snap.PE,
+			&snap.Ret20, &snap.Ret60, &snap.Ret120,
+			&snap.RS20, &snap.RS60, &snap.RS120,
+		); err != nil {
 			return nil, err
 		}
-		out = append(out, s)
+		out = append(out, snap)
 	}
 	return out, rows.Err()
 }
@@ -377,6 +438,86 @@ func boolToInt(b bool) int {
 		return 1
 	}
 	return 0
+}
+
+// UpdateRSRankings reads the ret20/ret60/ret120 stored in each code's latest
+// snapshot (populated by indicator-analyze -save from K-line history), computes
+// cross-sectional percentile ranks (0–100), and writes them back as rs20/rs60/rs120.
+// Returns the number of codes successfully updated.
+func (s *Store) UpdateRSRankings() (int, error) {
+	// Read latest ret20/ret60/ret120 for every code where ret20 has been computed.
+	// Rows where ret20 IS NULL are from old snapshots and are excluded from ranking.
+	rows, err := s.db.Query(`
+SELECT code,
+       ret20  AS r20,
+       COALESCE(ret60,0)  AS r60,
+       COALESCE(ret120,0) AS r120
+FROM snapshot
+WHERE trade_date = (SELECT MAX(trade_date) FROM snapshot s2 WHERE s2.code = snapshot.code)
+  AND ret20 IS NOT NULL`)
+	if err != nil {
+		return 0, fmt.Errorf("read returns: %w", err)
+	}
+	defer rows.Close()
+
+	type entry struct {
+		code           string
+		r20, r60, r120 float64
+	}
+	var entries []entry
+	for rows.Next() {
+		var e entry
+		if err := rows.Scan(&e.code, &e.r20, &e.r60, &e.r120); err != nil {
+			return 0, err
+		}
+		entries = append(entries, e)
+	}
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+
+	rank20 := percentileRanks(entries, func(e entry) (float64, bool) { return e.r20, true })
+	rank60 := percentileRanks(entries, func(e entry) (float64, bool) { return e.r60, true })
+	rank120 := percentileRanks(entries, func(e entry) (float64, bool) { return e.r120, true })
+
+	updated := 0
+	for i, e := range entries {
+		_, err := s.db.Exec(`
+UPDATE snapshot SET rs20=?, rs60=?, rs120=?
+WHERE code=? AND trade_date=(SELECT MAX(trade_date) FROM snapshot WHERE code=?)`,
+			rank20[i], rank60[i], rank120[i], e.code, e.code)
+		if err == nil {
+			updated++
+		}
+	}
+	return updated, nil
+}
+
+type entryVal struct {
+	idx int
+	val float64
+}
+
+// percentileRanks assigns 0–100 percentile rank to each entry. Entries for
+// which getValue returns ok=false receive rank 0 (not enough history).
+func percentileRanks[E any](entries []E, getValue func(E) (float64, bool)) []float64 {
+	ranks := make([]float64, len(entries))
+	valid := make([]entryVal, 0, len(entries))
+	for i, e := range entries {
+		v, ok := getValue(e)
+		if ok {
+			valid = append(valid, entryVal{idx: i, val: v})
+		}
+	}
+	if len(valid) == 0 {
+		return ranks
+	}
+	sort.Slice(valid, func(i, j int) bool { return valid[i].val < valid[j].val })
+	total := float64(len(valid))
+	for rank, ev := range valid {
+		ranks[ev.idx] = float64(rank) / total * 100
+	}
+	return ranks
 }
 
 // marketOf extracts the sh/sz/bj/hk prefix from a normalized code; empty if absent.

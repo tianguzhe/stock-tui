@@ -42,6 +42,8 @@ func run(args []string) error {
 		return cmdHistory(rest)
 	case "screen":
 		return cmdScreen(rest)
+	case "rs-rank":
+		return cmdRSRank(rest)
 	default:
 		return usageErr()
 	}
@@ -53,7 +55,8 @@ func usageErr() error {
   stockdb tag rm  <code> <标签>
   stockdb list --tag <标签>
   stockdb history <code> [-n 15]
-  stockdb screen [--tag X] [--min-adx 25] [--max-j 80] [--min-score 60]`)
+  stockdb screen [--tag X] [--min-adx 25] [--max-j 80] [--min-score 60]
+  stockdb rs-rank                         compute RS20/RS60/RS120 percentile ranks`)
 }
 
 func openStore() (*store.Store, error) {
@@ -177,6 +180,21 @@ func cmdHistory(args []string) error {
 		fmt.Printf("%-12s %8.3f %+6.2f %5d %+5d %6.1f %6.1f  setup=%s cd=%s\n",
 			r.TradeDate, r.Close, r.ChangePct, r.ScoreTotal, r.ScoreDelta, r.KDJ_J, r.ADX, r.TDSetup, r.TDCountdown)
 	}
+	return nil
+}
+
+func cmdRSRank(_ []string) error {
+	st, err := openStore()
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+
+	n, err := st.UpdateRSRankings()
+	if err != nil {
+		return fmt.Errorf("rs-rank: %w", err)
+	}
+	fmt.Printf("rs-rank: updated %d stocks\n", n)
 	return nil
 }
 

@@ -14,19 +14,22 @@ import (
 )
 
 type Stock struct {
-	Code      string
-	Name      string
-	Price     float64
-	Open      float64
-	Close     float64 // 昨收
-	High      float64
-	Low       float64
-	Change    float64 // 涨跌额
-	ChangePct float64 // 涨跌幅%
-	Volume    float64 // 成交量(手)
-	Amount    float64 // 成交额(万元)
-	Precision int     // 价格小数位数（从原始字符串检测）
-	UpdatedAt time.Time
+	Code         string
+	Name         string
+	Price        float64
+	Open         float64
+	Close        float64 // 昨收
+	High         float64
+	Low          float64
+	Change       float64 // 涨跌额
+	ChangePct    float64 // 涨跌幅%
+	Volume       float64 // 成交量(手)
+	Amount       float64 // 成交额(万元)
+	TurnoverRate float64 // 换手率 % (field index 38)
+	PE           float64 // 市盈率动态 (field index 39)
+	MarketCap    float64 // 总市值 亿元 (field index 45)
+	Precision    int     // 价格小数位数（从原始字符串检测）
+	UpdatedAt    time.Time
 }
 
 var reStock = regexp.MustCompile(`v_([a-z]{2}\d+)="([^"]+)"`)
@@ -85,7 +88,7 @@ func parseStock(code, raw string) (Stock, error) {
 		return v
 	}
 
-	return Stock{
+	s := Stock{
 		Code:      code,
 		Name:      fields[1],
 		Price:     toF(fields[3]),
@@ -99,7 +102,17 @@ func parseStock(code, raw string) (Stock, error) {
 		Amount:    toF(fields[37]),
 		Precision: strPrecision(strings.TrimSpace(fields[3])),
 		UpdatedAt: time.Now(),
-	}, nil
+	}
+	if len(fields) > 38 {
+		s.TurnoverRate = toF(fields[38])
+	}
+	if len(fields) > 39 {
+		s.PE = toF(fields[39])
+	}
+	if len(fields) > 45 {
+		s.MarketCap = toF(fields[45])
+	}
+	return s, nil
 }
 
 // strPrecision 从原始价格字符串检测小数位数，如 "2.01"→2，"1275.9"→1

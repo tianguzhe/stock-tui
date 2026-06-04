@@ -1,8 +1,11 @@
 package store
 
 import (
+	"fmt"
 	"path/filepath"
 	"testing"
+
+	_ "modernc.org/sqlite"
 )
 
 func openTemp(t *testing.T) *Store {
@@ -114,6 +117,88 @@ func TestSaveSnapshotUpsertSameDay(t *testing.T) {
 	// Newest first.
 	if hist[0].TradeDate != "2026-06-04" {
 		t.Fatalf("expected newest first, got %s", hist[0].TradeDate)
+	}
+}
+
+func TestMigrationAddsNewColumns(t *testing.T) {
+	// Simulate an existing DB created before the new columns existed: create the
+	// snapshot table without the new columns, then call Open which should add them.
+	path := filepath.Join(t.TempDir(), "legacy.db")
+
+	legacy, err := Open(path)
+	if err != nil {
+		t.Fatalf("initial open: %v", err)
+	}
+	// Drop the new columns by recreating the table without them.  This mimics a
+	// pre-migration database.
+	_, err = legacy.db.Exec(`
+CREATE TABLE IF NOT EXISTS snapshot_legacy AS SELECT code, trade_date, captured_at, close FROM snapshot LIMIT 0;
+DROP TABLE snapshot;
+ALTER TABLE snapshot_legacy RENAME TO snapshot;
+`)
+	if err != nil {
+		t.Fatalf("simulate legacy schema: %v", err)
+	}
+	legacy.Close()
+
+	// Re-open: migrate() should add the missing columns without error.
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatalf("re-open after migration: %v", err)
+	}
+	defer reopened.Close()
+
+	// Verify the new columns exist by querying them.
+	var dummy float64
+	err = reopened.db.QueryRow(
+		`SELECT COALESCE(turnover_rate,0)+COALESCE(market_cap,0)+COALESCE(pe,0)+COALESCE(rs20,0)+COALESCE(rs60,0)+COALESCE(rs120,0) FROM snapshot LIMIT 1`,
+	).Scan(&dummy)
+	// A "no rows" error is fine; "no such column" would be an error.
+	if err != nil && err.Error() != "sql: no rows in result set" {
+		t.Fatalf("new columns not accessible after migration: %v", err)
+	}
+}
+
+func TestUpdateRSRankings(t *testing.T) {
+	s := openTemp(t)
+
+	codes := []string{"sz000001", "sz000002", "sz000003"}
+	for _, c := range codes {
+		if err := s.UpsertInstrument(c, c, "sz", ""); err != nil {
+			t.Fatalf("seed instrument: %v", err)
+		}
+	}
+
+	// Insert 25 snapshots per code at different prices (newest first in time but
+	// inserted oldest first so trade_date order is ascending).
+	for day := 1; day <= 25; day++ {
+		date := fmt.Sprintf("2026-%02d-%02d", day/30+1, day%30+1)
+		for i, c := range codes {
+			close := 10.0 + float64(i)*2 + float64(day)*0.1 // prices all rising, at different rates
+			if err := s.SaveSnapshot(Snapshot{Code: c, TradeDate: date, Close: close}); err != nil {
+				t.Fatalf("seed snapshot: %v", err)
+			}
+		}
+	}
+
+	n, err := s.UpdateRSRankings()
+	if err != nil {
+		t.Fatalf("UpdateRSRankings: %v", err)
+	}
+	if n != len(codes) {
+		t.Fatalf("expected %d updated, got %d", len(codes), n)
+	}
+
+	// All three codes should now have rs20 in [0, 100].
+	for _, c := range codes {
+		snaps, err := s.History(c, 1)
+		if err != nil || len(snaps) == 0 {
+			t.Fatalf("history for %s: %v", c, err)
+		}
+		rs := snaps[0].RS20
+		if rs < 0 || rs > 100 {
+			t.Errorf("%s RS20=%v out of range", c, rs)
+		}
 	}
 }
 

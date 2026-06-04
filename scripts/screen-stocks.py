@@ -47,15 +47,32 @@ SELECT i.code, i.name,
        s.sar_long, s.supertrend_long, s.obv_up,
        s.macd_hist, s.vol_ratio,
        s.td_setup, s.td_countdown,
-       s.div_bear, s.sig_overbought
+       s.div_bear, s.sig_overbought,
+       COALESCE(s.turnover_rate, 0) AS turnover_rate,
+       COALESCE(s.market_cap, 0)    AS market_cap,
+       COALESCE(s.pe, 0)            AS pe,
+       COALESCE(s.rs20, 0)          AS rs20
 FROM snapshot s JOIN instrument i ON s.code = i.code
 WHERE s.trade_date = ?
 """, (date,)).fetchall()}
 con.close()
 
 
+def _fund_ok(r) -> bool:
+    """基本面硬性门槛：市值≥20亿（有数据时），换手率在 0.3%–15% 区间（有数据时）"""
+    mc = r["market_cap"] or 0
+    tr = r["turnover_rate"] or 0
+    if mc > 0 and mc < 20:
+        return False
+    if tr > 0 and not (0.3 <= tr <= 15):
+        return False
+    return True
+
+
 def tier(r) -> str | None:
     """返回 '⭐⭐⭐' / '⭐⭐' / None（不够格）"""
+    if not _fund_ok(r):
+        return None
     cdwn = r["td_countdown"] or ""
     hist = r["macd_hist"] or 0
     if (r["score_total"] >= 70
@@ -104,11 +121,14 @@ def signals(r, cost=0.0, shares=0) -> str:
 
 
 def print_row(label, r, cost=0.0, shares=0):
-    sa  = f"{r['score_total']} / {r['adx']:.1f}"
-    chg = f"{r['change_pct']:+.2f}%"
-    vr  = f"{r['vol_ratio']:.2f}" if r["vol_ratio"] else "—"
-    sig = signals(r, cost, shares)
-    print(f"| {label} | {r['code']} | {r['name']} | {sa} | {chg} | {vr} | {sig} |")
+    sa   = f"{r['score_total']} / {r['adx']:.1f}"
+    chg  = f"{r['change_pct']:+.2f}%"
+    vr   = f"{r['vol_ratio']:.2f}" if r["vol_ratio"] else "—"
+    rs20 = f"{r['rs20']:.0f}" if r["rs20"] else "—"
+    mc   = f"{r['market_cap']:.0f}亿" if r["market_cap"] else "—"
+    tr   = f"{r['turnover_rate']:.2f}%" if r["turnover_rate"] else "—"
+    sig  = signals(r, cost, shares)
+    print(f"| {label} | {r['code']} | {r['name']} | {sa} | {chg} | {vr} | {rs20} | {mc} | {tr} | {sig} |")
 
 
 # ── 筛选候选（排除持仓）────────────────────────────────────────────────────────
@@ -139,8 +159,8 @@ for t in ["⭐⭐⭐", "⭐⭐"]:
 n_hold = len(holdings)
 n_cand = len(selected)
 print(f"**候补 & 推荐（{date}，持仓 {n_hold} 只 + 候选 {n_cand} 只）**\n")
-print("| 级别 | 代码 | 名称 | score / ADX | 今日% | 量比 | 信号摘要 |")
-print("|------|------|------|-------------|-------|------|---------|")
+print("| 级别 | 代码 | 名称 | score / ADX | 今日% | 量比 | RS20 | 市值 | 换手 | 信号摘要 |")
+print("|------|------|------|-------------|-------|------|------|------|------|---------|")
 
 for code, cost, shares in holdings:
     r = snap.get(code)

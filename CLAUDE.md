@@ -81,11 +81,14 @@
 
 **每日工作流**：
 ```bash
-# 1. 收盘后批量更新快照
+# 1. 收盘后批量更新快照（含换手率/市值/PE）
 sqlite3 data/stock.db "SELECT code FROM instrument;" \
   | xargs -I{} go run ./cmd/indicator-analyze -save {}
 
-# 2. 生成选股表（持仓置顶 + 优质候选，合计≤10只）
+# 2. 计算 RS 相对强度百分位排名（需 21+ 天历史积累后才有效）
+go run ./cmd/stockdb rs-rank
+
+# 3. 生成选股表（持仓置顶 + 优质候选，合计≤10只）
 ./scripts/screen-stocks.sh \
   --holdings sh601991:8.504:1300,sh603256:193.752:100,sh605589:53.176:200
 

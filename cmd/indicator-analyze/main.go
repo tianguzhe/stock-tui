@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 
+	"stock-tui/internal/api"
 	"stock-tui/internal/indicator"
 	"stock-tui/internal/market"
 	"stock-tui/internal/store"
@@ -68,6 +69,15 @@ func run(args []string) error {
 	}
 	snap := printAnalysis(data)
 	if *save {
+		if stocks, err := api.FetchStocks([]string{code}); err == nil && len(stocks) > 0 {
+			s := stocks[0]
+			snap.TurnoverRate = s.TurnoverRate
+			snap.MarketCap = s.MarketCap
+			snap.PE = s.PE
+			fmt.Printf("FUND 换手率=%.2f%% 市值=%.1f亿 PE=%.1f\n", s.TurnoverRate, s.MarketCap, s.PE)
+		} else if err != nil {
+			fmt.Fprintf(os.Stderr, "warn: fundamentals fetch failed: %v\n", err)
+		}
 		if err := saveSnapshot(data, snap); err != nil {
 			return fmt.Errorf("save snapshot: %w", err)
 		}
@@ -238,7 +248,7 @@ func printAnalysis(data seriesData) store.Snapshot {
 
 	// Reuse the values already computed above; printing behavior is unchanged.
 	lastTD := tds[n-1]
-	return store.Snapshot{
+	snap := store.Snapshot{
 		Code:      data.Code,
 		TradeDate: dates[n-1],
 
@@ -293,7 +303,23 @@ func printAnalysis(data seriesData) store.Snapshot {
 		TDCountdown: fmt.Sprintf("%s/%d", tdSignalText(lastTD.CountdownSignal), lastTD.CountdownCount),
 
 		Streak: streakValue(candles),
+
+		Ret20:  nDayReturn(candles, 20),
+		Ret60:  nDayReturn(candles, 60),
+		Ret120: nDayReturn(candles, 120),
 	}
+	return snap
+}
+
+// nDayReturn computes (close[last] - close[last-n]) / close[last-n] * 100.
+// Returns 0 if there are fewer than n+1 bars or the base price is zero.
+func nDayReturn(candles []indicator.Candle, n int) float64 {
+	last := len(candles) - 1
+	base := last - n
+	if base < 0 || candles[base].Close == 0 {
+		return 0
+	}
+	return (candles[last].Close - candles[base].Close) / candles[base].Close * 100
 }
 
 type scoreState struct {
