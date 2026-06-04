@@ -44,21 +44,39 @@
   ```
 - 后续若要添加多个关键百分比标示线,按从背景到前景排序:百分比线/昨收线/开盘线在前,价格线永远最后;测试应断言价格 series 为连续原始价格序列。
 
+## 持仓格式与浮盈计算
+- 用户描述持仓时用 `成本价*股数`（如 `8.504*1300`）；浮盈 = (今收 - 成本) × 股数。
+- 脚本参数格式：`代码:成本:股数`（如 `sh601991:8.504:1300`）。
+
+## PERF 历史驱动的信号权重（核心方法论）
+- 推荐/评估标的前，**先查该股自身 PERF 历史**，不用同一把尺子量所有股：
+  - `PERF 趋势跟随多头` avg10 > 5%：追涨有历史依据，趋势信号优先
+  - `PERF 超买反转空头` win10 < 35%：超买警报在本股历史近乎无效，可降权
+  - `PERF 顶背离空头` win10 < 40%：顶背离历史无效，不以此降评级
+  - 反之（超买/背离信号 win10 > 55%）：信号有效，应等回调再入场
+- 快速提取 PERF 关键字段（不看全量输出）：
+  `go run ./cmd/indicator-analyze <code> 2>/dev/null | grep -E "SCORE|TD_NOW|SAR_KELT|DIVERGENCE|PERF"`
+
 ## 技术面分析 CLI
 - 深度技术面分析优先用固定命令 `go run ./cmd/indicator-analyze <代码>`；不要再写一次性 `cmd/<name>/main.go`。
 - `indicator-analyze` 会拉腾讯日K、处理 `qfqday/day` 回退、复用 `indicator.Calculate` / `TDSequential` / `FibRetracementOf`，并输出 SCORE、DIVERGENCE、TD、FIB、PERF 与近15日演变。
 - 批量落库：`sqlite3 data/stock.db "SELECT code FROM instrument;" | xargs -I{} go run ./cmd/indicator-analyze -save {}`
+- 多因子选股筛选：`./scripts/screen-stocks.sh --holdings 代码:成本:股数,...`，持仓固定置顶（附浮盈），剩余位补最多 7 只优质候选（⭐⭐⭐→⭐⭐，不凑数），输出直接贴入日志"四、候补&推荐"
+  - 示例：`./scripts/screen-stocks.sh --holdings sh601991:8.504:1300,sh603256:193.752:100,sh605589:53.176:200`
+  - 持仓须先 `-save` 落库，否则显示"无快照数据"
 
 ## 每日复盘日志
-日志目录：`docs/journal/YYYY-MM-DD/journal.md`，按日期建文件夹，每个文件分两区：
+日志目录：`docs/journal/YYYY-MM-DD/journal.md`，四段结构：
 
-**一、昨日复盘**（开盘前填）：对照前日"明日预判"表，逐只填写实际涨跌、对否判断、止损触发记录、复盘小结。
-
-**二、今日分析**（收盘后填）：大盘环境、持仓快照（score/TD/ADX/SAR/ST/止损价/仓位）、信号解读、候补标的、操作记录、明日预判。
+| 章节 | 内容 | 填写时机 |
+|------|------|---------|
+| 一、昨日复盘 | 预判对比表（自动回填）、止损触发、小结 | 开盘前 |
+| 二、持仓 | 持仓快照表（成本/股数/浮盈/score/TD/ADX/SAR/OBV）+ 每只2行关键信号 | 收盘后 |
+| 三、明日预判 & 计划 | 预判方向 + 操作触发条件 + 止损，合一张表 | 收盘后 |
+| 四、候补 & 推荐 | 候补入场条件 + 持仓置顶的选股表（`screen-stocks.sh` 生成）| 收盘后 |
 
 **生成脚本**：`./scripts/gen-journal.sh [YYYY-MM-DD]`
-- 自动从 DB 读取全量最新 snapshot 填入"全量快照"表
-- 自动从昨日 journal.md 的"明日预判"章节回填预判对比表
+- 自动从昨日 journal.md 的"三、明日预判"章节提取预判，回填至"一、昨日复盘"预判对比表
 - 若文件已存在则跳过，幂等安全
 
 **每日工作流**：
@@ -66,13 +84,19 @@
 # 1. 收盘后批量更新快照
 sqlite3 data/stock.db "SELECT code FROM instrument;" \
   | xargs -I{} go run ./cmd/indicator-analyze -save {}
-# 2. 生成次日模板
+
+# 2. 生成选股表（持仓置顶 + 优质候选，合计≤10只）
+./scripts/screen-stocks.sh \
+  --holdings sh601991:8.504:1300,sh603256:193.752:100,sh605589:53.176:200
+
+# 3. 生成次日日志模板（含昨日预判自动回填）
 ./scripts/gen-journal.sh
-# 3. 补填昨日复盘区 → 填写今日分析区 → 写明日预判
+
+# 4. 填写日志：二、持仓 → 三、明日预判 → 四、候补&推荐（贴步骤2输出）
 ```
 
-**日志字段含义速查**：
-- `TD`：优先显示 countdown（如 `C顶3`），无则显示 setup（如 `见顶/8`）；`见顶/8` 次日需警惕进入 countdown
-- `SAR/ST`：`多/多` = SAR 多头 + SuperTrend 多头，双确认；`空/多` 或 `多/空` = 方向混杂，需注意
-- `止损价`：对应当日 SAR 值，跌破即止；需每日从深度分析输出中手动更新
+**日志字段速查**：
+- `TD`：优先显示 countdown（如 `C顶3`），无则显示 setup（如 `见顶/8`）；`见顶/8` 次日警惕进入 countdown
+- `SAR/ST`：`多/多` = SAR 多头 + SuperTrend 多头，双确认；混杂时需注意
+- `止损价`：对应当日 SAR 值，跌破即止；批量落库后从 snapshot 直接读取
 - 量比口径：量比 < 0.8 = 缩量，> 1.5 = 放量，描述时必须附数值

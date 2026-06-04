@@ -1,140 +1,100 @@
 #!/usr/bin/env bash
-# gen-journal.sh — 生成下一个交易日的日志文件夹
+# gen-journal.sh — 生成当日复盘日志
 #
 # Usage:
-#   ./scripts/gen-journal.sh            # 生成今天的日志（today）
-#   ./scripts/gen-journal.sh 2026-06-04 # 指定日期
-#
-# 结构：docs/journal/YYYY-MM-DD/journal.md
-#   Section 1 — 昨日复盘  （自动填入昨日预判表，等手动填写实际结果）
-#   Section 2 — 今日分析  （自动填入 DB 最新 snapshot 快照表）
+#   ./scripts/gen-journal.sh            # 今天
+#   ./scripts/gen-journal.sh 2026-06-05 # 指定日期
 
 set -euo pipefail
 
 TODAY=${1:-$(date +%Y-%m-%d)}
 YESTERDAY=$(date -v-1d -j -f "%Y-%m-%d" "$TODAY" +%Y-%m-%d 2>/dev/null \
-  || date -d "$TODAY - 1 day" +%Y-%m-%d)   # macOS / Linux 兼容
+  || date -d "$TODAY - 1 day" +%Y-%m-%d)
 
-DIR="docs/journal/${TODAY}"
-OUT="${DIR}/journal.md"
-DB="data/stock.db"
+# 星期几
+DOW=$(date -j -f "%Y-%m-%d" "$TODAY" +%u 2>/dev/null || date -d "$TODAY" +%u)
+WEEKDAYS=("" "周一" "周二" "周三" "周四" "周五" "周六" "周日")
+WEEKDAY="${WEEKDAYS[$DOW]}"
+
+OUT="docs/journal/${TODAY}/journal.md"
 
 if [[ -f "$OUT" ]]; then
   echo "Already exists: $OUT"
   exit 0
 fi
 
-mkdir -p "$DIR"
+mkdir -p "docs/journal/${TODAY}"
 
-# ── 从 DB 读取最新快照（全量，按 score 降序）────────────────────────────
-SNAP_TABLE=""
-while IFS='|' read -r code name close chg score td_s td_c sar_l st_l adx streak; do
-  sar_st="$( [[ "$sar_l" -eq 1 ]] && echo '多' || echo '空')/$( [[ "$st_l" -eq 1 ]] && echo '多' || echo '空')"
-  # 优先展示 countdown，否则展示 setup
-  td="$td_s"
-  [[ "$td_c" != "-/0" && -n "$td_c" ]] && td="$td_c"
-  chg_fmt=$(printf "%+.2f%%" "$chg")
-  SNAP_TABLE+="| $code | $name | $close | $chg_fmt | $score | $td | $(printf '%.1f' "$adx") | $sar_st | — | — |\n"
-done < <(sqlite3 "$DB" "
-SELECT i.code, i.name, s.close, s.change_pct, s.score_total,
-       s.td_setup, s.td_countdown, s.sar_long, s.supertrend_long, s.adx, s.streak
-FROM snapshot s JOIN instrument i ON s.code=i.code
-WHERE s.trade_date=(SELECT MAX(trade_date) FROM snapshot)
-ORDER BY s.score_total DESC;")
-
-# ── 从昨日 journal 提取预判表（自动回填"实际"列留空）──────────────────
+# ── 从昨日 journal 提取预判表，回填"昨日复盘"────────────────────────────────
 PREV_JOURNAL="docs/journal/${YESTERDAY}/journal.md"
 PREV_TABLE=""
 if [[ -f "$PREV_JOURNAL" ]]; then
-  # 抓取"明日预判"章节的表格行
   in_table=0
   while IFS= read -r line; do
     if [[ "$line" =~ ^##.*明日预判 ]]; then in_table=1; continue; fi
-    if [[ $in_table -eq 1 && "$line" =~ ^\| ]]; then
-      # 跳过表头和分隔行
-      [[ "$line" =~ \-\-\- ]] && continue
-      [[ "$line" =~ 代码.*名称 ]] && continue
-      # 追加"实际涨跌"和"对否"空列
-      PREV_TABLE+="${line%|} — | — |\n"
-    elif [[ $in_table -eq 1 && -z "$line" ]]; then
-      in_table=0
+    if [[ $in_table -eq 1 ]]; then
+      [[ "$line" =~ ^## ]] && break                         # 下一章节停止，空行跳过
+      [[ "$line" =~ ^\| ]] || continue                    # 只取表格行
+      [[ "$line" =~ \-\-\- ]] && continue                 # 跳过分隔行
+      [[ "$line" =~ 代码.*名称 ]] && continue             # 跳过表头
+      # 提取前3列（代码/名称/预判），补"实际/✓✗/备注"占位
+      row=$(echo "$line" | awk -F'|' '{
+        for(i=2;i<=4;i++){gsub(/^[[:space:]]+|[[:space:]]+$/,"",$i)}
+        printf "| %s | %s | %s | — | — | — |", $2, $3, $4
+      }')
+      PREV_TABLE+="${row}\n"
     fi
   done < "$PREV_JOURNAL"
 fi
 
-if [[ -z "$PREV_TABLE" ]]; then
-  PREV_TABLE="| — | — | — | — | — | — |\n"
-fi
+[[ -z "$PREV_TABLE" ]] && PREV_TABLE="| — | — | — | — | — | — |\n"
 
-# ── 写文件 ────────────────────────────────────────────────────────────────
+# ── 写文件 ────────────────────────────────────────────────────────────────────
 cat > "$OUT" << TEMPLATE
-# 日志 · ${TODAY}
+# 日志 · ${TODAY}（${WEEKDAY}）
 
 ---
 
-## 一、昨日复盘（${YESTERDAY}）
+## 一、昨日复盘
 
-> 对照昨日"明日预判"表，填写实际结果
-
-### 1.1 预判对比
-
-| 代码 | 名称 | 预判方向 | 实际涨跌 | 对否 | 备注 |
-|------|------|----------|----------|------|------|
+| 代码 | 名称 | 预判 | 实际 | ✓/✗ | 备注 |
+|------|------|------|------|-----|------|
 $(echo -e "$PREV_TABLE")
+止损触发：无
 
-### 1.2 止损触发
-
-（无 / 手动填写）
-
-### 1.3 复盘小结
-
-（待填写：哪里判断准了、哪里出了偏差、下次改进点）
+小结：（待填）
 
 ---
 
-## 二、今日分析（${TODAY}）
+## 二、持仓（${TODAY} 收盘）
 
-### 2.1 大盘环境
+| 代码 | 名称 | 成本 | 股数 | 今收 | 今日% | 浮盈 | score | TD | ADX | SAR | OBV |
+|------|------|------|------|------|-------|------|-------|----|-----|-----|-----|
+| — | — | — | — | — | — | — | — | — | — | — | — |
 
-| 指数 | 涨跌 | 备注 |
-|------|------|------|
-| 上证 | — | |
-| 深成 | — | |
-| 创业板 | — | |
+> 成本 — | 市值 — | 浮盈 —
 
-### 2.2 全量快照（DB 最新，按 score 排序）
+（各持仓信号待填）
 
-| 代码 | 名称 | 收盘 | 今日% | score | TD | ADX | SAR/ST | 止损价 | 仓位 |
-|------|------|------|-------|-------|----|-----|--------|--------|------|
-$(echo -e "$SNAP_TABLE")
+---
 
-### 2.3 核心持仓信号解读
+## 三、明日预判 & 计划
 
-（待填写：针对持仓各只的今日信号变化）
-
-### 2.4 候补标的
-
-| 代码 | 名称 | score | 等待条件 |
-|------|------|-------|----------|
-| — | — | — | — |
-
-### 2.5 今日操作
-
-| 时间 | 代码 | 操作 | 价格 | 理由 |
-|------|------|------|------|------|
+| 代码 | 名称 | 预判 | 操作触发条件 | 止损 |
+|------|------|------|-------------|------|
 | — | — | — | — | — |
 
-### 2.6 明日计划
-
-- [ ] 待填写
-
 ---
 
-## 三、明日预判（给次日复盘用）
+## 四、候补 & 推荐
 
-| 代码 | 名称 | 预判方向 | 依据 |
-|------|------|----------|------|
-| — | — | — | — |
+候补：（待填）
+
+推荐购买：
+
+| 级别 | 代码 | 名称 | score/ADX | 今日% | PERF 核心依据 | 入场价位 | 止损 |
+|------|------|------|-----------|-------|--------------|---------|------|
+| — | — | — | — | — | — | — | — |
 TEMPLATE
 
 echo "Created: $OUT"
