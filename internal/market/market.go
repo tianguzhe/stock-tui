@@ -56,3 +56,12 @@ func NormalizeCode(code string) (string, bool) {
 		}
 	}
 }
+
+// Prefix returns the sh/sz/bj/hk market prefix of a normalized code — the prefix
+// NormalizeCode prepends — or "" if the code is too short to carry one.
+func Prefix(code string) string {
+	if len(code) >= 2 {
+		return code[:2]
+	}
+	return ""
+}

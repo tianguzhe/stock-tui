@@ -1,6 +1,7 @@
 stock-tui
 cpu
 indicator-analyze
+stockdb
 .ace-tool/
 .DS_Store
 .gocache/

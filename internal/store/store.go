@@ -15,6 +15,8 @@ import (
 	"sort"
 	"time"
 
+	"stock-tui/internal/market"
+
 	_ "modernc.org/sqlite"
 )
 
@@ -76,22 +78,6 @@ type Snapshot struct {
 
 	// RS percentile rankings (0–100) computed by stockdb rs-rank after batch saves.
 	RS20, RS60, RS120 float64
-}
-
-// ScreenRow is a Screen result: the matched instrument joined with its latest snapshot.
-type ScreenRow struct {
-	Instrument
-	Snapshot
-}
-
-// Filter selects instruments by their latest snapshot. Zero-value fields are
-// ignored (no constraint); UseMaxJ guards MaxJ because 0 is a meaningful bound.
-type Filter struct {
-	Tag      string
-	MinADX   float64
-	MinScore int
-	MaxJ     float64
-	UseMaxJ  bool
 }
 
 // Open opens (creating if needed) the SQLite database at path, enables foreign
@@ -223,7 +209,7 @@ func (s *Store) AddTag(code, tag string) error {
 	if _, err := tx.Exec(`
 INSERT INTO instrument (code, name, market, created_at)
 VALUES (?, '', ?, ?)
-ON CONFLICT(code) DO NOTHING`, code, marketOf(code), time.Now().Format(time.RFC3339)); err != nil {
+ON CONFLICT(code) DO NOTHING`, code, market.Prefix(code), time.Now().Format(time.RFC3339)); err != nil {
 		return fmt.Errorf("ensure instrument %s: %w", code, err)
 	}
 	if _, err := tx.Exec(`INSERT INTO tag (name) VALUES (?) ON CONFLICT(name) DO NOTHING`, tag); err != nil {
@@ -380,59 +366,6 @@ LIMIT ?`, code, limit)
 	return out, rows.Err()
 }
 
-// Screen returns instruments whose latest snapshot satisfies f. The latest
-// snapshot per code is taken by max(trade_date).
-func (s *Store) Screen(f Filter) ([]ScreenRow, error) {
-	query := `
-SELECT i.code, i.name, i.market, i.note,
-       s.trade_date, s.close, s.change_pct, s.ma5, s.ma10, s.ma20, s.ma60,
-       s.kdj_j, s.adx, s.adxr, s.score_total, s.score_delta, s.score_label,
-       s.td_setup, s.td_countdown, s.streak
-FROM instrument i
-JOIN snapshot s ON s.code = i.code
-WHERE s.trade_date = (SELECT MAX(trade_date) FROM snapshot s2 WHERE s2.code = i.code)`
-	var args []any
-	if f.Tag != "" {
-		query += `
-  AND i.code IN (SELECT it.code FROM instrument_tag it JOIN tag t ON t.id = it.tag_id WHERE t.name = ?)`
-		args = append(args, f.Tag)
-	}
-	if f.MinADX > 0 {
-		query += ` AND s.adx >= ?`
-		args = append(args, f.MinADX)
-	}
-	if f.UseMaxJ {
-		query += ` AND s.kdj_j <= ?`
-		args = append(args, f.MaxJ)
-	}
-	if f.MinScore > 0 {
-		query += ` AND s.score_total >= ?`
-		args = append(args, f.MinScore)
-	}
-	query += ` ORDER BY s.score_total DESC, i.code`
-
-	rows, err := s.db.Query(query, args...)
-	if err != nil {
-		return nil, fmt.Errorf("screen: %w", err)
-	}
-	defer rows.Close()
-
-	var out []ScreenRow
-	for rows.Next() {
-		var r ScreenRow
-		r.Snapshot.Code = ""
-		if err := rows.Scan(&r.Instrument.Code, &r.Name, &r.Market, &r.Note,
-			&r.TradeDate, &r.Close, &r.ChangePct, &r.MA5, &r.MA10, &r.MA20, &r.MA60,
-			&r.KDJ_J, &r.ADX, &r.ADXR, &r.ScoreTotal, &r.ScoreDelta, &r.ScoreLabel,
-			&r.TDSetup, &r.TDCountdown, &r.Streak); err != nil {
-			return nil, err
-		}
-		r.Snapshot.Code = r.Instrument.Code
-		out = append(out, r)
-	}
-	return out, rows.Err()
-}
-
 func boolToInt(b bool) int {
 	if b {
 		return 1
@@ -448,7 +381,7 @@ func (s *Store) UpdateRSRankings() (int, error) {
 	// Read latest ret20/ret60/ret120 for every code where ret20 has been computed.
 	// Rows where ret20 IS NULL are from old snapshots and are excluded from ranking.
 	rows, err := s.db.Query(`
-SELECT code,
+SELECT code, trade_date,
        ret20  AS r20,
        COALESCE(ret60,0)  AS r60,
        COALESCE(ret120,0) AS r120
@@ -460,32 +393,44 @@ WHERE trade_date = (SELECT MAX(trade_date) FROM snapshot s2 WHERE s2.code = snap
 	}
 	defer rows.Close()
 
+	// entry keeps only what the write-back needs; the ret values stream straight
+	// into per-horizon slices for ranking.
 	type entry struct {
-		code           string
-		r20, r60, r120 float64
+		code      string
+		tradeDate string
 	}
-	var entries []entry
+	var (
+		entries           []entry
+		r20s, r60s, r120s []float64
+	)
 	for rows.Next() {
-		var e entry
-		if err := rows.Scan(&e.code, &e.r20, &e.r60, &e.r120); err != nil {
+		var (
+			e              entry
+			r20, r60, r120 float64
+		)
+		if err := rows.Scan(&e.code, &e.tradeDate, &r20, &r60, &r120); err != nil {
 			return 0, err
 		}
 		entries = append(entries, e)
+		r20s = append(r20s, r20)
+		r60s = append(r60s, r60)
+		r120s = append(r120s, r120)
 	}
 	if err := rows.Err(); err != nil {
 		return 0, err
 	}
 
-	rank20 := percentileRanks(entries, func(e entry) (float64, bool) { return e.r20, true })
-	rank60 := percentileRanks(entries, func(e entry) (float64, bool) { return e.r60, true })
-	rank120 := percentileRanks(entries, func(e entry) (float64, bool) { return e.r120, true })
+	rank20 := percentileRanks(r20s)
+	rank60 := percentileRanks(r60s)
+	rank120 := percentileRanks(r120s)
 
+	// Reuse the trade_date selected above instead of recomputing MAX(trade_date)
+	// per row: the SELECT already pinned each code to its latest snapshot.
 	updated := 0
 	for i, e := range entries {
-		_, err := s.db.Exec(`
-UPDATE snapshot SET rs20=?, rs60=?, rs120=?
-WHERE code=? AND trade_date=(SELECT MAX(trade_date) FROM snapshot WHERE code=?)`,
-			rank20[i], rank60[i], rank120[i], e.code, e.code)
+		_, err := s.db.Exec(
+			`UPDATE snapshot SET rs20=?, rs60=?, rs120=? WHERE code=? AND trade_date=?`,
+			rank20[i], rank60[i], rank120[i], e.code, e.tradeDate)
 		if err == nil {
 			updated++
 		}
@@ -493,37 +438,21 @@ WHERE code=? AND trade_date=(SELECT MAX(trade_date) FROM snapshot WHERE code=?)`
 	return updated, nil
 }
 
-type entryVal struct {
-	idx int
-	val float64
-}
-
-// percentileRanks assigns 0–100 percentile rank to each entry. Entries for
-// which getValue returns ok=false receive rank 0 (not enough history).
-func percentileRanks[E any](entries []E, getValue func(E) (float64, bool)) []float64 {
-	ranks := make([]float64, len(entries))
-	valid := make([]entryVal, 0, len(entries))
-	for i, e := range entries {
-		v, ok := getValue(e)
-		if ok {
-			valid = append(valid, entryVal{idx: i, val: v})
-		}
-	}
-	if len(valid) == 0 {
+// percentileRanks assigns each value its 0–100 cross-sectional percentile rank
+// (lowest → 0, highest → (n-1)/n*100). An empty input yields an empty result.
+func percentileRanks(values []float64) []float64 {
+	ranks := make([]float64, len(values))
+	if len(values) == 0 {
 		return ranks
 	}
-	sort.Slice(valid, func(i, j int) bool { return valid[i].val < valid[j].val })
-	total := float64(len(valid))
-	for rank, ev := range valid {
-		ranks[ev.idx] = float64(rank) / total * 100
+	order := make([]int, len(values))
+	for i := range order {
+		order[i] = i
+	}
+	sort.Slice(order, func(a, b int) bool { return values[order[a]] < values[order[b]] })
+	total := float64(len(values))
+	for rank, idx := range order {
+		ranks[idx] = float64(rank) / total * 100
 	}
 	return ranks
-}
-
-// marketOf extracts the sh/sz/bj/hk prefix from a normalized code; empty if absent.
-func marketOf(code string) string {
-	if len(code) >= 2 {
-		return code[:2]
-	}
-	return ""
 }

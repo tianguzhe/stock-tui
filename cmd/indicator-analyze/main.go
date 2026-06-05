@@ -95,11 +95,7 @@ func saveSnapshot(data seriesData, snap store.Snapshot) error {
 	}
 	defer st.Close()
 
-	mkt := ""
-	if len(data.Code) >= 2 {
-		mkt = data.Code[:2]
-	}
-	if err := st.UpsertInstrument(data.Code, data.Name, mkt, ""); err != nil {
+	if err := st.UpsertInstrument(data.Code, data.Name, market.Prefix(data.Code), ""); err != nil {
 		return err
 	}
 	return st.SaveSnapshot(snap)
@@ -177,6 +173,7 @@ func printAnalysis(data seriesData) store.Snapshot {
 	last := results[n-1]
 	lastCandle := candles[n-1]
 	closes := closeSeries(candles)
+	ma5, ma10, ma20, ma60 := meanTail(closes, 5), meanTail(closes, 10), meanTail(closes, 20), meanTail(closes, 60)
 	volumes := volumeSeries(candles)
 	lowAll, highAll := rangeLowHigh(candles, 0, n)
 	low20, high20 := rangeLowHigh(candles, n-20, n)
@@ -201,7 +198,7 @@ func printAnalysis(data seriesData) store.Snapshot {
 		fmt.Printf("SAMPLE_WARN 日K根数=%d (<120), 均线预热、背离检测和历史PERF样本都偏弱\n", n)
 	}
 	fmt.Printf("MA5=%.3f MA10=%.3f MA20=%.3f MA60=%.3f | allRange %.3f..%.3f pos=%.0f%% | range20 %.3f..%.3f pos=%.0f%% | range60 %.3f..%.3f pos=%.0f%% | range120 %.3f..%.3f pos=%.0f%%\n",
-		meanTail(closes, 5), meanTail(closes, 10), meanTail(closes, 20), meanTail(closes, 60),
+		ma5, ma10, ma20, ma60,
 		lowAll, highAll, position(lastCandle.Close, lowAll, highAll),
 		low20, high20, position(lastCandle.Close, low20, high20),
 		low60, high60, position(lastCandle.Close, low60, high60),
@@ -255,10 +252,10 @@ func printAnalysis(data seriesData) store.Snapshot {
 		Close:     lastCandle.Close,
 		ChangePct: changePct,
 
-		MA5:  meanTail(closes, 5),
-		MA10: meanTail(closes, 10),
-		MA20: meanTail(closes, 20),
-		MA60: meanTail(closes, 60),
+		MA5:  ma5,
+		MA10: ma10,
+		MA20: ma20,
+		MA60: ma60,
 
 		KDJ_J:     last.KDJ.J,
 		MACD_DIF:  last.MACD.DIF,

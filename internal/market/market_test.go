@@ -57,3 +57,22 @@ func TestNormalizeCodeRejectsMalformedBareCode(t *testing.T) {
 		t.Fatalf("NormalizeCode(malformed) = %q, %v; want empty,false", got, ok)
 	}
 }
+
+func TestPrefix(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{"sh600580", "sh"},
+		{"sz000010", "sz"},
+		{"bj920819", "bj"},
+		{"hk00700", "hk"},
+		{"", ""},
+		{"6", ""},
+	}
+	for _, tc := range cases {
+		if got := Prefix(tc.in); got != tc.want {
+			t.Errorf("Prefix(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}

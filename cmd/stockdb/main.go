@@ -7,8 +7,6 @@
 //	stockdb tag rm  <code> <标签>     detach a tag
 //	stockdb list --tag <标签>         list instruments under a tag
 //	stockdb history <code> [-n 15]    show a symbol's snapshot history
-//	stockdb screen [--tag X] [--min-adx 25] [--max-j 80] [--min-score 60]
-//	                                  filter latest snapshots by condition
 package main
 
 import (
@@ -40,8 +38,6 @@ func run(args []string) error {
 		return cmdList(rest)
 	case "history":
 		return cmdHistory(rest)
-	case "screen":
-		return cmdScreen(rest)
 	case "rs-rank":
 		return cmdRSRank(rest)
 	default:
@@ -55,7 +51,6 @@ func usageErr() error {
   stockdb tag rm  <code> <标签>
   stockdb list --tag <标签>
   stockdb history <code> [-n 15]
-  stockdb screen [--tag X] [--min-adx 25] [--max-j 80] [--min-score 60]
   stockdb rs-rank                         compute RS20/RS60/RS120 percentile ranks`)
 }
 
@@ -195,56 +190,5 @@ func cmdRSRank(_ []string) error {
 		return fmt.Errorf("rs-rank: %w", err)
 	}
 	fmt.Printf("rs-rank: updated %d stocks\n", n)
-	return nil
-}
-
-func cmdScreen(args []string) error {
-	fs := flag.NewFlagSet("screen", flag.ContinueOnError)
-	fs.SetOutput(io.Discard)
-	tag := fs.String("tag", "", "limit to a tag")
-	minADX := fs.Float64("min-adx", 0, "minimum ADX")
-	maxJ := fs.Float64("max-j", 0, "maximum KDJ-J (0 disabled unless set)")
-	minScore := fs.Int("min-score", 0, "minimum SCORE total")
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
-
-	f := store.Filter{
-		Tag:      *tag,
-		MinADX:   *minADX,
-		MinScore: *minScore,
-	}
-	// max-j needs an explicit guard: 0 is a valid bound, so only apply when set.
-	fs.Visit(func(fl *flag.Flag) {
-		if fl.Name == "max-j" {
-			f.MaxJ = *maxJ
-			f.UseMaxJ = true
-		}
-	})
-
-	st, err := openStore()
-	if err != nil {
-		return err
-	}
-	defer st.Close()
-
-	rows, err := st.Screen(f)
-	if err != nil {
-		return err
-	}
-	if len(rows) == 0 {
-		fmt.Println("(无符合条件的标的)")
-		return nil
-	}
-	fmt.Printf("符合条件 %d 只 (按 SCORE 降序):\n", len(rows))
-	fmt.Printf("%-10s %-10s %7s %6s %6s %6s  %s\n", "code", "name", "close", "SCORE", "J", "ADX", "date")
-	for _, r := range rows {
-		name := r.Name
-		if name == "" {
-			name = "(未命名)"
-		}
-		fmt.Printf("%-10s %-10s %7.3f %5d %6.1f %6.1f  %s\n",
-			r.Instrument.Code, name, r.Close, r.ScoreTotal, r.KDJ_J, r.ADX, r.TradeDate)
-	}
 	return nil
 }
