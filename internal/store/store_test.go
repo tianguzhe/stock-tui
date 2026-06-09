@@ -159,6 +159,85 @@ ALTER TABLE snapshot_legacy RENAME TO snapshot;
 	}
 }
 
+func TestMigrationRepairsLegacyDecisionLogSchema(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy-decision.db")
+
+	legacy, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open legacy sqlite: %v", err)
+	}
+	_, err = legacy.Exec(`
+CREATE TABLE instrument (
+  code       TEXT PRIMARY KEY,
+  name       TEXT NOT NULL,
+  market     TEXT NOT NULL,
+  note       TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL
+);
+CREATE TABLE snapshot (
+  code        TEXT NOT NULL REFERENCES instrument(code) ON DELETE CASCADE,
+  trade_date  TEXT NOT NULL,
+  captured_at TEXT NOT NULL,
+  close REAL,
+  PRIMARY KEY (code, trade_date)
+);
+CREATE TABLE decision_log (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  code TEXT NOT NULL,
+  log_date TEXT NOT NULL,
+  action TEXT NOT NULL,
+  tier TEXT NOT NULL,
+  score_total INTEGER,
+  adx REAL,
+  sar_long INTEGER,
+  st_long INTEGER,
+  obv_up INTEGER,
+  macd_hist REAL,
+  td_countdown TEXT,
+  signals TEXT,
+  created_at TEXT NOT NULL,
+  outcome_pct REAL,
+  outcome_date TEXT,
+  correct INTEGER,
+  UNIQUE(code, log_date, action)
+);
+INSERT INTO instrument (code, name, market, created_at) VALUES ('sz000001', '平安银行', 'sz', 'now');
+INSERT INTO decision_log (code, log_date, action, tier, created_at)
+VALUES ('sz000001', '2026-06-01', 'recommend', '⭐⭐', 'now'),
+       ('sz999999', '2026-06-01', 'recommend', '⭐⭐', 'now');`)
+	if err != nil {
+		t.Fatalf("seed legacy schema: %v", err)
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatalf("close legacy sqlite: %v", err)
+	}
+
+	repaired, err := Open(path)
+	if err != nil {
+		t.Fatalf("open repaired store: %v", err)
+	}
+	defer repaired.Close()
+
+	var fkCount int
+	if err := repaired.db.QueryRow(`
+SELECT COUNT(*)
+FROM pragma_foreign_key_list('decision_log')
+WHERE "table" = 'instrument' AND "from" = 'code' AND "to" = 'code' AND on_delete = 'CASCADE'`).Scan(&fkCount); err != nil {
+		t.Fatalf("inspect repaired foreign keys: %v", err)
+	}
+	if fkCount != 1 {
+		t.Fatalf("expected repaired decision_log foreign key, got %d", fkCount)
+	}
+
+	var rows int
+	if err := repaired.db.QueryRow(`SELECT COUNT(*) FROM decision_log`).Scan(&rows); err != nil {
+		t.Fatalf("count repaired decisions: %v", err)
+	}
+	if rows != 1 {
+		t.Fatalf("expected only valid legacy decision row copied, got %d", rows)
+	}
+}
+
 func TestUpdateRSRankings(t *testing.T) {
 	s := openTemp(t)
 
@@ -199,5 +278,42 @@ func TestUpdateRSRankings(t *testing.T) {
 		if rs < 0 || rs > 100 {
 			t.Errorf("%s RS20=%v out of range", c, rs)
 		}
+	}
+}
+
+func TestCloseAfterUsesGlobalTradingDayAndRequiresExactCodeSnapshot(t *testing.T) {
+	s := openTemp(t)
+
+	for _, c := range []string{"sz000001", "sz000002"} {
+		if err := s.UpsertInstrument(c, c, "sz", ""); err != nil {
+			t.Fatalf("seed instrument %s: %v", c, err)
+		}
+	}
+	for day := 1; day <= 5; day++ {
+		date := fmt.Sprintf("2026-06-%02d", day)
+		if err := s.SaveSnapshot(Snapshot{Code: "sz000001", TradeDate: date, Close: float64(10 + day)}); err != nil {
+			t.Fatalf("seed sz000001 %s: %v", date, err)
+		}
+		if day != 4 {
+			if err := s.SaveSnapshot(Snapshot{Code: "sz000002", TradeDate: date, Close: float64(20 + day)}); err != nil {
+				t.Fatalf("seed sz000002 %s: %v", date, err)
+			}
+		}
+	}
+
+	close, date, err := s.CloseAfter("sz000002", "2026-06-01", 3)
+	if err != nil {
+		t.Fatalf("CloseAfter missing exact date: %v", err)
+	}
+	if close != 0 || date != "" {
+		t.Fatalf("expected missing exact global date to skip, got close=%v date=%q", close, date)
+	}
+
+	close, date, err = s.CloseAfter("sz000002", "2026-06-01", 4)
+	if err != nil {
+		t.Fatalf("CloseAfter next global date: %v", err)
+	}
+	if close != 25 || date != "2026-06-05" {
+		t.Fatalf("expected exact fourth global day close=25 date=2026-06-05, got close=%v date=%q", close, date)
 	}
 }

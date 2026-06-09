@@ -152,9 +152,34 @@ CREATE TABLE IF NOT EXISTS snapshot (
   rs60 REAL DEFAULT 0,
   rs120 REAL DEFAULT 0,
   PRIMARY KEY (code, trade_date)
-);`
+);
+CREATE TABLE IF NOT EXISTS decision_log (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  code         TEXT NOT NULL REFERENCES instrument(code) ON DELETE CASCADE,
+  log_date     TEXT NOT NULL,
+  action       TEXT NOT NULL,
+  tier         TEXT NOT NULL,
+  score_total  INTEGER,
+  adx          REAL,
+  sar_long     INTEGER,
+  st_long      INTEGER,
+  obv_up       INTEGER,
+  macd_hist    REAL,
+  td_countdown TEXT,
+  signals      TEXT,
+  created_at   TEXT NOT NULL,
+  outcome_pct  REAL,
+  outcome_date TEXT,
+  correct      INTEGER,
+  UNIQUE(code, log_date, action)
+);
+CREATE INDEX IF NOT EXISTS idx_decision_log_date ON decision_log(log_date);
+CREATE INDEX IF NOT EXISTS idx_decision_log_pending ON decision_log(outcome_pct) WHERE outcome_pct IS NULL;`
 	if _, err := s.db.Exec(schema); err != nil {
 		return fmt.Errorf("migrate schema: %w", err)
+	}
+	if err := s.ensureDecisionLogForeignKey(); err != nil {
+		return err
 	}
 	// Add new columns to existing databases; SQLite does not support IF NOT EXISTS
 	// in ALTER TABLE, so we ignore the "duplicate column name" error.
@@ -177,6 +202,95 @@ CREATE TABLE IF NOT EXISTS snapshot (
 	s.db.Exec(`UPDATE snapshot SET ret20=NULL, ret60=NULL, ret120=NULL
 		WHERE ret20=0 AND ret60=0 AND ret120=0 AND COALESCE(ret20,0)=0`) //nolint:errcheck
 	return nil
+}
+
+func (s *Store) ensureDecisionLogForeignKey() error {
+	rows, err := s.db.Query(`PRAGMA foreign_key_list(decision_log)`)
+	if err != nil {
+		return fmt.Errorf("inspect decision_log foreign keys: %w", err)
+	}
+	hasFK := false
+	for rows.Next() {
+		var id, seq int
+		var table, from, to, onUpdate, onDelete, match string
+		if err := rows.Scan(&id, &seq, &table, &from, &to, &onUpdate, &onDelete, &match); err != nil {
+			rows.Close()
+			return err
+		}
+		if table == "instrument" && from == "code" && to == "code" && onDelete == "CASCADE" {
+			hasFK = true
+		}
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if hasFK {
+		return nil
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec(`ALTER TABLE decision_log RENAME TO decision_log_legacy`); err != nil {
+		return fmt.Errorf("rename legacy decision_log: %w", err)
+	}
+	if _, err := tx.Exec(`DROP INDEX IF EXISTS idx_decision_log_date`); err != nil {
+		return fmt.Errorf("drop legacy decision_log date index: %w", err)
+	}
+	if _, err := tx.Exec(`DROP INDEX IF EXISTS idx_decision_log_pending`); err != nil {
+		return fmt.Errorf("drop legacy decision_log pending index: %w", err)
+	}
+	if _, err := tx.Exec(`
+CREATE TABLE decision_log (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  code         TEXT NOT NULL REFERENCES instrument(code) ON DELETE CASCADE,
+  log_date     TEXT NOT NULL,
+  action       TEXT NOT NULL,
+  tier         TEXT NOT NULL,
+  score_total  INTEGER,
+  adx          REAL,
+  sar_long     INTEGER,
+  st_long      INTEGER,
+  obv_up       INTEGER,
+  macd_hist    REAL,
+  td_countdown TEXT,
+  signals      TEXT,
+  created_at   TEXT NOT NULL,
+  outcome_pct  REAL,
+  outcome_date TEXT,
+  correct      INTEGER,
+  UNIQUE(code, log_date, action)
+)`); err != nil {
+		return fmt.Errorf("create repaired decision_log: %w", err)
+	}
+	if _, err := tx.Exec(`
+INSERT OR IGNORE INTO decision_log
+  (id, code, log_date, action, tier, score_total, adx, sar_long, st_long,
+   obv_up, macd_hist, td_countdown, signals, created_at, outcome_pct,
+   outcome_date, correct)
+SELECT id, code, log_date, action, tier, score_total, adx, sar_long, st_long,
+       obv_up, macd_hist, td_countdown, signals, created_at, outcome_pct,
+       outcome_date, correct
+FROM decision_log_legacy
+WHERE EXISTS (SELECT 1 FROM instrument WHERE instrument.code = decision_log_legacy.code)`); err != nil {
+		return fmt.Errorf("copy legacy decision_log: %w", err)
+	}
+	if _, err := tx.Exec(`DROP TABLE decision_log_legacy`); err != nil {
+		return fmt.Errorf("drop legacy decision_log: %w", err)
+	}
+	if _, err := tx.Exec(`CREATE INDEX IF NOT EXISTS idx_decision_log_date ON decision_log(log_date)`); err != nil {
+		return fmt.Errorf("create decision_log date index: %w", err)
+	}
+	if _, err := tx.Exec(`CREATE INDEX IF NOT EXISTS idx_decision_log_pending ON decision_log(outcome_pct) WHERE outcome_pct IS NULL`); err != nil {
+		return fmt.Errorf("create decision_log pending index: %w", err)
+	}
+	return tx.Commit()
 }
 
 // UpsertInstrument inserts the instrument or updates its name/market/note when
@@ -436,6 +550,166 @@ WHERE trade_date = (SELECT MAX(trade_date) FROM snapshot s2 WHERE s2.code = snap
 		}
 	}
 	return updated, nil
+}
+
+// Decision is one recommendation or hold record written by screen-stocks.
+type Decision struct {
+	ID          int
+	Code        string
+	LogDate     string
+	Action      string // "recommend" or "hold"
+	Tier        string // "⭐⭐⭐", "⭐⭐", "📌持仓"
+	ScoreTotal  int
+	ADX         float64
+	SARLong     bool
+	STLong      bool
+	OBVUp       bool
+	MACDHist    float64
+	TDCountdown string
+	Signals     string
+	OutcomePct  *float64 // nil when not yet backfilled
+	OutcomeDate *string
+	Correct     *int
+}
+
+// SaveDecision inserts a decision log entry, ignoring duplicates on (code, log_date, action).
+func (s *Store) SaveDecision(d Decision) error {
+	_, err := s.db.Exec(`
+INSERT OR IGNORE INTO decision_log
+  (code, log_date, action, tier, score_total, adx, sar_long, st_long, obv_up,
+   macd_hist, td_countdown, signals, created_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		d.Code, d.LogDate, d.Action, d.Tier, d.ScoreTotal, d.ADX,
+		boolToInt(d.SARLong), boolToInt(d.STLong), boolToInt(d.OBVUp),
+		d.MACDHist, d.TDCountdown, d.Signals, time.Now().Format(time.RFC3339))
+	if err != nil {
+		return fmt.Errorf("save decision %s@%s: %w", d.Code, d.LogDate, err)
+	}
+	return nil
+}
+
+// PendingDecisions returns decisions older than 10 days that have no outcome yet.
+func (s *Store) PendingDecisions() ([]Decision, error) {
+	rows, err := s.db.Query(`
+SELECT id, code, log_date, action, tier, score_total, adx,
+       sar_long, st_long, obv_up, macd_hist, td_countdown, signals
+FROM decision_log
+WHERE outcome_pct IS NULL
+  AND log_date <= date('now', '-10 days')
+ORDER BY log_date, code`)
+	if err != nil {
+		return nil, fmt.Errorf("pending decisions: %w", err)
+	}
+	defer rows.Close()
+
+	var out []Decision
+	for rows.Next() {
+		var d Decision
+		if err := rows.Scan(&d.ID, &d.Code, &d.LogDate, &d.Action, &d.Tier,
+			&d.ScoreTotal, &d.ADX, &d.SARLong, &d.STLong, &d.OBVUp,
+			&d.MACDHist, &d.TDCountdown, &d.Signals); err != nil {
+			return nil, err
+		}
+		out = append(out, d)
+	}
+	return out, rows.Err()
+}
+
+// BackfillDecision writes the outcome for a previously recorded decision.
+func (s *Store) BackfillDecision(id int, outcomePct float64, outcomeDate string, correct bool) error {
+	c := 0
+	if correct {
+		c = 1
+	}
+	_, err := s.db.Exec(
+		`UPDATE decision_log SET outcome_pct=?, outcome_date=?, correct=? WHERE id=?`,
+		outcomePct, outcomeDate, c, id)
+	if err != nil {
+		return fmt.Errorf("backfill decision %d: %w", id, err)
+	}
+	return nil
+}
+
+// DecisionStats aggregates win rate and average return by tier.
+type DecisionStats struct {
+	Tier      string
+	Count     int
+	Wins      int
+	AvgReturn float64
+	WinRate   float64
+}
+
+// CloseOnDate returns the close price for code on the exact tradeDate.
+// Returns 0 if no snapshot exists for that date.
+func (s *Store) CloseOnDate(code, tradeDate string) (float64, error) {
+	var close float64
+	err := s.db.QueryRow(
+		`SELECT close FROM snapshot WHERE code = ? AND trade_date = ?`,
+		code, tradeDate).Scan(&close)
+	if err == sql.ErrNoRows {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, fmt.Errorf("close on %s for %s: %w", tradeDate, code, err)
+	}
+	return close, nil
+}
+
+// CloseAfter returns the close price and trade_date on the Nth global trading day
+// after startDate. Returns 0 and "" when the global date is missing, or when the
+// code has no snapshot on that exact target date.
+func (s *Store) CloseAfter(code, startDate string, n int) (float64, string, error) {
+	var close float64
+	var tradeDate string
+	err := s.db.QueryRow(`
+WITH target AS (
+  SELECT trade_date
+  FROM (
+    SELECT DISTINCT trade_date
+    FROM snapshot
+    WHERE trade_date > ?
+    ORDER BY trade_date ASC
+    LIMIT 1 OFFSET ?
+  )
+)
+SELECT close, trade_date FROM snapshot
+WHERE code = ? AND trade_date = (SELECT trade_date FROM target)`, startDate, n-1, code).Scan(&close, &tradeDate)
+	if err == sql.ErrNoRows {
+		return 0, "", nil
+	}
+	if err != nil {
+		return 0, "", fmt.Errorf("close after %s+%d for %s: %w", startDate, n, code, err)
+	}
+	return close, tradeDate, nil
+}
+
+// StatsByTier returns aggregated decision statistics grouped by tier.
+func (s *Store) StatsByTier() ([]DecisionStats, error) {
+	rows, err := s.db.Query(`
+SELECT tier, COUNT(*), SUM(correct), AVG(outcome_pct)
+FROM decision_log
+WHERE outcome_pct IS NOT NULL
+GROUP BY tier
+ORDER BY tier`)
+	if err != nil {
+		return nil, fmt.Errorf("decision stats: %w", err)
+	}
+	defer rows.Close()
+
+	var out []DecisionStats
+	for rows.Next() {
+		var st DecisionStats
+		var sumCorrect int
+		if err := rows.Scan(&st.Tier, &st.Count, &sumCorrect, &st.AvgReturn); err != nil {
+			return nil, err
+		}
+		st.Wins = sumCorrect
+		if st.Count > 0 {
+			st.WinRate = float64(st.Wins) / float64(st.Count) * 100
+		}
+		out = append(out, st)
+	}
+	return out, rows.Err()
 }
 
 // percentileRanks assigns each value its 0–100 cross-sectional percentile rank

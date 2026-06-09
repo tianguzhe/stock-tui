@@ -225,9 +225,9 @@ func printAnalysis(data seriesData) store.Snapshot {
 	fmt.Printf("VolMA5=%.0f VolMA10=%.0f VolMA20=%.0f median20=%.0f | 今日量=%.0f 量比=%.2f | OBV=%s | 近5日量价: upDays=%d avgUpVol=%.0f downDays=%d avgDownVol=%.0f\n",
 		meanTail(volumes, 5), meanTail(volumes, 10), volMA20, medianTail(volumes, 20),
 		lastCandle.Volume, volRatio, obvTrend(obv), upCnt, upAvgVol, downCnt, downAvgVol)
-	fmt.Printf("SCORE total=%d delta=%+d dmi=%+d ma=%+d macd=%+d kdj=%+d rsi=%+d wr=%+d bias=%+d chopcmi=%+d volume=%+d label=%s\n",
-		score.Total, score.Delta, score.DMI, score.MA, score.MACD, score.KDJ, score.RSI, score.WR,
-		score.BIAS, score.CHOPCMI, score.Volume, score.Label)
+	fmt.Printf("SCORE total=%d delta=%+d dmi=%+d ma=%+d macd=%+d kdjwr=%+d rsi=%+d bias=%+d chopcmi=%+d volume=%+d sar=%+d div=%+d label=%s\n",
+		score.Total, score.Delta, score.DMI, score.MA, score.MACD, score.KdjWr, score.RSI,
+		score.BIAS, score.CHOPCMI, score.Volume, score.SAR, score.Divergence, score.Label)
 	fmt.Printf("当前策略触发: trendBull=%t(%d/4) trendBear=%t(%d/4) oversold=%t(%d/4) overbought=%t(%d/4) breakBull=%t(%d/3) breakBear=%t(%d/3) revertBull=%t(%d/3) revertBear=%t(%d/3) divBull=%t(%d/1,today=%t) divBear=%t(%d/1,today=%t)\n",
 		score.Signals.TrendBull, score.Signals.TrendBullScore, score.Signals.TrendBear, score.Signals.TrendBearScore,
 		score.Signals.Oversold, score.Signals.OversoldScore, score.Signals.Overbought, score.Signals.OverboughtScore,
@@ -240,6 +240,7 @@ func printAnalysis(data seriesData) store.Snapshot {
 	printFib(candles, dates, 120)
 	printRecentExtremes(candles, dates, results)
 	printStreak(candles)
+	printBullBear(candles, results, tds, obv, score, div, volRatio)
 	printPerf(performance(candles, dates, results, tds, obv))
 	printRecentRows(candles, dates, results, tds)
 
@@ -320,19 +321,20 @@ func nDayReturn(candles []indicator.Candle, n int) float64 {
 }
 
 type scoreState struct {
-	Total   int
-	Delta   int
-	DMI     int
-	MA      int
-	MACD    int
-	KDJ     int
-	RSI     int
-	WR      int
-	BIAS    int
-	CHOPCMI int
-	Volume  int
-	Label   string
-	Signals signalState
+	Total      int
+	Delta      int
+	DMI        int
+	MA         int
+	MACD       int
+	KdjWr      int // merged KDJ+WR (same source, pick the more extreme signal)
+	RSI        int
+	BIAS       int
+	CHOPCMI    int
+	Volume     int
+	SAR        int // SAR/SuperTrend dual confirmation
+	Divergence int // bull/bear divergence signal
+	Label      string
+	Signals    signalState
 }
 
 type signalState struct {
@@ -414,20 +416,45 @@ func scoreResult(candles []indicator.Candle, results []indicator.Result, obv []f
 		score.MACD = -5
 	}
 
+	// KDJ + WR merged: both measure close position within N-day high-low range.
+	// Take the more extreme signal to avoid double-counting same-source indicators.
 	kdjGold := last.KDJ.K >= last.KDJ.D
+	kdjSignal := 0
 	switch {
 	case last.KDJ.K < 20 && kdjGold:
-		score.KDJ = 7
+		kdjSignal = 7
 	case last.KDJ.K < 20:
-		score.KDJ = 1
+		kdjSignal = 1
 	case last.KDJ.K <= 80 && kdjGold:
-		score.KDJ = 3
+		kdjSignal = 3
 	case last.KDJ.K <= 80:
-		score.KDJ = -3
+		kdjSignal = -3
 	case kdjGold:
-		score.KDJ = -2
+		kdjSignal = -2
 	default:
-		score.KDJ = -7
+		kdjSignal = -7
+	}
+	wrSignal := 0
+	switch {
+	case last.WR.WR14 > 90:
+		wrSignal = 4
+	case last.WR.WR14 >= 80:
+		wrSignal = 2
+	case last.WR.WR14 >= 60:
+		wrSignal = 1
+	case last.WR.WR14 >= 40:
+		wrSignal = 0
+	case last.WR.WR14 >= 20:
+		wrSignal = -1
+	case last.WR.WR14 >= 10:
+		wrSignal = -2
+	default:
+		wrSignal = -4
+	}
+	if abs(kdjSignal) >= abs(wrSignal) {
+		score.KdjWr = kdjSignal
+	} else {
+		score.KdjWr = wrSignal
 	}
 
 	switch {
@@ -448,23 +475,6 @@ func scoreResult(candles []indicator.Candle, results []indicator.Result, obv []f
 	}
 
 	switch {
-	case last.WR.WR14 > 90:
-		score.WR = 4
-	case last.WR.WR14 >= 80:
-		score.WR = 2
-	case last.WR.WR14 >= 60:
-		score.WR = 1
-	case last.WR.WR14 >= 40:
-		score.WR = 0
-	case last.WR.WR14 >= 20:
-		score.WR = -1
-	case last.WR.WR14 >= 10:
-		score.WR = -2
-	default:
-		score.WR = -4
-	}
-
-	switch {
 	case last.BIAS.BIAS24 < -15:
 		score.BIAS = 3
 	case last.BIAS.BIAS24 <= -10:
@@ -481,19 +491,16 @@ func scoreResult(candles []indicator.Candle, results []indicator.Result, obv []f
 		score.BIAS = -3
 	}
 
-	if last.CHOP < 38.2 {
-		if last.DMI.PDI > last.DMI.MDI {
-			score.CHOPCMI += 2
-		} else if last.DMI.MDI > last.DMI.PDI {
-			score.CHOPCMI -= 2
-		}
-	}
-	if last.CMI > 60 {
-		if last.DMI.PDI > last.DMI.MDI {
-			score.CHOPCMI++
-		} else if last.DMI.MDI > last.DMI.PDI {
-			score.CHOPCMI--
-		}
+	// CHOPCMI: pure trend efficiency score, decoupled from DMI direction.
+	switch {
+	case last.CHOP < 30 && last.CMI > 70:
+		score.CHOPCMI = 3
+	case last.CHOP < 38.2 && last.CMI > 60:
+		score.CHOPCMI = 2
+	case last.CHOP > 70 && last.CMI < 30:
+		score.CHOPCMI = -3
+	case last.CHOP > 61.8 && last.CMI < 40:
+		score.CHOPCMI = -2
 	}
 
 	priceUp, priceDown := false, false
@@ -528,10 +535,41 @@ func scoreResult(candles []indicator.Candle, results []indicator.Result, obv []f
 		score.Volume--
 	}
 	score.Volume = clampInt(score.Volume, -5, 5)
-	score.Delta = score.DMI + score.MA + score.MACD + score.KDJ + score.RSI + score.WR + score.BIAS + score.CHOPCMI + score.Volume
+
+	// SAR/SuperTrend dual confirmation: trend-following stance.
+	switch {
+	case last.SAR.Long && last.SuperTrend.Long:
+		score.SAR = 3
+	case !last.SAR.Long && !last.SuperTrend.Long:
+		score.SAR = -3
+	}
+
+	// Divergence signal: bear divergence penalizes, bull divergence rewards.
+	if n >= 20 {
+		div := divergence(candles, results, n-1)
+		if div.BearToday {
+			score.Divergence = -3
+		} else if div.Bear {
+			score.Divergence = -1
+		}
+		if div.BullToday {
+			score.Divergence = 2
+		} else if div.Bull {
+			score.Divergence = 1
+		}
+	}
+
+	score.Delta = score.DMI + score.MA + score.MACD + score.KdjWr + score.RSI + score.BIAS + score.CHOPCMI + score.Volume + score.SAR + score.Divergence
 	score.Total = clampInt(50+score.Delta, 0, 100)
 	score.Label = scoreLabel(score.Total)
 	return score
+}
+
+func abs(x int) int {
+	if x < 0 {
+		return -x
+	}
+	return x
 }
 
 func evalSignals(candles []indicator.Candle, results []indicator.Result, obv []float64, i int) signalState {
@@ -837,6 +875,119 @@ func printStreak(candles []indicator.Candle) {
 	} else if sv < 0 {
 		fmt.Printf("连续下跌 %d 日\n", -sv)
 	}
+}
+
+// printBullBear emits a structured BULLBEAR line summarising bull/bear evidence
+// from existing indicators. Pure deterministic rules, no LLM.
+func printBullBear(candles []indicator.Candle, results []indicator.Result, tds []indicator.TD, obv []float64, score scoreState, div divergenceState, volRatio float64) {
+	n := len(candles)
+	last := results[n-1]
+	lastTD := tds[n-1]
+
+	var bulls, bears []string
+
+	// Trend strength
+	if last.DMI.ADX > 25 && last.DMI.PDI > last.DMI.MDI {
+		bulls = append(bulls, fmt.Sprintf("ADX强趋势(%.1f)", last.DMI.ADX))
+	}
+	if last.DMI.ADX > 25 && last.DMI.MDI > last.DMI.PDI {
+		bears = append(bears, fmt.Sprintf("ADX强空头(%.1f)", last.DMI.ADX))
+	}
+
+	// SAR/SuperTrend dual confirmation
+	if last.SAR.Long && last.SuperTrend.Long {
+		bulls = append(bulls, "SAR/ST双多")
+	} else if !last.SAR.Long && !last.SuperTrend.Long {
+		bears = append(bears, "SAR/ST双空")
+	}
+
+	// OBV
+	if len(obv) >= 6 && obv[n-1] > obv[n-6] {
+		bulls = append(bulls, "OBV净流入")
+	} else if len(obv) >= 6 && obv[n-1] < obv[n-6] {
+		bears = append(bears, "OBV净流出")
+	}
+
+	// MACD
+	if last.MACD.Histogram > 0 && last.MACD.DIF > last.MACD.DEA {
+		bulls = append(bulls, "MACD金叉")
+	} else if last.MACD.Histogram < 0 && last.MACD.DIF < last.MACD.DEA {
+		bears = append(bears, "MACD死叉")
+	}
+
+	// Volume surge
+	if volRatio > 1.5 && n > 1 && candles[n-1].Close > candles[n-2].Close {
+		bulls = append(bulls, fmt.Sprintf("放量上涨(量比%.2f)", volRatio))
+	} else if volRatio > 1.5 && n > 1 && candles[n-1].Close < candles[n-2].Close {
+		bears = append(bears, fmt.Sprintf("放量下跌(量比%.2f)", volRatio))
+	}
+
+	// TD Sequential countdown
+	cdwn := lastTD.CountdownCount
+	if cdwn > 0 && lastTD.CountdownSignal == indicator.TDSell {
+		bears = append(bears, fmt.Sprintf("TD C顶%d", cdwn))
+	}
+	if cdwn > 0 && lastTD.CountdownSignal == indicator.TDBuy {
+		bulls = append(bulls, fmt.Sprintf("TD C底%d", cdwn))
+	}
+
+	// Divergence
+	if div.Bear {
+		bears = append(bears, "顶背离")
+	}
+	if div.Bull {
+		bulls = append(bulls, "底背离")
+	}
+
+	// Overbought/oversold
+	if last.RSI.RSI6 > 70 {
+		bears = append(bears, fmt.Sprintf("RSI超买(%.1f)", last.RSI.RSI6))
+	}
+	if last.RSI.RSI6 < 30 {
+		bulls = append(bulls, fmt.Sprintf("RSI超卖(%.1f)", last.RSI.RSI6))
+	}
+	if last.BIAS.BIAS24 > 10 {
+		bears = append(bears, fmt.Sprintf("乖离偏大(BIAS24=%.1f)", last.BIAS.BIAS24))
+	}
+	if last.BIAS.BIAS24 < -10 {
+		bulls = append(bulls, fmt.Sprintf("负乖离偏大(BIAS24=%.1f)", last.BIAS.BIAS24))
+	}
+
+	// Score extremes
+	if score.Total >= 70 {
+		bulls = append(bulls, fmt.Sprintf("评分偏强(%d)", score.Total))
+	}
+	if score.Total <= 35 {
+		bears = append(bears, fmt.Sprintf("评分偏弱(%d)", score.Total))
+	}
+
+	verdict := "中性"
+	if len(bulls) > len(bears) {
+		verdict = "偏多"
+	} else if len(bears) > len(bulls) {
+		verdict = "偏空"
+	}
+
+	bullStr := "-"
+	if len(bulls) > 0 {
+		bullStr = joinComma(bulls)
+	}
+	bearStr := "-"
+	if len(bears) > 0 {
+		bearStr = joinComma(bears)
+	}
+	fmt.Printf("BULLBEAR bull=[%s] bear=[%s] verdict=%s\n", bullStr, bearStr, verdict)
+}
+
+func joinComma(ss []string) string {
+	s := ""
+	for i, v := range ss {
+		if i > 0 {
+			s += ","
+		}
+		s += v
+	}
+	return s
 }
 
 func printPerf(perfs []perfStat) {

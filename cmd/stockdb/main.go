@@ -40,6 +40,8 @@ func run(args []string) error {
 		return cmdHistory(rest)
 	case "rs-rank":
 		return cmdRSRank(rest)
+	case "backfill":
+		return cmdBackfill(rest)
 	default:
 		return usageErr()
 	}
@@ -51,7 +53,8 @@ func usageErr() error {
   stockdb tag rm  <code> <标签>
   stockdb list --tag <标签>
   stockdb history <code> [-n 15]
-  stockdb rs-rank                         compute RS20/RS60/RS120 percentile ranks`)
+  stockdb rs-rank                         compute RS20/RS60/RS120 percentile ranks
+  stockdb backfill                        backfill decision_log outcomes from snapshots`)
 }
 
 func openStore() (*store.Store, error) {
@@ -190,5 +193,67 @@ func cmdRSRank(_ []string) error {
 		return fmt.Errorf("rs-rank: %w", err)
 	}
 	fmt.Printf("rs-rank: updated %d stocks\n", n)
+	return nil
+}
+
+func cmdBackfill(_ []string) error {
+	st, err := openStore()
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+
+	pending, err := st.PendingDecisions()
+	if err != nil {
+		return err
+	}
+	if len(pending) == 0 {
+		fmt.Println("backfill: 无待回填的决策记录")
+		return nil
+	}
+
+	updated, skipped := 0, 0
+	for _, d := range pending {
+		close10, date10, err := st.CloseAfter(d.Code, d.LogDate, 10)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "warn: %s: %v\n", d.Code, err)
+			skipped++
+			continue
+		}
+		if close10 == 0 {
+			skipped++
+			continue
+		}
+		// Fetch entry close from snapshot on log_date.
+		entryClose, err := st.CloseOnDate(d.Code, d.LogDate)
+		if err != nil || entryClose == 0 {
+			fmt.Fprintf(os.Stderr, "warn: %s@%s: no entry close\n", d.Code, d.LogDate)
+			skipped++
+			continue
+		}
+		pct := (close10/entryClose - 1) * 100
+		correct := pct > 0
+		if err := st.BackfillDecision(d.ID, pct, date10, correct); err != nil {
+			fmt.Fprintf(os.Stderr, "warn: backfill %d: %v\n", d.ID, err)
+			skipped++
+			continue
+		}
+		updated++
+	}
+
+	fmt.Printf("backfill: %d 条已回填, %d 条跳过（数据不足）\n", updated, skipped)
+
+	// Print summary stats.
+	stats, err := st.StatsByTier()
+	if err != nil {
+		return err
+	}
+	if len(stats) > 0 {
+		fmt.Printf("\n%-10s %5s %5s %10s %8s\n", "tier", "N", "wins", "avg_ret%", "win%")
+		for _, s := range stats {
+			fmt.Printf("%-10s %5d %5d %+10.2f %7.1f%%\n",
+				s.Tier, s.Count, s.Wins, s.AvgReturn, s.WinRate)
+		}
+	}
 	return nil
 }

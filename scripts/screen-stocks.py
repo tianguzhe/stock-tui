@@ -174,3 +174,83 @@ for t, r in selected:
 
 if n_cand < limit:
     print(f"\n> ⚠️ 优质候选不足 {limit} 只，当前仅筛出 {n_cand} 只（⭐⭐⭐ {len(candidates['⭐⭐⭐'])} / ⭐⭐ {len(candidates['⭐⭐'])}）")
+
+# ── 写入 decision_log ────────────────────────────────────────────────────────
+import datetime as _dt
+
+def _ensure_decision_log(cur):
+    """Create decision_log table if it doesn't exist yet."""
+    cur.execute("""CREATE TABLE IF NOT EXISTS decision_log (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  code         TEXT NOT NULL REFERENCES instrument(code) ON DELETE CASCADE,
+  log_date     TEXT NOT NULL,
+  action       TEXT NOT NULL,
+  tier         TEXT NOT NULL,
+  score_total  INTEGER,
+  adx          REAL,
+  sar_long     INTEGER,
+  st_long      INTEGER,
+  obv_up       INTEGER,
+  macd_hist    REAL,
+  td_countdown TEXT,
+  signals      TEXT,
+  created_at   TEXT NOT NULL,
+  outcome_pct  REAL,
+  outcome_date TEXT,
+  correct      INTEGER,
+  UNIQUE(code, log_date, action)
+)""")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_decision_log_date ON decision_log(log_date)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_decision_log_pending ON decision_log(outcome_pct) WHERE outcome_pct IS NULL")
+
+def _save_decisions(con, date, holdings, selected):
+    """Insert recommend/hold entries into decision_log (idempotent on code+date+action)."""
+    cur = con.cursor()
+    _ensure_decision_log(cur)
+    inserted_holdings = 0
+    inserted_selected = 0
+    skipped_holdings = 0
+    for code, cost, shares in holdings:
+        r = snap.get(code)
+        if not r:
+            skipped_holdings += 1
+            continue
+        cur.execute(
+            "INSERT OR IGNORE INTO decision_log "
+            "(code, log_date, action, tier, score_total, adx, sar_long, st_long, "
+            "obv_up, macd_hist, td_countdown, signals, created_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (code, date, "hold", "📌持仓",
+             r["score_total"], r["adx"],
+             r["sar_long"], r["supertrend_long"], r["obv_up"],
+             r["macd_hist"] or 0, r["td_countdown"] or "",
+             signals(r, cost, shares), _dt.datetime.now().isoformat()))
+        inserted_holdings += cur.rowcount
+    for tier_label, r in selected:
+        cur.execute(
+            "INSERT OR IGNORE INTO decision_log "
+            "(code, log_date, action, tier, score_total, adx, sar_long, st_long, "
+            "obv_up, macd_hist, td_countdown, signals, created_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (r["code"], date, "recommend", tier_label,
+             r["score_total"], r["adx"],
+             r["sar_long"], r["supertrend_long"], r["obv_up"],
+             r["macd_hist"] or 0, r["td_countdown"] or "",
+             signals(r), _dt.datetime.now().isoformat()))
+        inserted_selected += cur.rowcount
+    con.commit()
+    return inserted_holdings, inserted_selected, skipped_holdings
+
+con2 = sqlite3.connect(args.db)
+try:
+    inserted_holdings, inserted_selected, skipped_holdings = _save_decisions(con2, date, holdings, selected)
+    duplicate_holdings = len(holdings) - skipped_holdings - inserted_holdings
+    duplicate_selected = len(selected) - inserted_selected
+    print(
+        f"\n> 📝 已写入 decision_log（新增 {inserted_holdings} 持仓 + {inserted_selected} 候选；"
+        f"重复 {duplicate_holdings} 持仓 + {duplicate_selected} 候选；无快照持仓 {skipped_holdings}）"
+    )
+except Exception as e:
+    print(f"\n> ⚠️ decision_log 写入失败: {e}")
+finally:
+    con2.close()
