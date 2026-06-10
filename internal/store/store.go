@@ -78,6 +78,10 @@ type Snapshot struct {
 
 	// RS percentile rankings (0–100) computed by stockdb rs-rank after batch saves.
 	RS20, RS60, RS120 float64
+
+	// PERF historical win rates (%) computed from backtesting signals during -save.
+	PerfTrendFollowBullWin10 *float64 // 趋势跟随多头 10日胜率
+	PerfOverboughtBearWin10  *float64 // 超买反转空头 10日胜率
 }
 
 // Open opens (creating if needed) the SQLite database at path, enables foreign
@@ -366,7 +370,8 @@ INSERT INTO snapshot (
   div_bull, div_bear, div_bear_today,
   td_setup, td_countdown, streak,
   turnover_rate, market_cap, pe,
-  ret20, ret60, ret120
+  ret20, ret60, ret120,
+  perf_trend_follow_bull_win10, perf_overbought_bear_win10
 ) VALUES (
   ?, ?, ?,
   ?, ?, ?, ?, ?, ?,
@@ -380,7 +385,8 @@ INSERT INTO snapshot (
   ?, ?, ?,
   ?, ?, ?,
   ?, ?, ?,
-  ?, ?, ?
+  ?, ?, ?,
+  ?, ?
 )
 ON CONFLICT(code, trade_date) DO UPDATE SET
   captured_at=excluded.captured_at,
@@ -396,7 +402,8 @@ ON CONFLICT(code, trade_date) DO UPDATE SET
   div_bull=excluded.div_bull, div_bear=excluded.div_bear, div_bear_today=excluded.div_bear_today,
   td_setup=excluded.td_setup, td_countdown=excluded.td_countdown, streak=excluded.streak,
   turnover_rate=excluded.turnover_rate, market_cap=excluded.market_cap, pe=excluded.pe,
-  ret20=excluded.ret20, ret60=excluded.ret60, ret120=excluded.ret120`,
+  ret20=excluded.ret20, ret60=excluded.ret60, ret120=excluded.ret120,
+  perf_trend_follow_bull_win10=excluded.perf_trend_follow_bull_win10, perf_overbought_bear_win10=excluded.perf_overbought_bear_win10`,
 		snap.Code, snap.TradeDate, time.Now().Format(time.RFC3339),
 		snap.Close, snap.ChangePct, snap.MA5, snap.MA10, snap.MA20, snap.MA60,
 		snap.KDJ_J, snap.MACD_DIF, snap.MACD_DEA, snap.MACD_Hist,
@@ -409,7 +416,8 @@ ON CONFLICT(code, trade_date) DO UPDATE SET
 		boolToInt(snap.DivBull), boolToInt(snap.DivBear), boolToInt(snap.DivBearToday),
 		snap.TDSetup, snap.TDCountdown, snap.Streak,
 		snap.TurnoverRate, snap.MarketCap, snap.PE,
-		snap.Ret20, snap.Ret60, snap.Ret120)
+		snap.Ret20, snap.Ret60, snap.Ret120,
+		snap.PerfTrendFollowBullWin10, snap.PerfOverboughtBearWin10)
 	if err != nil {
 		return fmt.Errorf("save snapshot %s@%s: %w", snap.Code, snap.TradeDate, err)
 	}

@@ -8,9 +8,15 @@
   持仓格式：代码:成本价:股数（逗号分隔）
 
 候选筛选（不凑数，只出真正优质的）：
-  ⭐⭐⭐  score≥70, ADX≥40, SAR/ST双多, OBV净流入, MACD hist>0, 非C顶countdown
-  ⭐⭐   score≥65, ADX≥35, SAR/ST双多, OBV净流入, MACD hist>0
+  ⭐⭐⭐  score≥70, ADX≥40, SAR/ST双多, OBV净流入, MACD hist>0,
+         TD非C顶或C顶≤6, 今日无顶背离, 热度≥3
+  ⭐⭐   score≥65, ADX≥35, SAR/ST双多, OBV净流入, MACD hist>0,
+         TD非C顶或C顶≤6, 今日无顶背离（与⭐⭐⭐共享安全阀）
   优先展示 ⭐⭐⭐，其次 ⭐⭐，合计不超过 (10 - 持仓数)，但不凑数——宁少勿滥
+
+硬性过滤（PERF 暂不可用，future: 扩展 snapshot 或建 perf 表后启用）：
+  - 若 PERF 趋势跟随多头 win10 < 40%：排除（追涨历史差）
+  - 若当前 sig_overbought=1 且 PERF 超买反转空头 win10 > 55%：排除（超买信号历史有效，等回调）
 """
 import sqlite3, sys, argparse
 
@@ -42,7 +48,7 @@ date = con.execute("SELECT MAX(trade_date) FROM snapshot").fetchone()[0]
 
 # 全量快照
 snap = {r["code"]: r for r in con.execute("""
-SELECT i.code, i.name,
+SELECT i.code, i.name, i.hot_score,
        s.score_total, s.adx, s.change_pct, s.close,
        s.sar_long, s.supertrend_long, s.obv_up,
        s.macd_hist, s.vol_ratio,
@@ -51,7 +57,9 @@ SELECT i.code, i.name,
        COALESCE(s.turnover_rate, 0) AS turnover_rate,
        COALESCE(s.market_cap, 0)    AS market_cap,
        COALESCE(s.pe, 0)            AS pe,
-       COALESCE(s.rs20, 0)          AS rs20
+       COALESCE(s.rs20, 0)          AS rs20,
+       s.perf_trend_follow_bull_win10,
+       s.perf_overbought_bear_win10
 FROM snapshot s JOIN instrument i ON s.code = i.code
 WHERE s.trade_date = ?
 """, (date,)).fetchall()}
@@ -69,25 +77,100 @@ def _fund_ok(r) -> bool:
     return True
 
 
+def _perf_ok(r) -> bool:
+    """PERF 历史胜率过滤：追涨历史差或超买信号历史有效则排除"""
+    tf_win = r["perf_trend_follow_bull_win10"]
+    ob_win = r["perf_overbought_bear_win10"]
+
+    # 无 PERF 数据（新入库或历史不足）则放行
+    if tf_win is None and ob_win is None:
+        return True
+
+    # 追涨历史差（win10 < 40%），排除
+    if tf_win is not None and tf_win < 40:
+        return False
+
+    # 当前超买 + 超买反转历史有效（win10 > 55%），等回调
+    if r["sig_overbought"] == 1 and ob_win is not None and ob_win > 55:
+        return False
+
+    return True
+
+
+def _td_safe(cdwn: str) -> bool:
+    """TD Countdown 安全检查：C顶7-13 为高危区，排除"""
+    if not cdwn:
+        return True
+    # 提取数字：C顶9 → 9 或 见顶/13 → 13
+    import re
+    m = re.search(r"[顶底]/(\d+)", cdwn)  # 匹配 "见顶/13" 或 "C顶9"
+    if not m:
+        m = re.search(r"C[顶底](\d+)", cdwn)  # 兼容 "C顶9" 格式
+    if m:
+        n = int(m.group(1))
+        if "顶" in cdwn or "Sell" in cdwn or "sell" in cdwn:
+            return n <= 6  # 见顶countdown仅允许1-6
+    return True  # 底部序列或无法解析则放行
+
+
+def _div_bear_safe(r) -> bool:
+    """顶背离安全检查：强趋势中顶背离可容忍（技术钝化是常态）"""
+    if r["div_bear"] != 1:
+        return True  # 无顶背离
+
+    # 有顶背离，但满足以下条件可容忍（趋势强劲 + 历史验证顶背离无效）：
+    strong_trend = (r["adx"] >= 38                # 同步主筛选阈值
+                    and r["sar_long"] == 1
+                    and r["supertrend_long"] == 1)
+
+    # PERF 历史：该股顶背离胜率低（<50%）说明顶背离信号不靠谱
+    perf_div_weak = (r["perf_overbought_bear_win10"] is not None
+                     and r["perf_overbought_bear_win10"] < 50)
+
+    # 强趋势 + 顶背离历史无效 → 容忍（技术钝化但趋势未破）
+    if strong_trend and perf_div_weak:
+        return True
+
+    return False  # 弱趋势或顶背离历史有效，排除
+
+
 def tier(r) -> str | None:
     """返回 '⭐⭐⭐' / '⭐⭐' / None（不够格）"""
     if not _fund_ok(r):
         return None
+    if not _perf_ok(r):
+        return None
+    # RS20 < 60 排除（弱势股）
+    rs20 = r["rs20"] or 0
+    if rs20 > 0 and rs20 < 60:
+        return None
     cdwn = r["td_countdown"] or ""
     hist = r["macd_hist"] or 0
+    hot  = r["hot_score"] or 0
+
+    # ⭐⭐⭐：严格门槛（ADX 40→38，平衡保守与覆盖）
     if (r["score_total"] >= 70
-            and r["adx"] >= 40
+            and r["adx"] >= 38                # 优化：放宽至38，ADX=38-40仍属强趋势
+            and r["sar_long"] == 1
             and r["supertrend_long"] == 1
             and r["obv_up"] == 1
             and hist > 0
-            and not cdwn.startswith("C顶")):
+            and _div_bear_safe(r)        # 改为：多维度评估顶背离
+            and _td_safe(cdwn)
+            and hot >= 3):
         return "⭐⭐⭐"
+
+    # ⭐⭐：放宽但保留核心安全阀
     if (r["score_total"] >= 65
             and r["adx"] >= 35
+            and r["sar_long"] == 1
             and r["supertrend_long"] == 1
             and r["obv_up"] == 1
-            and hist > 0):
+            and hist > 0
+            and _div_bear_safe(r)        # 改为：多维度评估顶背离
+            and _td_safe(cdwn)):
         return "⭐⭐"
+
     return None
 
 

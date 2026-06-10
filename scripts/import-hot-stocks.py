@@ -27,14 +27,28 @@ rows = [
 
 con = sqlite3.connect(DB)
 before = con.execute("SELECT COUNT(*) FROM instrument").fetchone()[0]
+
+# 1. 删除热度分=0的股票（已连续5天不在榜）
+deleted = con.execute("DELETE FROM instrument WHERE hot_score = 0").rowcount
+
+# 2. 所有股票热度分-1（最低0分）
+con.execute("UPDATE instrument SET hot_score = MAX(0, hot_score - 1)")
+
+# 3. 插入新股票（默认hot_score=5）
 con.executemany(
     "INSERT OR IGNORE INTO instrument(code, name, market, note, created_at) VALUES(?,?,?,'',?)",
     rows,
 )
+
+# 4. 今日上榜股票热度分重置为5
+hot_codes = [code for code, *_ in rows]
+con.executemany("UPDATE instrument SET hot_score = 5 WHERE code = ?", [(c,) for c in hot_codes])
+
 con.commit()
-inserted = con.execute("SELECT COUNT(*) FROM instrument").fetchone()[0] - before
+inserted = con.execute("SELECT COUNT(*) FROM instrument").fetchone()[0] - before + deleted
+updated = len(hot_codes) - inserted
 con.close()
 
-print(f"热榜共 {len(stocks)} 只，大盘主板 {len(rows)} 只，新增入库 {inserted} 只")
+print(f"热榜共 {len(stocks)} 只，大盘主板 {len(rows)} 只，新增入库 {inserted} 只，热度更新 {updated} 只，清理冷门 {deleted} 只")
 for code, name, *_ in rows:
     print(f"  {code}  {name}")

@@ -241,8 +241,22 @@ func printAnalysis(data seriesData) store.Snapshot {
 	printRecentExtremes(candles, dates, results)
 	printStreak(candles)
 	printBullBear(candles, results, tds, obv, score, div, volRatio)
-	printPerf(performance(candles, dates, results, tds, obv))
+	perfs := performance(candles, dates, results, tds, obv)
+	printPerf(perfs)
 	printRecentRows(candles, dates, results, tds)
+
+	// 提取 PERF 胜率数据
+	var perfTrendFollowBullWin10, perfOverboughtBearWin10 *float64
+	for _, p := range perfs {
+		if p.Name == "趋势跟随多头" && p.Triggers > 0 {
+			val := float64(p.Win10) / float64(p.Triggers) * 100
+			perfTrendFollowBullWin10 = &val
+		}
+		if p.Name == "超买反转" && p.Triggers > 0 {
+			val := float64(p.Win10) / float64(p.Triggers) * 100
+			perfOverboughtBearWin10 = &val
+		}
+	}
 
 	// Reuse the values already computed above; printing behavior is unchanged.
 	lastTD := tds[n-1]
@@ -305,6 +319,9 @@ func printAnalysis(data seriesData) store.Snapshot {
 		Ret20:  nDayReturn(candles, 20),
 		Ret60:  nDayReturn(candles, 60),
 		Ret120: nDayReturn(candles, 120),
+
+		PerfTrendFollowBullWin10:  perfTrendFollowBullWin10,
+		PerfOverboughtBearWin10:   perfOverboughtBearWin10,
 	}
 	return snap
 }
