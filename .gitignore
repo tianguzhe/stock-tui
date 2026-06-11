@@ -18,3 +18,16 @@ data/
 .codegraph/
 __pycache__/
 *.pyc
+
+# macOS
+.DS_Store
+
+# Go 编译产物
+indicator-analyze
+stockdb
+
+# 工具缓存
+.ace-tool/
+
+# 临时分析数据
+analysis/
