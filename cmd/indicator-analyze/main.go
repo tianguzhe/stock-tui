@@ -245,16 +245,24 @@ func printAnalysis(data seriesData) store.Snapshot {
 	printPerf(perfs)
 	printRecentRows(candles, dates, results, tds)
 
-	// 提取 PERF 胜率数据
-	var perfTrendFollowBullWin10, perfOverboughtBearWin10 *float64
+	// 提取 PERF 胜率数据（含样本数）
+	var perfTrendFollowBullWin10, perfOverboughtBearWin10, perfDivBearWin10 *float64
+	var perfTrendFollowBullN, perfOverboughtBearN, perfDivBearN *int
 	for _, p := range perfs {
 		if p.Name == "趋势跟随多头" && p.Triggers > 0 {
 			val := float64(p.Win10) / float64(p.Triggers) * 100
 			perfTrendFollowBullWin10 = &val
+			perfTrendFollowBullN = &p.Triggers
 		}
 		if p.Name == "超买反转" && p.Triggers > 0 {
 			val := float64(p.Win10) / float64(p.Triggers) * 100
 			perfOverboughtBearWin10 = &val
+			perfOverboughtBearN = &p.Triggers
+		}
+		if p.Name == "顶背离" && p.Triggers > 0 {
+			val := float64(p.Win10) / float64(p.Triggers) * 100
+			perfDivBearWin10 = &val
+			perfDivBearN = &p.Triggers
 		}
 	}
 
@@ -322,6 +330,10 @@ func printAnalysis(data seriesData) store.Snapshot {
 
 		PerfTrendFollowBullWin10:  perfTrendFollowBullWin10,
 		PerfOverboughtBearWin10:   perfOverboughtBearWin10,
+		PerfDivBearWin10:          perfDivBearWin10,
+		PerfTrendFollowBullN:      perfTrendFollowBullN,
+		PerfOverboughtBearN:       perfOverboughtBearN,
+		PerfDivBearN:              perfDivBearN,
 	}
 	return snap
 }

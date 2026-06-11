@@ -1,16 +1,20 @@
-stock-tui
-cpu
-indicator-analyze
-stockdb
-.ace-tool/
-.DS_Store
-.gocache/
+# 编辑器临时文件
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
 
-# 分析产物(每次从接口重新生成,无需版本管理)
-analysis/
+# 日志
+*.log
+
+# 本地配置(可包含 key/密钥)
+config.local.json
 
 # 本地 SQLite 数据库(分析快照与分类,不入库)
 data/
 *.db
 
-.codegraph
+.codegraph/
+__pycache__/
+*.pyc

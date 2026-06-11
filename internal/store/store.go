@@ -82,6 +82,10 @@ type Snapshot struct {
 	// PERF historical win rates (%) computed from backtesting signals during -save.
 	PerfTrendFollowBullWin10 *float64 // 趋势跟随多头 10日胜率
 	PerfOverboughtBearWin10  *float64 // 超买反转空头 10日胜率
+	PerfDivBearWin10         *float64 // 顶背离空头 10日胜率
+	PerfTrendFollowBullN     *int     // 趋势跟随多头样本数
+	PerfOverboughtBearN      *int     // 超买反转样本数
+	PerfDivBearN             *int     // 顶背离样本数
 }
 
 // Open opens (creating if needed) the SQLite database at path, enables foreign
@@ -118,7 +122,8 @@ CREATE TABLE IF NOT EXISTS instrument (
   name       TEXT NOT NULL,
   market     TEXT NOT NULL,
   note       TEXT NOT NULL DEFAULT '',
-  created_at TEXT NOT NULL
+  created_at TEXT NOT NULL,
+  hot_score  INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS tag (
   id   INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -152,10 +157,20 @@ CREATE TABLE IF NOT EXISTS snapshot (
   ret20 REAL,
   ret60 REAL,
   ret120 REAL,
-  rs20 REAL DEFAULT 0,
-  rs60 REAL DEFAULT 0,
-  rs120 REAL DEFAULT 0,
+  rs20 REAL,
+  rs60 REAL,
+  rs120 REAL,
+  perf_trend_follow_bull_win10 REAL,
+  perf_overbought_bear_win10 REAL,
+  perf_div_bear_win10 REAL,
+  perf_trend_follow_bull_n INTEGER,
+  perf_overbought_bear_n INTEGER,
+  perf_div_bear_n INTEGER,
   PRIMARY KEY (code, trade_date)
+);
+CREATE TABLE IF NOT EXISTS metadata (
+  key   TEXT PRIMARY KEY,
+  value TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS decision_log (
   id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -194,17 +209,41 @@ CREATE INDEX IF NOT EXISTS idx_decision_log_pending ON decision_log(outcome_pct)
 		"ret20 REAL",
 		"ret60 REAL",
 		"ret120 REAL",
-		"rs20 REAL DEFAULT 0",
-		"rs60 REAL DEFAULT 0",
-		"rs120 REAL DEFAULT 0",
+		"rs20 REAL",
+		"rs60 REAL",
+		"rs120 REAL",
+		"perf_trend_follow_bull_win10 REAL",
+		"perf_overbought_bear_win10 REAL",
+		"perf_div_bear_win10 REAL",
+		"perf_trend_follow_bull_n INTEGER",
+		"perf_overbought_bear_n INTEGER",
+		"perf_div_bear_n INTEGER",
 	} {
 		s.db.Exec("ALTER TABLE snapshot ADD COLUMN " + col) //nolint:errcheck
 	}
+	// Add hot_score to instrument table
+	s.db.Exec("ALTER TABLE instrument ADD COLUMN hot_score INTEGER NOT NULL DEFAULT 0") //nolint:errcheck
+
 	// Clear ret values that are all-zero but were written as Go zero-values before
 	// the nDayReturn computation existed. All three being exactly 0 is impossible
 	// for real market data across 20/60/120 days.
 	s.db.Exec(`UPDATE snapshot SET ret20=NULL, ret60=NULL, ret120=NULL
 		WHERE ret20=0 AND ret60=0 AND ret120=0 AND COALESCE(ret20,0)=0`) //nolint:errcheck
+
+	// Clear rs values ONLY if all three are 0 AND never been set by rs-rank.
+	// Check if rs20/60/120 were just zero-initialized but never computed.
+	// If rs-rank has run, at least one should be non-zero or some should be NULL.
+	// Only clear when they look like stale defaults: all exactly 0.
+	var hasRealRS int
+	s.db.QueryRow(`SELECT COUNT(*) FROM snapshot WHERE rs20 > 0 OR rs20 IS NULL`).Scan(&hasRealRS)
+	if hasRealRS == 0 {
+		// No RS data at all, safe to clear all-zero as stale
+		s.db.Exec(`UPDATE snapshot SET rs20=NULL, rs60=NULL, rs120=NULL
+			WHERE rs20=0 AND rs60=0 AND rs120=0`) //nolint:errcheck
+	}
+	// If rs-rank has run (hasRealRS > 0), leave rs=0 as-is (valid bottom percentile)
+
+
 	return nil
 }
 
@@ -371,7 +410,8 @@ INSERT INTO snapshot (
   td_setup, td_countdown, streak,
   turnover_rate, market_cap, pe,
   ret20, ret60, ret120,
-  perf_trend_follow_bull_win10, perf_overbought_bear_win10
+  perf_trend_follow_bull_win10, perf_overbought_bear_win10, perf_div_bear_win10,
+  perf_trend_follow_bull_n, perf_overbought_bear_n, perf_div_bear_n
 ) VALUES (
   ?, ?, ?,
   ?, ?, ?, ?, ?, ?,
@@ -386,7 +426,8 @@ INSERT INTO snapshot (
   ?, ?, ?,
   ?, ?, ?,
   ?, ?, ?,
-  ?, ?
+  ?, ?, ?,
+  ?, ?, ?
 )
 ON CONFLICT(code, trade_date) DO UPDATE SET
   captured_at=excluded.captured_at,
@@ -403,7 +444,8 @@ ON CONFLICT(code, trade_date) DO UPDATE SET
   td_setup=excluded.td_setup, td_countdown=excluded.td_countdown, streak=excluded.streak,
   turnover_rate=excluded.turnover_rate, market_cap=excluded.market_cap, pe=excluded.pe,
   ret20=excluded.ret20, ret60=excluded.ret60, ret120=excluded.ret120,
-  perf_trend_follow_bull_win10=excluded.perf_trend_follow_bull_win10, perf_overbought_bear_win10=excluded.perf_overbought_bear_win10`,
+  perf_trend_follow_bull_win10=excluded.perf_trend_follow_bull_win10, perf_overbought_bear_win10=excluded.perf_overbought_bear_win10, perf_div_bear_win10=excluded.perf_div_bear_win10,
+  perf_trend_follow_bull_n=excluded.perf_trend_follow_bull_n, perf_overbought_bear_n=excluded.perf_overbought_bear_n, perf_div_bear_n=excluded.perf_div_bear_n`,
 		snap.Code, snap.TradeDate, time.Now().Format(time.RFC3339),
 		snap.Close, snap.ChangePct, snap.MA5, snap.MA10, snap.MA20, snap.MA60,
 		snap.KDJ_J, snap.MACD_DIF, snap.MACD_DEA, snap.MACD_Hist,
@@ -417,7 +459,8 @@ ON CONFLICT(code, trade_date) DO UPDATE SET
 		snap.TDSetup, snap.TDCountdown, snap.Streak,
 		snap.TurnoverRate, snap.MarketCap, snap.PE,
 		snap.Ret20, snap.Ret60, snap.Ret120,
-		snap.PerfTrendFollowBullWin10, snap.PerfOverboughtBearWin10)
+		snap.PerfTrendFollowBullWin10, snap.PerfOverboughtBearWin10, snap.PerfDivBearWin10,
+		snap.PerfTrendFollowBullN, snap.PerfOverboughtBearN, snap.PerfDivBearN)
 	if err != nil {
 		return fmt.Errorf("save snapshot %s@%s: %w", snap.Code, snap.TradeDate, err)
 	}
@@ -495,21 +538,29 @@ func boolToInt(b bool) int {
 	return 0
 }
 
-// UpdateRSRankings reads the ret20/ret60/ret120 stored in each code's latest
-// snapshot (populated by indicator-analyze -save from K-line history), computes
-// cross-sectional percentile ranks (0–100), and writes them back as rs20/rs60/rs120.
-// Returns the number of codes successfully updated.
+// UpdateRSRankings reads the ret20/ret60/ret120 from the latest cross-sectional snapshot
+// (same trade_date for all codes), computes percentile ranks (0–100), and writes them back
+// as rs20/rs60/rs120. Returns the number of codes successfully updated.
 func (s *Store) UpdateRSRankings() (int, error) {
-	// Read latest ret20/ret60/ret120 for every code where ret20 has been computed.
-	// Rows where ret20 IS NULL are from old snapshots and are excluded from ranking.
+	// Get the latest trade_date that has data
+	var latestDate string
+	err := s.db.QueryRow(`SELECT MAX(trade_date) FROM snapshot WHERE ret20 IS NOT NULL`).Scan(&latestDate)
+	if err != nil {
+		return 0, fmt.Errorf("get latest date: %w", err)
+	}
+	if latestDate == "" {
+		return 0, nil // No data to rank
+	}
+
+	// Read ret20/ret60/ret120 for all codes on that single date (cross-section)
 	rows, err := s.db.Query(`
 SELECT code, trade_date,
        ret20  AS r20,
        COALESCE(ret60,0)  AS r60,
        COALESCE(ret120,0) AS r120
 FROM snapshot
-WHERE trade_date = (SELECT MAX(trade_date) FROM snapshot s2 WHERE s2.code = snapshot.code)
-  AND ret20 IS NOT NULL`)
+WHERE trade_date = ?
+  AND ret20 IS NOT NULL`, latestDate)
 	if err != nil {
 		return 0, fmt.Errorf("read returns: %w", err)
 	}

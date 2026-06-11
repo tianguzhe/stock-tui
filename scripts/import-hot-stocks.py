@@ -28,21 +28,32 @@ rows = [
 con = sqlite3.connect(DB)
 before = con.execute("SELECT COUNT(*) FROM instrument").fetchone()[0]
 
-# 1. 删除热度分=0的股票（已连续5天不在榜）
-deleted = con.execute("DELETE FROM instrument WHERE hot_score = 0").rowcount
+# 检查今日是否已衰减（通过检查是否有 hot_score=9 的记录判断）
+today = datetime.datetime.now().strftime("%Y-%m-%d")
+last_decay = con.execute("SELECT value FROM metadata WHERE key='last_hot_decay'").fetchone()
+need_decay = (last_decay is None or last_decay[0] != today)
 
-# 2. 所有股票热度分-1（最低0分）
-con.execute("UPDATE instrument SET hot_score = MAX(0, hot_score - 1)")
+if need_decay:
+    # 1. 删除热度分=0的股票（已连续9天不在榜）
+    deleted = con.execute("DELETE FROM instrument WHERE hot_score = 0").rowcount
 
-# 3. 插入新股票（默认hot_score=5）
+    # 2. 所有股票热度分-1（最低0分）
+    con.execute("UPDATE instrument SET hot_score = MAX(0, hot_score - 1)")
+
+    # 3. 记录今日已衰减
+    con.execute("INSERT OR REPLACE INTO metadata(key, value) VALUES('last_hot_decay', ?)", (today,))
+else:
+    deleted = 0
+
+# 4. 插入新股票（默认hot_score=9）
 con.executemany(
-    "INSERT OR IGNORE INTO instrument(code, name, market, note, created_at) VALUES(?,?,?,'',?)",
+    "INSERT OR IGNORE INTO instrument(code, name, market, note, created_at, hot_score) VALUES(?,?,?,'',?,9)",
     rows,
 )
 
-# 4. 今日上榜股票热度分重置为5
+# 5. 今日上榜股票热度分重置为9
 hot_codes = [code for code, *_ in rows]
-con.executemany("UPDATE instrument SET hot_score = 5 WHERE code = ?", [(c,) for c in hot_codes])
+con.executemany("UPDATE instrument SET hot_score = 9 WHERE code = ?", [(c,) for c in hot_codes])
 
 con.commit()
 inserted = con.execute("SELECT COUNT(*) FROM instrument").fetchone()[0] - before + deleted
