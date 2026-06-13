@@ -185,6 +185,10 @@ func printAnalysis(data seriesData) store.Snapshot {
 	upCnt, upAvgVol, downCnt, downAvgVol := recentVolumeHealth(candles, 5)
 	score := scoreResult(candles, results, obv, upAvgVol, downAvgVol, volRatio)
 	div := divergence(candles, results, n-1)
+	// PERF stats must exist before scoring: applyPerfAdaptive reweighs the
+	// overbought/divergence penalties by this stock's own signal history.
+	perfs := performance(candles, dates, results, tds, obv)
+	scoreAdj, perfAdj := applyPerfAdaptive(score, perfs)
 
 	change, changePct := 0.0, 0.0
 	if n > 1 {
@@ -225,9 +229,9 @@ func printAnalysis(data seriesData) store.Snapshot {
 	fmt.Printf("VolMA5=%.0f VolMA10=%.0f VolMA20=%.0f median20=%.0f | 今日量=%.0f 量比=%.2f | OBV=%s | 近5日量价: upDays=%d avgUpVol=%.0f downDays=%d avgDownVol=%.0f\n",
 		meanTail(volumes, 5), meanTail(volumes, 10), volMA20, medianTail(volumes, 20),
 		lastCandle.Volume, volRatio, obvTrend(obv), upCnt, upAvgVol, downCnt, downAvgVol)
-	fmt.Printf("SCORE total=%d delta=%+d dmi=%+d ma=%+d macd=%+d kdjwr=%+d rsi=%+d bias=%+d chopcmi=%+d volume=%+d sar=%+d div=%+d label=%s\n",
+	fmt.Printf("SCORE total=%d delta=%+d dmi=%+d ma=%+d macd=%+d kdjwr=%+d rsi=%+d bias=%+d chopcmi=%+d volume=%+d sar=%+d div=%+d adj=%d perfadj=%+d label=%s\n",
 		score.Total, score.Delta, score.DMI, score.MA, score.MACD, score.KdjWr, score.RSI,
-		score.BIAS, score.CHOPCMI, score.Volume, score.SAR, score.Divergence, score.Label)
+		score.BIAS, score.CHOPCMI, score.Volume, score.SAR, score.Divergence, scoreAdj, perfAdj, score.Label)
 	fmt.Printf("当前策略触发: trendBull=%t(%d/4) trendBear=%t(%d/4) oversold=%t(%d/4) overbought=%t(%d/4) breakBull=%t(%d/3) breakBear=%t(%d/3) revertBull=%t(%d/3) revertBear=%t(%d/3) divBull=%t(%d/1,today=%t) divBear=%t(%d/1,today=%t)\n",
 		score.Signals.TrendBull, score.Signals.TrendBullScore, score.Signals.TrendBear, score.Signals.TrendBearScore,
 		score.Signals.Oversold, score.Signals.OversoldScore, score.Signals.Overbought, score.Signals.OverboughtScore,
@@ -241,18 +245,20 @@ func printAnalysis(data seriesData) store.Snapshot {
 	printRecentExtremes(candles, dates, results)
 	printStreak(candles)
 	printBullBear(candles, results, tds, obv, score, div, volRatio)
-	perfs := performance(candles, dates, results, tds, obv)
 	printPerf(perfs)
 	printRecentRows(candles, dates, results, tds)
 
 	// 提取 PERF 胜率数据（含样本数）
 	var perfTrendFollowBullWin10, perfOverboughtBearWin10, perfDivBearWin10 *float64
 	var perfTrendFollowBullN, perfOverboughtBearN, perfDivBearN *int
+	var perfTrendFollowBullAvg10 *float64
 	for _, p := range perfs {
 		if p.Name == "趋势跟随多头" && p.Triggers > 0 {
 			val := float64(p.Win10) / float64(p.Triggers) * 100
 			perfTrendFollowBullWin10 = &val
 			perfTrendFollowBullN = &p.Triggers
+			avg := p.Sum10 / float64(p.Triggers)
+			perfTrendFollowBullAvg10 = &avg
 		}
 		if p.Name == "超买反转" && p.Triggers > 0 {
 			val := float64(p.Win10) / float64(p.Triggers) * 100
@@ -310,6 +316,7 @@ func printAnalysis(data seriesData) store.Snapshot {
 		ScoreTotal: score.Total,
 		ScoreDelta: score.Delta,
 		ScoreLabel: score.Label,
+		ScoreAdj:   scoreAdj,
 
 		SigTrendBull:  score.Signals.TrendBull,
 		SigOverbought: score.Signals.Overbought,
@@ -328,12 +335,20 @@ func printAnalysis(data seriesData) store.Snapshot {
 		Ret60:  nDayReturn(candles, 60),
 		Ret120: nDayReturn(candles, 120),
 
-		PerfTrendFollowBullWin10:  perfTrendFollowBullWin10,
-		PerfOverboughtBearWin10:   perfOverboughtBearWin10,
-		PerfDivBearWin10:          perfDivBearWin10,
-		PerfTrendFollowBullN:      perfTrendFollowBullN,
-		PerfOverboughtBearN:       perfOverboughtBearN,
-		PerfDivBearN:              perfDivBearN,
+		PerfTrendFollowBullWin10: perfTrendFollowBullWin10,
+		PerfOverboughtBearWin10:  perfOverboughtBearWin10,
+		PerfDivBearWin10:         perfDivBearWin10,
+		PerfTrendFollowBullN:     perfTrendFollowBullN,
+		PerfOverboughtBearN:      perfOverboughtBearN,
+		PerfDivBearN:             perfDivBearN,
+		PerfTrendFollowBullAvg10: perfTrendFollowBullAvg10,
+
+		KeltnerSqueeze:   last.Keltner.Squeeze,
+		DonchBreak20Bull: donchianBreak(candles, results, 20, true),
+		DonchBreak55Bull: donchianBreak(candles, results, 55, true),
+
+		SARValue:        last.SAR.Value,
+		SuperTrendValue: last.SuperTrend.Value,
 	}
 	return snap
 }
@@ -594,6 +609,63 @@ func scoreResult(candles []indicator.Candle, results []indicator.Result, obv []f
 	return score
 }
 
+// applyPerfAdaptive recomputes the total score with per-stock PERF-history
+// weighting (CLAUDE.md 方法论: 不用同一把尺子量所有股). Overbought-family
+// penalties (negative KdjWr/RSI/BIAS) are only adjusted when the composite
+// Overbought signal fired — that is exactly the signal the "超买反转" PERF
+// stat backtests, and gating there avoids mis-weighting e.g. a mid-range KDJ
+// dead cross. Penalties are halved when the signal is historically
+// ineffective (win10 < 35%) and amplified ×1.5 when effective (win10 > 55%);
+// the bear-divergence penalty is adjusted the same way against the "顶背离"
+// stat (<40% / >55%). Bull rewards are never touched. Requires n ≥ 10
+// samples. Integer division truncates toward zero (-7/2 = -3, -1/2 = 0).
+//
+// The adjusted total goes to the score_adj sidecar column; score_total keeps
+// the original scale so history stays comparable.
+func applyPerfAdaptive(score scoreState, perfs []perfStat) (adjTotal, perfAdj int) {
+	var obWin, divWin float64
+	var obN, divN int
+	for _, p := range perfs {
+		if p.Triggers == 0 {
+			continue
+		}
+		switch p.Name {
+		case "超买反转":
+			obWin = float64(p.Win10) / float64(p.Triggers) * 100
+			obN = p.Triggers
+		case "顶背离":
+			divWin = float64(p.Win10) / float64(p.Triggers) * 100
+			divN = p.Triggers
+		}
+	}
+
+	// scale reweighs a negative penalty by historical win rate; positives and
+	// thin samples (n < 10) pass through unchanged.
+	scale := func(v int, win float64, n int, weakBelow, strongAbove float64) int {
+		if v >= 0 || n < 10 {
+			return v
+		}
+		if win < weakBelow {
+			return v / 2
+		}
+		if win > strongAbove {
+			return v * 3 / 2
+		}
+		return v
+	}
+
+	adj := 0
+	if score.Signals.Overbought {
+		for _, v := range []int{score.KdjWr, score.RSI, score.BIAS} {
+			adj += scale(v, obWin, obN, 35, 55) - v
+		}
+	}
+	if score.Divergence < 0 {
+		adj += scale(score.Divergence, divWin, divN, 40, 55) - score.Divergence
+	}
+	return clampInt(50+score.Delta+adj, 0, 100), adj
+}
+
 func abs(x int) int {
 	if x < 0 {
 		return -x
@@ -682,9 +754,9 @@ func divergence(candles []indicator.Candle, results []indicator.Result, i int) d
 	}
 
 	d := divergenceState{
-		Ready:      true,
-		HighIdx:    i, RefHighIdx: rsiPeakIdx,
-		LowIdx:     i, RefLowIdx: rsiTroughIdx,
+		Ready:   true,
+		HighIdx: i, RefHighIdx: rsiPeakIdx,
+		LowIdx: i, RefLowIdx: rsiTroughIdx,
 	}
 
 	rsiNow := results[i].RSI.RSI6
@@ -729,6 +801,13 @@ type perfStat struct {
 	LastDate   string
 }
 
+// performance backtests each signal's forward 5/10-day returns. Signals are
+// counted on the RISING EDGE only (off→on transition): consecutive trigger
+// days re-sample the same overlapping forward window and would inflate N
+// without adding independent information (overlapping-returns problem), which
+// previously made win-rate samples look 3-5x larger than they really were.
+// The TD countdown==13 trigger is inherently a one-shot event and needs no
+// edge detection.
 func performance(candles []indicator.Candle, dates []string, results []indicator.Result, tds []indicator.TD, obv []float64) []perfStat {
 	perfs := []perfStat{
 		newPerf("趋势跟随多头", "多头"), newPerf("趋势跟随空头", "空头"),
@@ -738,37 +817,42 @@ func performance(candles []indicator.Candle, dates []string, results []indicator
 		newPerf("底背离", "多头"), newPerf("顶背离", "空头"),
 		newPerf("TD见底Countdown", "多头"), newPerf("TD见顶Countdown", "空头"),
 	}
+	if len(candles) <= 90 {
+		return perfs
+	}
+	prev := evalSignals(candles, results, obv, 79)
+	prevDiv := divergence(candles, results, 79)
 	for i := 80; i+10 < len(candles); i++ {
 		s := evalSignals(candles, results, obv, i)
 		d := divergence(candles, results, i)
-		if s.TrendBull {
+		if s.TrendBull && !prev.TrendBull {
 			recordPerf(&perfs[0], candles, dates, i)
 		}
-		if s.TrendBear {
+		if s.TrendBear && !prev.TrendBear {
 			recordPerf(&perfs[1], candles, dates, i)
 		}
-		if s.Oversold {
+		if s.Oversold && !prev.Oversold {
 			recordPerf(&perfs[2], candles, dates, i)
 		}
-		if s.Overbought {
+		if s.Overbought && !prev.Overbought {
 			recordPerf(&perfs[3], candles, dates, i)
 		}
-		if s.BreakBull {
+		if s.BreakBull && !prev.BreakBull {
 			recordPerf(&perfs[4], candles, dates, i)
 		}
-		if s.BreakBear {
+		if s.BreakBear && !prev.BreakBear {
 			recordPerf(&perfs[5], candles, dates, i)
 		}
-		if s.RevertBull {
+		if s.RevertBull && !prev.RevertBull {
 			recordPerf(&perfs[6], candles, dates, i)
 		}
-		if s.RevertBear {
+		if s.RevertBear && !prev.RevertBear {
 			recordPerf(&perfs[7], candles, dates, i)
 		}
-		if d.BullToday {
+		if d.BullToday && !prevDiv.BullToday {
 			recordPerf(&perfs[8], candles, dates, i)
 		}
-		if d.BearToday {
+		if d.BearToday && !prevDiv.BearToday {
 			recordPerf(&perfs[9], candles, dates, i)
 		}
 		if tds[i].CountdownCount == 13 {
@@ -778,6 +862,7 @@ func performance(candles []indicator.Candle, dates []string, results []indicator
 				recordPerf(&perfs[11], candles, dates, i)
 			}
 		}
+		prev, prevDiv = s, d
 	}
 	return perfs
 }

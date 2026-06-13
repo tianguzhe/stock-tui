@@ -54,8 +54,11 @@
   - `PERF 超买反转空头` win10 < 35%：超买警报在本股历史近乎无效，可降权
   - `PERF 顶背离空头` win10 < 40%：顶背离历史无效，不以此降评级
   - 反之（超买/背离信号 win10 > 55%）：信号有效，应等回调再入场
+- **PERF N 为信号边沿计数**（信号 0→1 翻转才计 1 次，连续触发日不重复计数，避免重叠前向窗口灌水）；`screen-stocks.py` 的排除/容忍判断用 **Wilson 95% 置信界**（排除型须下界>50%，"历史差"型须上界<50%），小样本自动失去否决力。
+- **RS 排名是热榜池内百分位**（非全市场）：池子本身按热度准入，RS 高位叠加了双重动量选择，短期反转暴露是结构性的——排序已按 0.3*RS20+0.5*RS60+0.2*RS120 综合动量降权短期。
 - 快速提取 PERF 关键字段（不看全量输出）：
   `go run ./cmd/indicator-analyze <code> 2>/dev/null | grep -E "SCORE|TD_NOW|SAR_KELT|DIVERGENCE|PERF"`
+- **score_adj 口径**：`-save` 落库两个分——`score_total` 为原始固定尺评分（历史可比），`score_adj` 为 PERF 自适应分（超买/顶背离惩罚按本股历史胜率调权：win10 低于阈值减半、高于 55% ×1.5，gate 在复合超买信号上）。`screen-stocks.py` 用 `COALESCE(score_adj, score_total)` 筛选；CLI `SCORE` 行的 `adj=`/`perfadj=` 即调整分与调整量。
 
 ## 技术面分析 CLI
 - 深度技术面分析优先用固定命令 `go run ./cmd/indicator-analyze <代码>`；不要再写一次性 `cmd/<name>/main.go`。
@@ -85,21 +88,25 @@
 sqlite3 data/stock.db "SELECT code FROM instrument;" \
   | xargs -I{} go run ./cmd/indicator-analyze -save {}
 
-# 2. 计算 RS 相对强度百分位排名（需 21+ 天历史积累后才有效）
+# 2. 计算 RS 相对强度百分位排名（横截面 ret20 排名，全量落库当日即有效）
 go run ./cmd/stockdb rs-rank
 
-# 3. 生成选股表（持仓置顶 + 优质候选，合计≤10只）
+# 3. 回填决策结果（信号后满 10 个交易日的 decision_log 自动结算，输出分层胜率）
+go run ./cmd/stockdb backfill
+
+# 4. 生成选股表（持仓置顶 + 优质候选，合计≤10只）
 ./scripts/screen-stocks.sh \
   --holdings sh601991:8.504:1300,sh603256:193.752:100,sh605589:53.176:200
 
-# 3. 生成次日日志模板（含昨日预判自动回填）
+# 5. 生成次日日志模板（含昨日预判自动回填）
 ./scripts/gen-journal.sh
 
-# 4. 填写日志：二、持仓 → 三、明日预判 → 四、候补&推荐（贴步骤2输出）
+# 6. 填写日志：二、持仓 → 三、明日预判 → 四、候补&推荐（贴步骤4输出）
 ```
 
 **日志字段速查**：
-- `TD`：优先显示 countdown（如 `C顶3`），无则显示 setup（如 `见顶/8`）；`见顶/8` 次日警惕进入 countdown
-- `SAR/ST`：`多/多` = SAR 多头 + SuperTrend 多头，双确认；混杂时需注意
-- `止损价`：对应当日 SAR 值，跌破即止；批量落库后从 snapshot 直接读取
+- `TD`：优先显示 countdown，无则显示 setup；snapshot 落库格式均为 `见顶/N`/`见底/N`（CLI 近15日行才用 `C顶N` 短格式）；setup `见顶/8` 次日警惕进入 countdown
+- `SAR/ST`：`多/多` = SAR 多头 + SuperTrend 多头，双确认；持仓翻空时选股表显示 `⚠️SAR/ST双空` 等警示，必须执行退出纪律
+- `止损价`：snapshot `sar_value` 列（批量落库后直接读取）；选股表"止损(距%)"列即此值；`--capital 总资金` 可输出候选建议仓位（单笔风险 1% / 止损距离）
 - 量比口径：量比 < 0.8 = 缩量，> 1.5 = 放量，描述时必须附数值
+- 末端降级口径：乖离 `bias24/atr_pct > 4`（波动归一化）、连涨≥5日、换手 15–20% 任一触发即从推荐降为观察；市场广度（池内站上 MA20 比例）< 40% 时推荐上限减半

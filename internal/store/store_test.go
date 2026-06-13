@@ -121,6 +121,65 @@ func TestSaveSnapshotUpsertSameDay(t *testing.T) {
 	}
 }
 
+// TestSaveSnapshotNewColumnsRoundTripAndOverwrite verifies the avg10/squeeze/
+// donchian/score_adj columns persist and that a same-day re-save overwrites
+// them (a missing ON CONFLICT DO UPDATE entry would silently keep stale values).
+func TestSaveSnapshotNewColumnsRoundTripAndOverwrite(t *testing.T) {
+	s := openTemp(t)
+	if err := s.UpsertInstrument("sz002916", "深南电路", "sz", ""); err != nil {
+		t.Fatalf("upsert instrument: %v", err)
+	}
+
+	avg10 := 6.5
+	snap := Snapshot{
+		Code: "sz002916", TradeDate: "2026-06-12", Close: 100,
+		ScoreTotal: 60, ScoreAdj: 66,
+		PerfTrendFollowBullAvg10: &avg10,
+		KeltnerSqueeze:           true,
+		DonchBreak20Bull:         true,
+		DonchBreak55Bull:         false,
+		SARValue:                 95.5,
+		SuperTrendValue:          93.2,
+	}
+	if err := s.SaveSnapshot(snap); err != nil {
+		t.Fatalf("first save: %v", err)
+	}
+
+	read := func() (gotAvg sql.NullFloat64, squeeze, b20, b55, adj int, sarV, stV float64) {
+		t.Helper()
+		err := s.db.QueryRow(
+			`SELECT perf_trend_follow_bull_avg10, keltner_squeeze, donch_break20_bull, donch_break55_bull, score_adj, sar_value, supertrend_value
+			 FROM snapshot WHERE code='sz002916' AND trade_date='2026-06-12'`,
+		).Scan(&gotAvg, &squeeze, &b20, &b55, &adj, &sarV, &stV)
+		if err != nil {
+			t.Fatalf("read new columns: %v", err)
+		}
+		return
+	}
+
+	gotAvg, squeeze, b20, b55, adj, sarV, stV := read()
+	if !gotAvg.Valid || gotAvg.Float64 != 6.5 || squeeze != 1 || b20 != 1 || b55 != 0 || adj != 66 || sarV != 95.5 || stV != 93.2 {
+		t.Fatalf("round-trip mismatch: avg10=%+v squeeze=%d b20=%d b55=%d adj=%d sar=%v st=%v", gotAvg, squeeze, b20, b55, adj, sarV, stV)
+	}
+
+	// Same-day re-save with changed values must overwrite all new columns.
+	avg10b := -1.2
+	snap.PerfTrendFollowBullAvg10 = &avg10b
+	snap.KeltnerSqueeze = false
+	snap.DonchBreak20Bull = false
+	snap.DonchBreak55Bull = true
+	snap.ScoreAdj = 48
+	snap.SARValue = 97.1
+	snap.SuperTrendValue = 94.8
+	if err := s.SaveSnapshot(snap); err != nil {
+		t.Fatalf("second save: %v", err)
+	}
+	gotAvg, squeeze, b20, b55, adj, sarV, stV = read()
+	if !gotAvg.Valid || gotAvg.Float64 != -1.2 || squeeze != 0 || b20 != 0 || b55 != 1 || adj != 48 || sarV != 97.1 || stV != 94.8 {
+		t.Fatalf("same-day overwrite mismatch: avg10=%+v squeeze=%d b20=%d b55=%d adj=%d sar=%v st=%v", gotAvg, squeeze, b20, b55, adj, sarV, stV)
+	}
+}
+
 func TestMigrationAddsNewColumns(t *testing.T) {
 	// Simulate an existing DB created before the new columns existed: create the
 	// snapshot table without the new columns, then call Open which should add them.
@@ -152,7 +211,9 @@ ALTER TABLE snapshot_legacy RENAME TO snapshot;
 	// Verify the new columns exist by querying them.
 	var dummy float64
 	err = reopened.db.QueryRow(
-		`SELECT COALESCE(turnover_rate,0)+COALESCE(market_cap,0)+COALESCE(pe,0)+COALESCE(rs20,0)+COALESCE(rs60,0)+COALESCE(rs120,0) FROM snapshot LIMIT 1`,
+		`SELECT COALESCE(turnover_rate,0)+COALESCE(market_cap,0)+COALESCE(pe,0)+COALESCE(rs20,0)+COALESCE(rs60,0)+COALESCE(rs120,0)
+		+COALESCE(perf_trend_follow_bull_avg10,0)+COALESCE(keltner_squeeze,0)+COALESCE(donch_break20_bull,0)+COALESCE(donch_break55_bull,0)+COALESCE(score_adj,0)
+		+COALESCE(sar_value,0)+COALESCE(supertrend_value,0) FROM snapshot LIMIT 1`,
 	).Scan(&dummy)
 	// A "no rows" error is fine; "no such column" would be an error.
 	if err != nil && err.Error() != "sql: no rows in result set" {

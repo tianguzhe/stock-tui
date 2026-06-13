@@ -86,6 +86,23 @@ type Snapshot struct {
 	PerfTrendFollowBullN     *int     // 趋势跟随多头样本数
 	PerfOverboughtBearN      *int     // 超买反转样本数
 	PerfDivBearN             *int     // 顶背离样本数
+
+	// 趋势跟随多头 10日平均收益%（avg10 > 5% 时追涨有历史依据，CLAUDE.md 方法论）。
+	PerfTrendFollowBullAvg10 *float64
+
+	// Volatility-compression / breakout flags computed during -save.
+	KeltnerSqueeze   bool // BOLL(20,2σ) fully inside Keltner — direction-neutral compression
+	DonchBreak20Bull bool // today's close > prior bar's Donchian20 upper band
+	DonchBreak55Bull bool // today's close > prior bar's Donchian55 upper band
+
+	// Trailing-stop prices (long: support below; short: resistance above).
+	// SARValue is the journal's 止损价 — break it intraday and the stop fires.
+	SARValue        float64
+	SuperTrendValue float64
+
+	// PERF-adaptive adjusted total score (sidecar: score_total keeps the original
+	// scale so history stays comparable; screeners read COALESCE(score_adj, score_total)).
+	ScoreAdj int
 }
 
 // Open opens (creating if needed) the SQLite database at path, enables foreign
@@ -166,6 +183,13 @@ CREATE TABLE IF NOT EXISTS snapshot (
   perf_trend_follow_bull_n INTEGER,
   perf_overbought_bear_n INTEGER,
   perf_div_bear_n INTEGER,
+  perf_trend_follow_bull_avg10 REAL,
+  keltner_squeeze INTEGER,
+  donch_break20_bull INTEGER,
+  donch_break55_bull INTEGER,
+  score_adj INTEGER,
+  sar_value REAL,
+  supertrend_value REAL,
   PRIMARY KEY (code, trade_date)
 );
 CREATE TABLE IF NOT EXISTS metadata (
@@ -218,6 +242,13 @@ CREATE INDEX IF NOT EXISTS idx_decision_log_pending ON decision_log(outcome_pct)
 		"perf_trend_follow_bull_n INTEGER",
 		"perf_overbought_bear_n INTEGER",
 		"perf_div_bear_n INTEGER",
+		"perf_trend_follow_bull_avg10 REAL",
+		"keltner_squeeze INTEGER",
+		"donch_break20_bull INTEGER",
+		"donch_break55_bull INTEGER",
+		"score_adj INTEGER",
+		"sar_value REAL",
+		"supertrend_value REAL",
 	} {
 		s.db.Exec("ALTER TABLE snapshot ADD COLUMN " + col) //nolint:errcheck
 	}
@@ -242,7 +273,6 @@ CREATE INDEX IF NOT EXISTS idx_decision_log_pending ON decision_log(outcome_pct)
 			WHERE rs20=0 AND rs60=0 AND rs120=0`) //nolint:errcheck
 	}
 	// If rs-rank has run (hasRealRS > 0), leave rs=0 as-is (valid bottom percentile)
-
 
 	return nil
 }
@@ -411,7 +441,11 @@ INSERT INTO snapshot (
   turnover_rate, market_cap, pe,
   ret20, ret60, ret120,
   perf_trend_follow_bull_win10, perf_overbought_bear_win10, perf_div_bear_win10,
-  perf_trend_follow_bull_n, perf_overbought_bear_n, perf_div_bear_n
+  perf_trend_follow_bull_n, perf_overbought_bear_n, perf_div_bear_n,
+  perf_trend_follow_bull_avg10,
+  keltner_squeeze, donch_break20_bull, donch_break55_bull,
+  score_adj,
+  sar_value, supertrend_value
 ) VALUES (
   ?, ?, ?,
   ?, ?, ?, ?, ?, ?,
@@ -427,7 +461,11 @@ INSERT INTO snapshot (
   ?, ?, ?,
   ?, ?, ?,
   ?, ?, ?,
-  ?, ?, ?
+  ?, ?, ?,
+  ?,
+  ?, ?, ?,
+  ?,
+  ?, ?
 )
 ON CONFLICT(code, trade_date) DO UPDATE SET
   captured_at=excluded.captured_at,
@@ -445,7 +483,11 @@ ON CONFLICT(code, trade_date) DO UPDATE SET
   turnover_rate=excluded.turnover_rate, market_cap=excluded.market_cap, pe=excluded.pe,
   ret20=excluded.ret20, ret60=excluded.ret60, ret120=excluded.ret120,
   perf_trend_follow_bull_win10=excluded.perf_trend_follow_bull_win10, perf_overbought_bear_win10=excluded.perf_overbought_bear_win10, perf_div_bear_win10=excluded.perf_div_bear_win10,
-  perf_trend_follow_bull_n=excluded.perf_trend_follow_bull_n, perf_overbought_bear_n=excluded.perf_overbought_bear_n, perf_div_bear_n=excluded.perf_div_bear_n`,
+  perf_trend_follow_bull_n=excluded.perf_trend_follow_bull_n, perf_overbought_bear_n=excluded.perf_overbought_bear_n, perf_div_bear_n=excluded.perf_div_bear_n,
+  perf_trend_follow_bull_avg10=excluded.perf_trend_follow_bull_avg10,
+  keltner_squeeze=excluded.keltner_squeeze, donch_break20_bull=excluded.donch_break20_bull, donch_break55_bull=excluded.donch_break55_bull,
+  score_adj=excluded.score_adj,
+  sar_value=excluded.sar_value, supertrend_value=excluded.supertrend_value`,
 		snap.Code, snap.TradeDate, time.Now().Format(time.RFC3339),
 		snap.Close, snap.ChangePct, snap.MA5, snap.MA10, snap.MA20, snap.MA60,
 		snap.KDJ_J, snap.MACD_DIF, snap.MACD_DEA, snap.MACD_Hist,
@@ -460,7 +502,11 @@ ON CONFLICT(code, trade_date) DO UPDATE SET
 		snap.TurnoverRate, snap.MarketCap, snap.PE,
 		snap.Ret20, snap.Ret60, snap.Ret120,
 		snap.PerfTrendFollowBullWin10, snap.PerfOverboughtBearWin10, snap.PerfDivBearWin10,
-		snap.PerfTrendFollowBullN, snap.PerfOverboughtBearN, snap.PerfDivBearN)
+		snap.PerfTrendFollowBullN, snap.PerfOverboughtBearN, snap.PerfDivBearN,
+		snap.PerfTrendFollowBullAvg10,
+		boolToInt(snap.KeltnerSqueeze), boolToInt(snap.DonchBreak20Bull), boolToInt(snap.DonchBreak55Bull),
+		snap.ScoreAdj,
+		snap.SARValue, snap.SuperTrendValue)
 	if err != nil {
 		return fmt.Errorf("save snapshot %s@%s: %w", snap.Code, snap.TradeDate, err)
 	}
