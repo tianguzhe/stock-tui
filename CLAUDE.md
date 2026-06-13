@@ -63,10 +63,21 @@
 ## 技术面分析 CLI
 - 深度技术面分析优先用固定命令 `go run ./cmd/indicator-analyze <代码>`；不要再写一次性 `cmd/<name>/main.go`。
 - `indicator-analyze` 会拉腾讯日K、处理 `qfqday/day` 回退、复用 `indicator.Calculate` / `TDSequential` / `FibRetracementOf`，并输出 SCORE、DIVERGENCE、TD、FIB、PERF 与近15日演变。
-- 批量落库：`sqlite3 data/stock.db "SELECT code FROM instrument;" | xargs -I{} go run ./cmd/indicator-analyze -save {}`
+- 批量落库：`go build -o /tmp/ia ./cmd/indicator-analyze && sqlite3 data/stock.db "SELECT code FROM instrument;" | xargs -I{} /tmp/ia -save {}`（预编译避免 285 次重复编译，全池约 90 秒）
 - 多因子选股筛选：`./scripts/screen-stocks.sh --holdings 代码:成本:股数,...`，持仓固定置顶（附浮盈），剩余位补最多 7 只优质候选（⭐⭐⭐→⭐⭐，不凑数），输出直接贴入日志"四、候补&推荐"
   - 示例：`./scripts/screen-stocks.sh --holdings sh601991:8.504:1300,sh603256:193.752:100,sh605589:53.176:200`
+  - `--dry-run` 临时查询不写 decision_log（正式落库每日一次即可）；`--capital 68000` 输出候选建议仓位（单笔风险1%/止损距离）
   - 持仓须先 `-save` 落库，否则显示"无快照数据"
+
+## snapshot 加列同步清单（缺一即漏）
+1. `internal/store/store.go`：Snapshot struct → CREATE TABLE → ALTER 容错列表 → SaveSnapshot 四子处（列名/占位符/**ON CONFLICT DO UPDATE**/参数顺序；漏 DO UPDATE 同日重跑会**静默保留旧值**）
+2. `internal/store/store_test.go`：迁移测试 SELECT + round-trip 直查 SQL（`History()` 不含新列，不能靠它）+ 同日二次 save 覆盖用例
+3. `scripts/screen-stocks.py` SELECT + `scripts/test_screen_stocks.py` 的 `base_row()` fixture（缺 key 全部用例 KeyError）
+4. 全量重跑 `-save` 后新列才有值；重跑前备份：`cp data/stock.db data/stock.db.bak-$(date +%Y%m%d-%H%M)`
+
+## 测试
+- Go：`go test ./...`；提交前对改动的 Go 文件跑 `gofmt -w`
+- Python 筛选逻辑：`python3 scripts/test_screen_stocks.py`（自跑 print 式，无 pytest；经 importlib 加载连字符文件名，测试真实 tier/sort_key/signals 逻辑）
 
 ## 每日复盘日志
 日志目录：`docs/journal/YYYY-MM-DD/journal.md`，四段结构：
@@ -84,9 +95,9 @@
 
 **每日工作流**：
 ```bash
-# 1. 收盘后批量更新快照（含换手率/市值/PE）
-sqlite3 data/stock.db "SELECT code FROM instrument;" \
-  | xargs -I{} go run ./cmd/indicator-analyze -save {}
+# 1. 收盘后批量更新快照（含换手率/市值/PE；预编译二进制，全池约90秒）
+go build -o /tmp/ia ./cmd/indicator-analyze && sqlite3 data/stock.db \
+  "SELECT code FROM instrument;" | xargs -I{} /tmp/ia -save {}
 
 # 2. 计算 RS 相对强度百分位排名（横截面 ret20 排名，全量落库当日即有效）
 go run ./cmd/stockdb rs-rank
