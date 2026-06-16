@@ -132,6 +132,9 @@ func Open(path string) (*Store, error) {
 // Close releases the underlying database handle.
 func (s *Store) Close() error { return s.db.Close() }
 
+// DB returns the underlying database connection
+func (s *Store) DB() *sql.DB { return s.db }
+
 func (s *Store) migrate() error {
 	const schema = `
 CREATE TABLE IF NOT EXISTS instrument (

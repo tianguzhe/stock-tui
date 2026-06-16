@@ -75,6 +75,25 @@
 3. `scripts/screen-stocks.py` SELECT + `scripts/test_screen_stocks.py` 的 `base_row()` fixture（缺 key 全部用例 KeyError）
 4. 全量重跑 `-save` 后新列才有值；重跑前备份：`cp data/stock.db data/stock.db.bak-$(date +%Y%m%d-%H%M)`
 
+## snapshot 表结构关键点
+- 字段名：`trade_date`（非 `date`）、`sar_long`/`supertrend_long`（非 `sar_stance`）、下划线命名（snake_case）
+- 无 `low`/`high` 字段，回测/止损计算只能用 `close`（盘中最低点数据不可得）
+- 数据是**逐日累积**的（每次 `-save` 仅保存当日），不是一次性回填历史——回测需完整 T+N 数据，数据不足时 `exit_date` 为空
+- 查看数据范围：`sqlite3 data/stock.db "SELECT MIN(trade_date), MAX(trade_date), COUNT(DISTINCT trade_date) FROM snapshot;"`
+
+## 回测系统
+- 命令：`go run ./cmd/stockdb backtest [--start YYYY-MM-DD] [--days N] [--signals "类型1,类型2"]`（基础回测）
+- 命令：`go run ./cmd/stockdb backtest-portfolio [--capital 100000] [--max-positions 5]`（组合回测）
+- 表结构：`backtest_result`（单次信号结果）、`backtest_summary`（汇总统计）
+- 有效结果过滤：`WHERE exit_date IS NOT NULL AND exit_date != ''`（数据不足时为空）
+- 信号字段映射：`sig_trend_bull`（趋势跟随多头）、`sig_overbought`（超买）、`sig_oversold`（超卖）、`div_bull`/`div_bear`（背离）
+- 每日更新脚本：`./scripts/daily-update.sh`（批量保存快照 → 更新RS → 回填决策 → 选股表，约90秒）
+
+## Go 项目约定
+- 模块名：`stock-tui`（`go.mod` 中定义，import 路径用此）
+- 新增外部依赖需 `go get <package>`（如 `github.com/google/uuid`）
+- Store 暴露底层连接：添加 `func (s *Store) DB() *sql.DB { return s.db }` 供其他包使用
+
 ## 测试
 - Go：`go test ./...`；提交前对改动的 Go 文件跑 `gofmt -w`
 - Python 筛选逻辑：`python3 scripts/test_screen_stocks.py`（自跑 print 式，无 pytest；经 importlib 加载连字符文件名，测试真实 tier/sort_key/signals 逻辑）

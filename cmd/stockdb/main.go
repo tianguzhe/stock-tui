@@ -14,7 +14,10 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
+	"time"
 
+	"stock-tui/internal/backtest"
 	"stock-tui/internal/market"
 	"stock-tui/internal/store"
 )
@@ -42,6 +45,10 @@ func run(args []string) error {
 		return cmdRSRank(rest)
 	case "backfill":
 		return cmdBackfill(rest)
+	case "backtest":
+		return cmdBacktest(rest)
+	case "backtest-portfolio":
+		return cmdBacktestPortfolio(rest)
 	default:
 		return usageErr()
 	}
@@ -54,7 +61,9 @@ func usageErr() error {
   stockdb list --tag <标签>
   stockdb history <code> [-n 15]
   stockdb rs-rank                         compute RS20/RS60/RS120 percentile ranks
-  stockdb backfill                        backfill decision_log outcomes from snapshots`)
+  stockdb backfill                        backfill decision_log outcomes from snapshots
+  stockdb backtest [options]              run strategy backtest
+  stockdb backtest-portfolio [options]    run portfolio backtest with position management`)
 }
 
 func openStore() (*store.Store, error) {
@@ -257,3 +266,116 @@ func cmdBackfill(_ []string) error {
 	}
 	return nil
 }
+
+func cmdBacktest(args []string) error {
+	fs := flag.NewFlagSet("backtest", flag.ExitOnError)
+	startDate := fs.String("start", "2025-01-01", "开始日期 (YYYY-MM-DD)")
+	endDate := fs.String("end", time.Now().Format("2006-01-02"), "结束日期 (YYYY-MM-DD)")
+	signals := fs.String("signals", "all", "信号类型（逗号分隔，或 all）")
+	holdingDays := fs.Int("days", 10, "持有天数")
+	stopLoss := fs.Float64("stop-loss", 0, "止损百分比（0=不止损）")
+	verbose := fs.Bool("verbose", false, "详细日志")
+
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	st, err := openStore()
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+
+	// 初始化回测表
+	if err := st.InitBacktestTables(); err != nil {
+		return fmt.Errorf("初始化回测表失败: %w", err)
+	}
+
+	// 解析信号类型
+	var signalList []string
+	if *signals == "all" {
+		signalList = []string{
+			"趋势跟随多头", "趋势跟随空头",
+			"超买反转空头", "超卖反转多头",
+			"量价突破多头", "量价突破空头",
+			"顶背离空头", "底背离多头",
+		}
+	} else {
+		signalList = strings.Split(*signals, ",")
+	}
+
+	config := backtest.Config{
+		StartDate:   *startDate,
+		EndDate:     *endDate,
+		Signals:     signalList,
+		HoldingDays: *holdingDays,
+		StopLoss:    *stopLoss,
+		Verbose:     *verbose,
+	}
+
+	engine := backtest.NewEngine(st.DB(), st, config)
+	runID, err := engine.Run()
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("\n回测完成！运行ID: %s\n", runID)
+	fmt.Printf("查看详情: SELECT * FROM backtest_result WHERE backtest_run_id='%s' LIMIT 20;\n", runID)
+	fmt.Printf("查看汇总: SELECT * FROM backtest_summary WHERE backtest_run_id='%s';\n", runID)
+
+	return nil
+}
+
+func cmdBacktestPortfolio(args []string) error {
+	fs := flag.NewFlagSet("backtest-portfolio", flag.ExitOnError)
+	startDate := fs.String("start", "2025-01-01", "开始日期 (YYYY-MM-DD)")
+	endDate := fs.String("end", time.Now().Format("2006-01-02"), "结束日期 (YYYY-MM-DD)")
+	signals := fs.String("signals", "all", "信号类型（逗号分隔，或 all）")
+	holdingDays := fs.Int("days", 10, "持有天数")
+	stopLoss := fs.Float64("stop-loss", 8.0, "止损百分比")
+	takeProfit := fs.Float64("take-profit", 0, "止盈百分比（0=不止盈）")
+	capital := fs.Float64("capital", 100000, "初始资金")
+	maxPos := fs.Int("max-positions", 5, "最大持仓数")
+	posSize := fs.Float64("position-size", 0.2, "单笔仓位比例（0.2=20%）")
+	verbose := fs.Bool("verbose", false, "详细日志")
+
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	st, err := openStore()
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+
+	// 解析信号类型
+	var signalList []string
+	if *signals == "all" {
+		signalList = []string{
+			"趋势跟随多头", "超买反转空头", "超卖反转多头",
+			"量价突破多头", "顶背离空头", "底背离多头",
+		}
+	} else {
+		signalList = strings.Split(*signals, ",")
+	}
+
+	config := backtest.PortfolioConfig{
+		Config: backtest.Config{
+			StartDate:   *startDate,
+			EndDate:     *endDate,
+			Signals:     signalList,
+			HoldingDays: *holdingDays,
+			StopLoss:    *stopLoss,
+			Verbose:     *verbose,
+		},
+		InitialCapital: *capital,
+		MaxPositions:   *maxPos,
+		PositionSize:   *posSize,
+		TakeProfit:     *takeProfit,
+	}
+
+	engine := backtest.NewPortfolioEngine(st.DB(), st, config)
+	return engine.Run()
+}
+
