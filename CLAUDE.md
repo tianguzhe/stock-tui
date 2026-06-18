@@ -1,5 +1,15 @@
 # stock-tui
 
+## 目录结构
+- `cmd/indicator-analyze` — 单标的深度技术面分析 CLI
+- `cmd/stockdb` — 数据库管理（tag/history/rs-rank/backfill/backtest）
+- `internal/api` — 实时行情 API 封装
+- `internal/indicator` — 技术指标计算引擎
+- `internal/store` — SQLite 存储层（snapshot/decision_log/instrument）
+- `scripts/` — 每日更新/选股/日志生成/测试脚本
+- `docs/journal/` — 每日复盘日志
+- `docs/holdings-monitor/` — 持仓监控文档
+
 ## 行情数据
 - 拉行情/K线前先查 `docs/data-apis.md`(腾讯/东财/新浪接口、OHLC 字段顺序、`sh`/`sz` 前缀、`Candle` 映射都已记录)。
 - `internal/api` 仅封装实时报价 `FetchStocks` 与分时 `FetchMinute`,**无日K**——日K需按 docs 自行拉取。
@@ -15,7 +25,7 @@
 - **趋势方向/强度**:主用 `DMI`(ADX 强度 + PDI/MDI 方向)+ MA 排列;`CMI`/`CHOP` 仅作趋势效率/震荡度印证(三者相关:ADX 高≈CHOP 低≈CMI 高)。**`SAR`/`SuperTrend`/`Keltner` 同属 ATR 系趋势跟踪,方向几乎总是一致——三者一致才算趋势确认,仅作 stance 印证与移动止损参考,不叠加计分。**
 - **动量/超买超卖**:`WR` 与 `KDJ` 同源(都基于 close 在 N 日 high-low 区间的位置),**勿当两个独立证据**;`RSI`(涨跌幅)、`BIAS`(乖离)口径不同可印证;`MACD` 相对独立(趋势性动量)。
 - **波动/通道**:`ATR`/BOLL 带宽量波动幅度;`BOLL`(σ 带)、`Keltner`(ATR 带)、`Donchian`(极值带)是三类通道,BOLL vs Keltner 的对比正是 Squeeze 的意义。
-- **资金**:`MFI`(0–100 有界、超买超卖)与 OBV(累计、趋势)互补;量比看量能强度。
+- **资金**:`MFI`(0–100 有界、超买超卖)与 OBV(累计、趋势)互补;量比看量能强度。**MFI 定性口径**：> 80 超买 / 70–80 偏高 / 20–30 偏低 / < 20 超卖。
 - **择时**:`TDSequential` 与斐波那契是独立口径,可与趋势/动量交叉印证。
 
 ## 分析输出口径
@@ -75,6 +85,11 @@
 3. `scripts/screen-stocks.py` SELECT + `scripts/test_screen_stocks.py` 的 `base_row()` fixture（缺 key 全部用例 KeyError）
 4. 全量重跑 `-save` 后新列才有值；重跑前备份：`cp data/stock.db data/stock.db.bak-$(date +%Y%m%d-%H%M)`
 
+## decision_log 表结构关键点
+- 字段名：`log_date`（非 `date`）、`outcome_pct`（结算涨跌幅）、`outcome_date`（结算日）、`correct`（是否正确）
+- 查询示例：`SELECT log_date, code, tier, outcome_pct FROM decision_log WHERE log_date='2026-06-18';`
+- 回填条件：信号日后满 10 个交易日 snapshot 数据
+
 ## snapshot 表结构关键点
 - 字段名：`trade_date`（非 `date`）、`sar_long`/`supertrend_long`（非 `sar_stance`）、下划线命名（snake_case）
 - 无 `low`/`high` 字段，回测/止损计算只能用 `close`（盘中最低点数据不可得）
@@ -126,7 +141,7 @@ go run ./cmd/stockdb backfill
 
 # 4. 生成选股表（持仓置顶 + 优质候选，合计≤10只）
 ./scripts/screen-stocks.sh \
-  --holdings sh601991:8.504:1300,sh603256:193.752:100,sh605589:53.176:200
+  --holdings <代码:成本:股数,...>
 
 # 5. 生成次日日志模板（含昨日预判自动回填）
 ./scripts/gen-journal.sh
@@ -138,5 +153,5 @@ go run ./cmd/stockdb backfill
 - `TD`：优先显示 countdown，无则显示 setup；snapshot 落库格式均为 `见顶/N`/`见底/N`（CLI 近15日行才用 `C顶N` 短格式）；setup `见顶/8` 次日警惕进入 countdown
 - `SAR/ST`：`多/多` = SAR 多头 + SuperTrend 多头，双确认；持仓翻空时选股表显示 `⚠️SAR/ST双空` 等警示，必须执行退出纪律
 - `止损价`：snapshot `sar_value` 列（批量落库后直接读取）；选股表"止损(距%)"列即此值；`--capital 总资金` 可输出候选建议仓位（单笔风险 1% / 止损距离）
-- 量比口径：量比 < 0.8 = 缩量，> 1.5 = 放量，描述时必须附数值
+- 量比口径：量比 < 0.8 / > 1.5 为阈值，描述时一律写"量比 X.X（< 0.8）"格式，不用"缩量/放量"
 - 末端降级口径：乖离 `bias24/atr_pct > 4`（波动归一化）、连涨≥5日、换手 15–20% 任一触发即从推荐降为观察；市场广度（池内站上 MA20 比例）< 40% 时推荐上限减半
