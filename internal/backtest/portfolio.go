@@ -10,12 +10,12 @@ import (
 
 // PortfolioConfig 组合回测配置
 type PortfolioConfig struct {
-	Config                      // 继承基础配置
-	InitialCapital float64      // 初始资金
-	MaxPositions   int          // 最大持仓数
-	PositionSize   float64      // 每笔仓位大小（百分比，如 0.1 = 10%）
-	TakeProfit     float64      // 止盈百分比（0=不止盈）
-	Commission     float64      // 手续费率（如 0.0003 = 万3）
+	Config                 // 继承基础配置
+	InitialCapital float64 // 初始资金
+	MaxPositions   int     // 最大持仓数
+	PositionSize   float64 // 每笔仓位大小（百分比，如 0.1 = 10%）
+	TakeProfit     float64 // 止盈百分比（0=不止盈）
+	Commission     float64 // 手续费率（如 0.0003 = 万3）
 }
 
 // Position 持仓
@@ -110,33 +110,39 @@ func (e *PortfolioEngine) Run() error {
 		// 1. 检查现有持仓（止损/止盈/到期）
 		for j := len(positions) - 1; j >= 0; j-- {
 			pos := positions[j]
-			currentPrice, err := e.getPrice(pos.Code, date)
+			closePrice, low, high, err := e.getPriceRange(pos.Code, date)
 			if err != nil {
 				continue
 			}
 
-			// 计算浮盈
-			returnPct := (currentPrice - pos.EntryPrice) / pos.EntryPrice * 100
 			daysHeld := e.countTradingDays(pos.EntryDate, date)
 
-			// 检查退出条件
+			// 退出条件按优先级：盘中止损（看当日最低）> 盘中止盈（看当日最高）> 到期（收盘）。
+			// 持仓为多头，成交价取触发价（止损/止盈线）或到期收盘价。
 			shouldExit := false
 			exitReason := ""
+			exitPrice := closePrice
 
-			if e.config.StopLoss > 0 && returnPct <= -e.config.StopLoss {
+			switch {
+			case e.config.StopLoss > 0 && (low-pos.EntryPrice)/pos.EntryPrice*100 <= -e.config.StopLoss:
 				shouldExit = true
 				exitReason = "止损"
-			} else if e.config.TakeProfit > 0 && returnPct >= e.config.TakeProfit {
+				exitPrice = pos.EntryPrice * (1 - e.config.StopLoss/100)
+			case e.config.TakeProfit > 0 && (high-pos.EntryPrice)/pos.EntryPrice*100 >= e.config.TakeProfit:
 				shouldExit = true
 				exitReason = "止盈"
-			} else if daysHeld >= e.config.HoldingDays {
+				exitPrice = pos.EntryPrice * (1 + e.config.TakeProfit/100)
+			case daysHeld >= e.config.HoldingDays:
 				shouldExit = true
 				exitReason = "到期"
+				exitPrice = closePrice
 			}
+
+			returnPct := (exitPrice - pos.EntryPrice) / pos.EntryPrice * 100
 
 			if shouldExit {
 				// 平仓
-				revenue := float64(pos.Shares) * currentPrice
+				revenue := float64(pos.Shares) * exitPrice
 				commission := revenue * e.config.Commission
 				pnl := revenue - pos.Cost - commission
 
@@ -148,7 +154,7 @@ func (e *PortfolioEngine) Run() error {
 					Code:       pos.Code,
 					SignalType: pos.SignalType,
 					EntryPrice: pos.EntryPrice,
-					ExitPrice:  currentPrice,
+					ExitPrice:  exitPrice,
 					Shares:     pos.Shares,
 					PnL:        pnl,
 					ReturnPct:  returnPct,
@@ -263,16 +269,22 @@ func (e *PortfolioEngine) getSignals(date string) ([]Signal, error) {
 	return engine.findSignals()
 }
 
-// getPrice 获取指定日期的价格
-func (e *PortfolioEngine) getPrice(code, date string) (float64, error) {
-	var price float64
-	err := e.db.QueryRow(`
-		SELECT close
+// getPriceRange 获取指定日期的收盘价与盘中 low/high（旧行缺失时回退到 close）。
+// 用日内极值判定止损/止盈，避免仅用收盘价低估盘中风险。
+func (e *PortfolioEngine) getPriceRange(code, date string) (close, low, high float64, err error) {
+	err = e.db.QueryRow(`
+		SELECT close, COALESCE(low, close), COALESCE(high, close)
 		FROM snapshot
 		WHERE code = ? AND trade_date = ?
-	`, code, date).Scan(&price)
+	`, code, date).Scan(&close, &low, &high)
 
-	return price, err
+	return close, low, high, err
+}
+
+// getPrice 获取指定日期的收盘价（用于建仓与逐日权益估值）。
+func (e *PortfolioEngine) getPrice(code, date string) (float64, error) {
+	close, _, _, err := e.getPriceRange(code, date)
+	return close, err
 }
 
 // countTradingDays 计算两个日期之间的交易日数
@@ -289,16 +301,16 @@ func (e *PortfolioEngine) countTradingDays(from, to string) int {
 
 // PortfolioStats 组合统计
 type PortfolioStats struct {
-	TotalTrades   int
-	WinTrades     int
-	WinRate       float64
-	AvgReturn     float64
-	MaxDrawdown   float64
-	SharpeRatio   float64
-	CalmarRatio   float64
-	ProfitFactor  float64
-	AvgWin        float64
-	AvgLoss       float64
+	TotalTrades  int
+	WinTrades    int
+	WinRate      float64
+	AvgReturn    float64
+	MaxDrawdown  float64
+	SharpeRatio  float64
+	CalmarRatio  float64
+	ProfitFactor float64
+	AvgWin       float64
+	AvgLoss      float64
 }
 
 // calculateStats 计算统计指标

@@ -304,9 +304,13 @@ func (e *Engine) simulateTrade(sig Signal) store.BacktestResult {
 		TDSetup:    sig.TDSetup,
 	}
 
-	// 查询后续 N 个交易日的价格（仅使用 close，因为 snapshot 表没有 low/high）
+	// 查询后续 N 个交易日的价格。用盘中 low/high（而非仅收盘）量回撤与止损，
+	// 与 recordPerf 的 MaxAdverse 口径一致；缺失的旧行 low/high 为 NULL，
+	// COALESCE 回退到 close 以保持向后兼容。
 	query := `
-		SELECT trade_date, close
+		SELECT trade_date, close,
+		       COALESCE(low, close)  AS low,
+		       COALESCE(high, close) AS high
 		FROM snapshot
 		WHERE code = ? AND trade_date > ?
 		ORDER BY trade_date ASC
@@ -331,8 +335,8 @@ func (e *Engine) simulateTrade(sig Signal) store.BacktestResult {
 	for rows.Next() {
 		hasData = true
 		var date string
-		var close float64
-		if err := rows.Scan(&date, &close); err != nil {
+		var close, low, high float64
+		if err := rows.Scan(&date, &close, &low, &high); err != nil {
 			if e.config.Verbose {
 				fmt.Printf("扫描失败: %s: %v\n", sig.Code, err)
 			}
@@ -345,7 +349,7 @@ func (e *Engine) simulateTrade(sig Signal) store.BacktestResult {
 
 		dayCount++
 
-		// 计算当日收益（使用收盘价）
+		// 当日收盘收益
 		var returnPct float64
 		if sig.Direction == "多头" {
 			returnPct = (close - sig.Close) / sig.Close * 100
@@ -353,24 +357,33 @@ func (e *Engine) simulateTrade(sig Signal) store.BacktestResult {
 			returnPct = (sig.Close - close) / sig.Close * 100
 		}
 
-		// 记录最大回撤（简化：使用收盘价）
-		if returnPct < maxAdverse {
-			maxAdverse = returnPct
+		// 盘中最大不利波动：多头看当日最低、空头看当日最高（真实日内回撤）
+		var adverse float64
+		if sig.Direction == "多头" {
+			adverse = (low - sig.Close) / sig.Close * 100
+		} else {
+			adverse = (sig.Close - high) / sig.Close * 100
+		}
+		if adverse < maxAdverse {
+			maxAdverse = adverse
 		}
 
-		// 检查止损（如果设置）
-		if e.config.StopLoss > 0 && returnPct <= -e.config.StopLoss {
-			// 触发止损
+		// 盘中止损：用日内极值判定（而非收盘），触发则按止损价成交
+		if e.config.StopLoss > 0 && adverse <= -e.config.StopLoss {
 			result.ExitDate = date
-			result.ExitPrice = close
 			result.HoldingDays = dayCount
-			result.ReturnPct = returnPct
+			result.ReturnPct = -e.config.StopLoss
+			if sig.Direction == "多头" {
+				result.ExitPrice = sig.Close * (1 - e.config.StopLoss/100)
+			} else {
+				result.ExitPrice = sig.Close * (1 + e.config.StopLoss/100)
+			}
 			result.MaxAdversePct = maxAdverse
 			result.Win = 0
 			return result
 		}
 
-		// 到达持有天数，正常退出
+		// 到达持有天数，正常退出（收盘价）
 		if dayCount == e.config.HoldingDays {
 			result.ExitDate = date
 			result.ExitPrice = close

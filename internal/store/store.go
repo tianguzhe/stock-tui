@@ -50,6 +50,11 @@ type Snapshot struct {
 	Close     float64
 	ChangePct float64
 
+	// Intraday extremes of the trading day (from the daily K-line). Persisted so
+	// the snapshot-driven backtest can measure real intraday drawdown / stop-loss
+	// triggers instead of approximating with close only.
+	Low, High float64
+
 	MA5, MA10, MA20, MA60 float64
 
 	KDJ_J                          float64
@@ -159,6 +164,7 @@ CREATE TABLE IF NOT EXISTS snapshot (
   trade_date  TEXT NOT NULL,
   captured_at TEXT NOT NULL,
   close REAL, change_pct REAL,
+  low REAL, high REAL,
   ma5 REAL, ma10 REAL, ma20 REAL, ma60 REAL,
   kdj_j REAL, macd_dif REAL, macd_dea REAL, macd_hist REAL,
   rsi6 REAL, wr14 REAL, bias6 REAL, bias24 REAL,
@@ -230,6 +236,8 @@ CREATE INDEX IF NOT EXISTS idx_decision_log_pending ON decision_log(outcome_pct)
 	// Add new columns to existing databases; SQLite does not support IF NOT EXISTS
 	// in ALTER TABLE, so we ignore the "duplicate column name" error.
 	for _, col := range []string{
+		"low REAL",
+		"high REAL",
 		"turnover_rate REAL DEFAULT 0",
 		"market_cap REAL DEFAULT 0",
 		"pe REAL DEFAULT 0",
@@ -431,7 +439,7 @@ func (s *Store) SaveSnapshot(snap Snapshot) error {
 	_, err := s.db.Exec(`
 INSERT INTO snapshot (
   code, trade_date, captured_at,
-  close, change_pct, ma5, ma10, ma20, ma60,
+  close, change_pct, low, high, ma5, ma10, ma20, ma60,
   kdj_j, macd_dif, macd_dea, macd_hist,
   rsi6, wr14, bias6, bias24,
   pdi, mdi, adx, adxr, cmi, chop,
@@ -451,7 +459,7 @@ INSERT INTO snapshot (
   sar_value, supertrend_value
 ) VALUES (
   ?, ?, ?,
-  ?, ?, ?, ?, ?, ?,
+  ?, ?, ?, ?, ?, ?, ?, ?,
   ?, ?, ?, ?,
   ?, ?, ?, ?,
   ?, ?, ?, ?, ?, ?,
@@ -473,6 +481,7 @@ INSERT INTO snapshot (
 ON CONFLICT(code, trade_date) DO UPDATE SET
   captured_at=excluded.captured_at,
   close=excluded.close, change_pct=excluded.change_pct,
+  low=excluded.low, high=excluded.high,
   ma5=excluded.ma5, ma10=excluded.ma10, ma20=excluded.ma20, ma60=excluded.ma60,
   kdj_j=excluded.kdj_j, macd_dif=excluded.macd_dif, macd_dea=excluded.macd_dea, macd_hist=excluded.macd_hist,
   rsi6=excluded.rsi6, wr14=excluded.wr14, bias6=excluded.bias6, bias24=excluded.bias24,
@@ -492,7 +501,7 @@ ON CONFLICT(code, trade_date) DO UPDATE SET
   score_adj=excluded.score_adj,
   sar_value=excluded.sar_value, supertrend_value=excluded.supertrend_value`,
 		snap.Code, snap.TradeDate, time.Now().Format(time.RFC3339),
-		snap.Close, snap.ChangePct, snap.MA5, snap.MA10, snap.MA20, snap.MA60,
+		snap.Close, snap.ChangePct, snap.Low, snap.High, snap.MA5, snap.MA10, snap.MA20, snap.MA60,
 		snap.KDJ_J, snap.MACD_DIF, snap.MACD_DEA, snap.MACD_Hist,
 		snap.RSI6, snap.WR14, snap.BIAS6, snap.BIAS24,
 		snap.PDI, snap.MDI, snap.ADX, snap.ADXR, snap.CMI, snap.CHOP,

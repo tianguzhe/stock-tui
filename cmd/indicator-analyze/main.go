@@ -189,6 +189,11 @@ func printAnalysis(data seriesData) store.Snapshot {
 	// overbought/divergence penalties by this stock's own signal history.
 	perfs := performance(candles, dates, results, tds, obv)
 	scoreAdj, perfAdj := applyPerfAdaptive(score, perfs)
+	// Late-stage crowding penalty folds into score_adj (the adaptive sidecar),
+	// not score_total — keeping the fixed scale historically comparable while the
+	// single-stock CLI view still reflects end-of-move overheating.
+	latePen, _, _ := lateStagePenalty(candles, results)
+	scoreAdj = clampInt(scoreAdj+latePen, 0, 100)
 
 	change, changePct := 0.0, 0.0
 	if n > 1 {
@@ -236,9 +241,9 @@ func printAnalysis(data seriesData) store.Snapshot {
 	fmt.Printf("VolMA5=%.0f VolMA10=%.0f VolMA20=%.0f median20=%.0f | 今日量=%.0f 量比=%.2f | OBV=%s | 近5日量价: upDays=%d avgUpVol=%.0f downDays=%d avgDownVol=%.0f\n",
 		meanTail(volumes, 5), meanTail(volumes, 10), volMA20, medianTail(volumes, 20),
 		lastCandle.Volume, volRatio, obvTrend(obv), upCnt, upAvgVol, downCnt, downAvgVol)
-	fmt.Printf("SCORE total=%d delta=%+d dmi=%+d ma=%+d macd=%+d kdjwr=%+d rsi=%+d bias=%+d chopcmi=%+d volume=%+d sar=%+d div=%+d adj=%d perfadj=%+d label=%s\n",
+	fmt.Printf("SCORE total=%d delta=%+d dmi=%+d ma=%+d macd=%+d kdjwr=%+d rsi=%+d bias=%+d chopcmi=%+d volume=%+d sar=%+d div=%+d adj=%d perfadj=%+d late=%+d label=%s\n",
 		score.Total, score.Delta, score.DMI, score.MA, score.MACD, score.KdjWr, score.RSI,
-		score.BIAS, score.CHOPCMI, score.Volume, score.SAR, score.Divergence, scoreAdj, perfAdj, score.Label)
+		score.BIAS, score.CHOPCMI, score.Volume, score.SAR, score.Divergence, scoreAdj, perfAdj, latePen, score.Label)
 	fmt.Printf("当前策略触发: trendBull=%t(%d/4) trendBear=%t(%d/4) oversold=%t(%d/4) overbought=%t(%d/4) breakBull=%t(%d/3) breakBear=%t(%d/3) revertBull=%t(%d/3) revertBear=%t(%d/3) divBull=%t(%d/1,today=%t) divBear=%t(%d/1,today=%t)\n",
 		score.Signals.TrendBull, score.Signals.TrendBullScore, score.Signals.TrendBear, score.Signals.TrendBearScore,
 		score.Signals.Oversold, score.Signals.OversoldScore, score.Signals.Overbought, score.Signals.OverboughtScore,
@@ -289,6 +294,9 @@ func printAnalysis(data seriesData) store.Snapshot {
 
 		Close:     lastCandle.Close,
 		ChangePct: changePct,
+
+		Low:  lastCandle.Low,
+		High: lastCandle.High,
 
 		MA5:  ma5,
 		MA10: ma10,
@@ -410,6 +418,15 @@ type signalState struct {
 	StochStagBull   bool // StochRSI %K up-cross inside an oversold-pinned RSI zone
 	StochStagBear   bool // StochRSI %K down-cross inside an overbought-pinned RSI zone
 }
+
+// Volume-ratio (量比) thresholds, unified across scoring, signals, and display
+// so one volRatio reads the same everywhere (CLAUDE.md 量能口径): 缩量 < volQuiet,
+// 放量 ≥ volSurge, 强放量 ≥ volStrong.
+const (
+	volQuiet  = 0.8
+	volSurge  = 1.5
+	volStrong = 2.0
+)
 
 func scoreResult(candles []indicator.Candle, results []indicator.Result, obv []float64, avgUpVol, avgDownVol, volRatio float64) scoreState {
 	n := len(candles)
@@ -564,17 +581,17 @@ func scoreResult(candles []indicator.Candle, results []indicator.Result, obv []f
 		priceDown = candles[n-1].Close < candles[n-2].Close
 	}
 	switch {
-	case volRatio > 2.0 && priceUp:
+	case volRatio > volStrong && priceUp:
 		score.Volume += 3
-	case volRatio > 2.0 && priceDown:
+	case volRatio > volStrong && priceDown:
 		score.Volume -= 3
-	case volRatio >= 1.3 && priceUp:
+	case volRatio >= volSurge && priceUp:
 		score.Volume += 2
-	case volRatio >= 1.3 && priceDown:
+	case volRatio >= volSurge && priceDown:
 		score.Volume -= 2
-	case volRatio < 0.7 && priceUp:
+	case volRatio < volQuiet && priceUp:
 		score.Volume -= 2
-	case volRatio < 0.7 && priceDown:
+	case volRatio < volQuiet && priceDown:
 		score.Volume++
 	}
 	if len(obv) >= 6 {
@@ -685,6 +702,37 @@ func abs(x int) int {
 	return x
 }
 
+// lateStagePenalty scores end-of-move overheating from candle-only inputs, so it
+// is identical on -save and plain runs (turnover, which the CLI lacks here, is
+// left to screen-stocks). 口径对齐 screen-stocks `_late_stage_risk`: a positive
+// BIAS24 stretched > 4 daily ATRs (volatility-normalized 乖离) and/or an up-run
+// of ≥5 closes mark a crowded, reversal-prone tail. Returns a small non-positive
+// penalty (≥ -5) plus the raw streak/biasAtr for display. Only the UP side is
+// penalized — oversold (negative bias / down-run) returns 0.
+func lateStagePenalty(candles []indicator.Candle, results []indicator.Result) (penalty, streak int, biasAtr float64) {
+	last := results[len(results)-1]
+	streak = streakValue(candles)
+	if last.ATR.Pct > 0 {
+		biasAtr = last.BIAS.BIAS24 / last.ATR.Pct
+	}
+	if biasAtr > 4 {
+		penalty -= 2
+		if biasAtr > 6 {
+			penalty--
+		}
+	}
+	if streak >= 5 {
+		penalty -= 2
+		if streak >= 7 {
+			penalty--
+		}
+	}
+	if penalty < -5 {
+		penalty = -5
+	}
+	return penalty, streak, biasAtr
+}
+
 func evalSignals(candles []indicator.Candle, results []indicator.Result, obv []float64, i int) signalState {
 	if i < 60 {
 		return signalState{}
@@ -707,8 +755,8 @@ func evalSignals(candles []indicator.Candle, results []indicator.Result, obv []f
 		TrendBearScore:  countTrue(r.CHOP < 38.2, r.DMI.ADX > 25, r.MACD.DIF < 0 && r.DMI.MDI > r.DMI.PDI, candles[i].Close < ma5 && candles[i].Close < ma20 && ma5 < ma20),
 		OversoldScore:   countTrue(r.RSI.RSI6 < 30, r.WR.WR14 > 80, r.KDJ.K < 20 && (r.KDJ.K > r.KDJ.D || r.KDJ.J > prev.KDJ.J), r.BIAS.BIAS24 < -10),
 		OverboughtScore: countTrue(r.RSI.RSI6 > 70, r.WR.WR14 < 20, r.KDJ.K > 80 && (r.KDJ.K < r.KDJ.D || r.KDJ.J < prev.KDJ.J), r.BIAS.BIAS24 > 10),
-		BreakBullScore:  countTrue(crossUp20 || crossUp60, vr > 1.5, obvUp),
-		BreakBearScore:  countTrue(crossDown20 || crossDown60, vr > 1.5, obvDown),
+		BreakBullScore:  countTrue(crossUp20 || crossUp60, vr > volSurge, obvUp),
+		BreakBearScore:  countTrue(crossDown20 || crossDown60, vr > volSurge, obvDown),
 		RevertBullScore: countTrue(r.BIAS.BIAS24 < -10, r.CHOP > 45, priceDown5 && obvUp),
 		RevertBearScore: countTrue(r.BIAS.BIAS24 > 10, r.CHOP > 45, priceUp5 && obvDown),
 	}
@@ -1213,10 +1261,10 @@ func evalBullBear(candles []indicator.Candle, results []indicator.Result, tds []
 	priceUp := n > 1 && candles[n-1].Close > candles[n-2].Close
 	priceDown := n > 1 && candles[n-1].Close < candles[n-2].Close
 	switch {
-	case volRatio > 1.5 && priceUp:
+	case volRatio > volSurge && priceUp:
 		moneyW += 2
 		moneyParts = append(moneyParts, fmt.Sprintf("放量上涨(量比%.2f)", volRatio))
-	case volRatio > 1.5 && priceDown:
+	case volRatio > volSurge && priceDown:
 		moneyW -= 2
 		moneyParts = append(moneyParts, fmt.Sprintf("放量下跌(量比%.2f)", volRatio))
 	}
@@ -1343,10 +1391,10 @@ func printReading(candles []indicator.Candle, results []indicator.Result, tds []
 
 	money := "量价中性"
 	switch {
-	case volRatio > 1.5:
-		money = fmt.Sprintf("量比%.2f(>1.5)放量,需看价配合", volRatio)
-	case volRatio < 0.8:
-		money = fmt.Sprintf("量比%.2f(<0.8)清淡", volRatio)
+	case volRatio > volSurge:
+		money = fmt.Sprintf("量比%.2f(>%.1f)放量,需看价配合", volRatio, volSurge)
+	case volRatio < volQuiet:
+		money = fmt.Sprintf("量比%.2f(<%.1f)清淡", volRatio, volQuiet)
 	}
 	mfiTag := ""
 	switch {
@@ -1384,6 +1432,19 @@ func printReading(candles []indicator.Candle, results []indicator.Result, tds []
 		timingText = joinComma(timing)
 	}
 	fmt.Printf("READ 择时: %s\n", timingText)
+
+	latePen, streak, biasAtr := lateStagePenalty(candles, results)
+	lateText := "无明显末端拥挤"
+	if latePen < 0 {
+		lateText = fmt.Sprintf("末端追高风险(score_adj %+d)", latePen)
+	}
+	streakText := "无连涨"
+	if streak >= 2 {
+		streakText = fmt.Sprintf("连涨%d日", streak)
+	} else if streak <= -2 {
+		streakText = fmt.Sprintf("连跌%d日", -streak)
+	}
+	fmt.Printf("READ 末端: %s bias24/atr=%.1f(>4偏热) → %s\n", streakText, biasAtr, lateText)
 
 	var caveats []string
 	if score.Signals.Overbought {
@@ -1437,9 +1498,9 @@ func printRecentRows(candles []indicator.Candle, dates []string, results []indic
 		volumeTag := "平"
 		if vm := volumeMA(candles, i, 20); vm > 0 {
 			ratio := candles[i].Volume / vm
-			if ratio > 1.5 {
+			if ratio > volSurge {
 				volumeTag = "放量"
-			} else if ratio < 0.7 {
+			} else if ratio < volQuiet {
 				volumeTag = "缩量"
 			}
 		}
