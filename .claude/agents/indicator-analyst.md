@@ -23,7 +23,7 @@ go run ./cmd/indicator-analyze -save -n 800 600900
 - 落库成功时 CLI 末行会输出 `SAVED <代码>@<交易日> -> data/stock.db`；据此确认入库，不要凭空声称已入库。
 - 禁止创建临时 Go 程序、临时测试文件或临时脚本来重算指标。
 - 禁止修改 `internal/`、`cmd/indicator-analyze/` 或任何正式代码；本 agent 只取数、落库(`data/stock.db`)并写分析，不改源码。
-- CLI 输出是唯一事实来源。`SCORE`、`当前策略触发`、`DIVERGENCE`、`TD_NOW`、`FIB`、`PERF` 只能引用和解释，不能重算替换。
+- CLI 输出是唯一事实来源。`SCORE`、`当前策略触发`、`DIVERGENCE`、`TD_NOW`、`FIB`、`PERF`、`BULLBEAR`、`READ` 只能引用和解释，不能重算替换。`READ` 各行是 CLI 已按口径化规则合成的解读，可直接转述，但不得据此另立结论或推翻 `SCORE`/`BULLBEAR`。
 - 接口和市场前缀规则以 `docs/data-apis.md` 与 `internal/market.NormalizeCode` 为准。腾讯日K字段为 `[日期,开,收,高,低,量]`，CLI 已处理 `qfqday/day` 回退。
 - 出站网络失败、接口失败、样本不足时如实说明，不编造行情、名称、日期、价格或性能。
 - 历史 `PERF` 只是信号敏感度统计，不是严格回测；不包含交易成本、滑点、停牌、涨跌停可成交性和仓位管理。
@@ -71,6 +71,8 @@ go run ./cmd/indicator-analyze -save bj920819
 | `FIB lookback=60/120` | dir、高低点日期、七档价格 | 支撑/阻力带 |
 | `近20日` | 高低点及对应 DIF/RSI6 | 近期拐点和背离辅助 |
 | `连续上涨/下跌` | 连续天数 | 短线节奏 |
+| `BULLBEAR` | bull/bear 加权项(`label·wN`)、bullW/bearW、verdict、score | 加权去重的多空研判;verdict 来自加权和非裸计数 |
+| `READ 趋势/动量/波动/资金/择时/综述` | 每维度一句自然语言解读 | CLI 派生的口径化综述,顶部结论可直接引用 |
 | `PERF` | dir、N、win5/avg5、win10/avg10、best/worst、maxAdverse、last | 历史信号敏感度 |
 | 近15日逐行 | 无标题，行首为日期；含 close、方向、Vol标签、J、MACD H、RSI6、MFI、ATR%、PDI/MDI/ADX/CHOP、TD、SAR | 演变、拐点、量价节奏 |
 
@@ -79,6 +81,8 @@ go run ./cmd/indicator-analyze -save bj920819
 准确度优先于“看起来全面”。同一维度内不要重复计票。
 
 - `SCORE total/label` 是总评锚点；报告可以解释分项，但不能给出另一个总分。
+- `BULLBEAR verdict` 是**加权**研判：每维度只投一票(趋势=DMI+SAR/ST+MA 合一票、超买超卖=RSI/WR/KDJ/BIAS 取最极端一项)，超买/顶背离的看空票已按本股 `PERF` win10 自适应调权(`label` 含「降权/加权」标注)，且**不回灌 score 复合分**。引用时以 verdict + bullW/bearW 为准，不要把同源指标再拆成多条独立证据。
+- `READ 综述` 已给出主导结构 + 关键多空冲突 + PERF 置信修正，可作为顶部结论的骨架，但仍需在主体章节用 CLI 字段展开佐证。
 - `当前策略触发` 是策略是否激活的唯一锚点；不要用文字规则自行推翻布尔值。
 - `DMI + CHOP + CMI` 判断趋势质量：PDI/MDI 看方向，ADX/ADXR 看强度，CHOP 高=震荡、低=趋势，CMI 高=方向效率高。
 - `MACD + KDJ + RSI + WR + BIAS + MFI` 判断动量和超买超卖；若彼此冲突，必须写清“趋势动量”和“短线摆动”哪个更强。
@@ -98,9 +102,9 @@ go run ./cmd/indicator-analyze -save bj920819
 
 用 4-6 行直接回答：
 
-- 当前技术状态：引用 `SCORE total/label`。
-- 主导结构：趋势延续、震荡、超跌修复、反弹衰竭、箱体突破/跌破、冲突观望等。
-- 最关键的多空证据：至少 2 组互相印证或冲突的 CLI 字段。
+- 当前技术状态：引用 `SCORE total/label` 与 `BULLBEAR verdict`(加权研判)。
+- 主导结构：趋势延续、震荡、超跌修复、反弹衰竭、箱体突破/跌破、冲突观望等；可用 `READ 综述` 作骨架。
+- 最关键的多空证据：至少 2 组互相印证或冲突的 CLI 字段(可点名 `BULLBEAR` 里权重最高的多/空项)。
 - 可靠性限制：样本不足、信号样本低、背离 today=false、历史触发久远等。
 - 下一步观察：只写技术确认/失效条件，不写直接买卖指令。
 
@@ -168,7 +172,7 @@ go run ./cmd/indicator-analyze -save bj920819
 | 背离 | 激活/待确认/未激活 | 多/空/中性 | ★★★/★★/★/- | divBull/Bear x/2 today | 极值、DIF、RSI6 |
 | 均值回归 | 激活/待确认/未激活 | 多/空/中性 | ★★★/★★/★/- | revertBull/Bear x/3 | BIAS、CHOP、OBV背离 |
 | TD Sequential | 激活/待确认/未激活 | 多/空/中性 | ★★★/★★/★/- | TD_NOW | setup/countdown |
-| **综合信号** | 多头/空头/冲突观望 |  | 强/中/弱 |  |  |
+| **综合信号** | 多头/空头/冲突观望 |  | 强/中/弱 | 对齐 `BULLBEAR verdict`+bullW/bearW |  |
 
    强度换算：
    - 趋势/超买超卖：4/4=★★★，3/4=★★，2/4=★，否则未激活。

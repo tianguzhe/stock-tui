@@ -251,7 +251,9 @@ func printAnalysis(data seriesData) store.Snapshot {
 	printFib(candles, dates, 120)
 	printRecentExtremes(candles, dates, results)
 	printStreak(candles)
-	printBullBear(candles, results, tds, obv, score, div, volRatio)
+	verdict := evalBullBear(candles, results, tds, obv, div, perfs, volRatio)
+	printBullBear(verdict, score)
+	printReading(candles, results, tds, obv, score, div, perfs, volRatio, verdict)
 	printPerf(perfs)
 	printRecentRows(candles, dates, results, tds)
 
@@ -632,47 +634,48 @@ func scoreResult(candles []indicator.Candle, results []indicator.Result, obv []f
 // The adjusted total goes to the score_adj sidecar column; score_total keeps
 // the original scale so history stays comparable.
 func applyPerfAdaptive(score scoreState, perfs []perfStat) (adjTotal, perfAdj int) {
-	var obWin, divWin float64
-	var obN, divN int
-	for _, p := range perfs {
-		if p.Triggers == 0 {
-			continue
-		}
-		switch p.Name {
-		case "超买反转":
-			obWin = float64(p.Win10) / float64(p.Triggers) * 100
-			obN = p.Triggers
-		case "顶背离":
-			divWin = float64(p.Win10) / float64(p.Triggers) * 100
-			divN = p.Triggers
-		}
-	}
-
-	// scale reweighs a negative penalty by historical win rate; positives and
-	// thin samples (n < 10) pass through unchanged.
-	scale := func(v int, win float64, n int, weakBelow, strongAbove float64) int {
-		if v >= 0 || n < 10 {
-			return v
-		}
-		if win < weakBelow {
-			return v / 2
-		}
-		if win > strongAbove {
-			return v * 3 / 2
-		}
-		return v
-	}
+	obWin, obN := perfWin10(perfs, "超买反转")
+	divWin, divN := perfWin10(perfs, "顶背离")
 
 	adj := 0
 	if score.Signals.Overbought {
 		for _, v := range []int{score.KdjWr, score.RSI, score.BIAS} {
-			adj += scale(v, obWin, obN, 35, 55) - v
+			adj += perfScale(v, obWin, obN, 35, 55) - v
 		}
 	}
 	if score.Divergence < 0 {
-		adj += scale(score.Divergence, divWin, divN, 40, 55) - score.Divergence
+		adj += perfScale(score.Divergence, divWin, divN, 40, 55) - score.Divergence
 	}
 	return clampInt(50+score.Delta+adj, 0, 100), adj
+}
+
+// perfWin10 returns the forward-10-day win rate (%) and trigger count for the
+// named PERF stat, or (0, 0) when it is absent or never triggered.
+func perfWin10(perfs []perfStat, name string) (float64, int) {
+	for _, p := range perfs {
+		if p.Name == name && p.Triggers > 0 {
+			return float64(p.Win10) / float64(p.Triggers) * 100, p.Triggers
+		}
+	}
+	return 0, 0
+}
+
+// perfScale reweighs a negative penalty by this stock's own historical win
+// rate (CLAUDE.md PERF 自适应): halved when the signal was historically
+// ineffective (win < weakBelow), amplified ×1.5 when effective (win >
+// strongAbove). Non-negative values and thin samples (n < 10) pass through
+// unchanged. Integer division truncates toward zero (-7/2 = -3, -1/2 = 0).
+func perfScale(v int, win float64, n int, weakBelow, strongAbove float64) int {
+	if v >= 0 || n < 10 {
+		return v
+	}
+	if win < weakBelow {
+		return v / 2
+	}
+	if win > strongAbove {
+		return v * 3 / 2
+	}
+	return v
 }
 
 func abs(x int) int {
@@ -1047,104 +1050,358 @@ func printStreak(candles []indicator.Candle) {
 
 // printBullBear emits a structured BULLBEAR line summarising bull/bear evidence
 // from existing indicators. Pure deterministic rules, no LLM.
-func printBullBear(candles []indicator.Candle, results []indicator.Result, tds []indicator.TD, obv []float64, score scoreState, div divergenceState, volRatio float64) {
+type bbItem struct {
+	Label  string
+	Weight int
+}
+
+type bullBearVerdict struct {
+	Bulls     []bbItem
+	Bears     []bbItem
+	BullScore int
+	BearScore int
+	Verdict   string // 偏多 / 偏空 / 中性
+}
+
+func (v *bullBearVerdict) addBull(label string, weight int) {
+	if weight <= 0 {
+		return
+	}
+	v.Bulls = append(v.Bulls, bbItem{Label: label, Weight: weight})
+	v.BullScore += weight
+}
+
+func (v *bullBearVerdict) addBear(label string, weight int) {
+	if weight <= 0 {
+		return
+	}
+	v.Bears = append(v.Bears, bbItem{Label: label, Weight: weight})
+	v.BearScore += weight
+}
+
+// perfNote labels how PERF-history reweighting changed a penalty, for display.
+func perfNote(orig, adj int) string {
+	switch {
+	case adj == orig:
+		return ""
+	case abs(adj) < abs(orig):
+		return "(本股历史无效·降权)"
+	default:
+		return "(本股历史有效·加权)"
+	}
+}
+
+// strongestSwingVote returns the single most extreme overbought/oversold
+// reading across RSI6 / WR14 / KDJ-J / BIAS24. These share one axis (CLAUDE.md
+// 「指标分工」: close position within the recent high-low range), so only the
+// most extreme of them votes — counting all four would triple-count one signal.
+// Positive weight = oversold (bullish), negative = overbought (bearish); zero
+// means no member is in an extreme zone. Ties keep the first (RSI) for
+// determinism.
+func strongestSwingVote(last indicator.Result) (string, int) {
+	type cand struct {
+		label string
+		w     int
+	}
+	var cands []cand
+	switch {
+	case last.RSI.RSI6 > 80:
+		cands = append(cands, cand{fmt.Sprintf("RSI超买(%.1f)", last.RSI.RSI6), -3})
+	case last.RSI.RSI6 > 70:
+		cands = append(cands, cand{fmt.Sprintf("RSI偏高(%.1f)", last.RSI.RSI6), -2})
+	case last.RSI.RSI6 < 20:
+		cands = append(cands, cand{fmt.Sprintf("RSI超卖(%.1f)", last.RSI.RSI6), 3})
+	case last.RSI.RSI6 < 30:
+		cands = append(cands, cand{fmt.Sprintf("RSI偏低(%.1f)", last.RSI.RSI6), 2})
+	}
+	switch { // WR 正值口径:高=超卖(看多),低=超买(看空)
+	case last.WR.WR14 > 90:
+		cands = append(cands, cand{fmt.Sprintf("WR超卖(%.1f)", last.WR.WR14), 3})
+	case last.WR.WR14 >= 80:
+		cands = append(cands, cand{fmt.Sprintf("WR偏超卖(%.1f)", last.WR.WR14), 2})
+	case last.WR.WR14 < 10:
+		cands = append(cands, cand{fmt.Sprintf("WR超买(%.1f)", last.WR.WR14), -3})
+	case last.WR.WR14 <= 20:
+		cands = append(cands, cand{fmt.Sprintf("WR偏超买(%.1f)", last.WR.WR14), -2})
+	}
+	switch {
+	case last.BIAS.BIAS24 > 15:
+		cands = append(cands, cand{fmt.Sprintf("乖离过大(%.1f)", last.BIAS.BIAS24), -3})
+	case last.BIAS.BIAS24 > 10:
+		cands = append(cands, cand{fmt.Sprintf("乖离偏大(%.1f)", last.BIAS.BIAS24), -2})
+	case last.BIAS.BIAS24 < -15:
+		cands = append(cands, cand{fmt.Sprintf("负乖离过大(%.1f)", last.BIAS.BIAS24), 3})
+	case last.BIAS.BIAS24 < -10:
+		cands = append(cands, cand{fmt.Sprintf("负乖离偏大(%.1f)", last.BIAS.BIAS24), 2})
+	}
+	switch {
+	case last.KDJ.J > 100:
+		cands = append(cands, cand{fmt.Sprintf("KDJ-J超买(%.1f)", last.KDJ.J), -2})
+	case last.KDJ.J < 0:
+		cands = append(cands, cand{fmt.Sprintf("KDJ-J超卖(%.1f)", last.KDJ.J), 2})
+	}
+	best, bestLabel := 0, ""
+	for _, c := range cands {
+		if abs(c.w) > abs(best) {
+			best, bestLabel = c.w, c.label
+		}
+	}
+	return bestLabel, best
+}
+
+// evalBullBear synthesizes a weighted, de-duplicated bull/bear verdict from the
+// CLI indicators. Each axis (CLAUDE.md「指标分工」) votes at most once so
+// same-source indicators can't manufacture false consensus: trend folds
+// DMI + SAR/ST + MA into a single vote, the overbought/oversold axis takes only
+// its most extreme member (RSI/WR/KDJ-J/BIAS), and the composite score is NOT
+// fed back as a vote. Overbought and top-divergence bear votes are reweighted by
+// this stock's own PERF history (perfScale), matching score_adj's methodology.
+func evalBullBear(candles []indicator.Candle, results []indicator.Result, tds []indicator.TD, obv []float64, div divergenceState, perfs []perfStat, volRatio float64) bullBearVerdict {
+	n := len(candles)
+	last := results[n-1]
+	lastTD := tds[n-1]
+	var v bullBearVerdict
+
+	obWin, obN := perfWin10(perfs, "超买反转")
+	divWin, divN := perfWin10(perfs, "顶背离")
+
+	// 趋势维度:DMI 方向强度 + SAR/ST 双确认 + MA 排列,合并一票(三者一致才满权)。
+	ma5, ma10, ma20, ma60 := closeMA(candles, n-1, 5), closeMA(candles, n-1, 10), closeMA(candles, n-1, 20), closeMA(candles, n-1, 60)
+	adx := last.DMI.ADX
+	maBull := ma5 > ma10 && ma10 > ma20 && ma20 > ma60
+	maBear := ma5 < ma10 && ma10 < ma20 && ma20 < ma60
+	sarStBull := last.SAR.Long && last.SuperTrend.Long
+	sarStBear := !last.SAR.Long && !last.SuperTrend.Long
+	bullConfirm := countTrue(adx > 25 && last.DMI.PDI > last.DMI.MDI, sarStBull, maBull)
+	bearConfirm := countTrue(adx > 25 && last.DMI.MDI > last.DMI.PDI, sarStBear, maBear)
+	switch {
+	case bullConfirm > bearConfirm:
+		v.addBull(fmt.Sprintf("趋势多头(ADX%.1f,确认%d/3)", adx, bullConfirm), bullConfirm)
+	case bearConfirm > bullConfirm:
+		v.addBear(fmt.Sprintf("趋势空头(ADX%.1f,确认%d/3)", adx, bearConfirm), bearConfirm)
+	}
+
+	// 动量维度:MACD 趋势性动量,独立一票。
+	switch {
+	case last.MACD.Histogram > 0 && last.MACD.DIF > last.MACD.DEA:
+		v.addBull(fmt.Sprintf("MACD金叉(H%+.4f)", last.MACD.Histogram), 2)
+	case last.MACD.Histogram < 0 && last.MACD.DIF < last.MACD.DEA:
+		v.addBear(fmt.Sprintf("MACD死叉(H%+.4f)", last.MACD.Histogram), 2)
+	}
+
+	// 超买超卖维度:RSI/WR/KDJ-J/BIAS 同源,只取最极端的一项计一票;看空侧按 PERF 调权。
+	if label, w := strongestSwingVote(last); w < 0 {
+		adj := perfScale(w, obWin, obN, 35, 55)
+		v.addBear(label+perfNote(w, adj), -adj)
+	} else if w > 0 {
+		v.addBull(label, w)
+	}
+
+	// 资金维度:OBV 净流向 + 量比异动,合并一票。
+	moneyW := 0
+	var moneyParts []string
+	if n >= 6 {
+		switch {
+		case obv[n-1] > obv[n-6]:
+			moneyW++
+			moneyParts = append(moneyParts, "OBV净流入")
+		case obv[n-1] < obv[n-6]:
+			moneyW--
+			moneyParts = append(moneyParts, "OBV净流出")
+		}
+	}
+	priceUp := n > 1 && candles[n-1].Close > candles[n-2].Close
+	priceDown := n > 1 && candles[n-1].Close < candles[n-2].Close
+	switch {
+	case volRatio > 1.5 && priceUp:
+		moneyW += 2
+		moneyParts = append(moneyParts, fmt.Sprintf("放量上涨(量比%.2f)", volRatio))
+	case volRatio > 1.5 && priceDown:
+		moneyW -= 2
+		moneyParts = append(moneyParts, fmt.Sprintf("放量下跌(量比%.2f)", volRatio))
+	}
+	switch {
+	case moneyW > 0:
+		v.addBull("资金:"+joinComma(moneyParts), moneyW)
+	case moneyW < 0:
+		v.addBear("资金:"+joinComma(moneyParts), -moneyW)
+	}
+
+	// 择时维度:TD countdown 反转倒计时。
+	if lastTD.CountdownCount > 0 {
+		w := 1
+		if lastTD.CountdownCount >= 13 {
+			w = 3
+		} else if lastTD.CountdownCount >= 8 {
+			w = 2
+		}
+		switch lastTD.CountdownSignal {
+		case indicator.TDSell:
+			v.addBear(fmt.Sprintf("TD见顶countdown/%d", lastTD.CountdownCount), w)
+		case indicator.TDBuy:
+			v.addBull(fmt.Sprintf("TD见底countdown/%d", lastTD.CountdownCount), w)
+		}
+	}
+
+	// 背离维度:顶背离看空(按本股「顶背离」历史调权),底背离看多;非当日各降一档。
+	if div.Bear {
+		w := -2
+		label := "顶背离"
+		if !div.BearToday {
+			w = -1
+			label = "顶背离(非当日)"
+		}
+		adj := perfScale(w, divWin, divN, 40, 55)
+		v.addBear(label+perfNote(w, adj), -adj)
+	}
+	if div.Bull {
+		w := 2
+		label := "底背离"
+		if !div.BullToday {
+			w = 1
+			label = "底背离(非当日)"
+		}
+		v.addBull(label, w)
+	}
+
+	switch {
+	case v.BullScore-v.BearScore >= 2:
+		v.Verdict = "偏多"
+	case v.BearScore-v.BullScore >= 2:
+		v.Verdict = "偏空"
+	default:
+		v.Verdict = "中性"
+	}
+	return v
+}
+
+// printBullBear renders the weighted verdict. The composite score is shown as
+// context only (score=), never as a vote — it is the sum of the very dimensions
+// already counted above, so feeding it back would double-count everything.
+func printBullBear(v bullBearVerdict, score scoreState) {
+	fmt.Printf("BULLBEAR bull=[%s] bear=[%s] bullW=%d bearW=%d verdict=%s score=%d\n",
+		bbItemsText(v.Bulls), bbItemsText(v.Bears), v.BullScore, v.BearScore, v.Verdict, score.Total)
+}
+
+// bbItemsText renders weighted items as "label·wN,...", or "-" when empty.
+func bbItemsText(items []bbItem) string {
+	if len(items) == 0 {
+		return "-"
+	}
+	parts := make([]string, len(items))
+	for i, it := range items {
+		parts[i] = fmt.Sprintf("%s·w%d", it.Label, it.Weight)
+	}
+	return joinComma(parts)
+}
+
+// printReading emits a per-dimension natural-language reading of the indicators
+// (CLAUDE.md 分析输出口径: 量能一律用量比数值). It only synthesizes values already
+// computed upstream — nothing here is persisted or recomputed independently.
+func printReading(candles []indicator.Candle, results []indicator.Result, tds []indicator.TD, obv []float64, score scoreState, div divergenceState, perfs []perfStat, volRatio float64, v bullBearVerdict) {
 	n := len(candles)
 	last := results[n-1]
 	lastTD := tds[n-1]
 
-	var bulls, bears []string
+	trend := "震荡/方向不明"
+	switch {
+	case last.DMI.ADX > 25 && last.DMI.PDI > last.DMI.MDI:
+		trend = "上升趋势延续"
+	case last.DMI.ADX > 25 && last.DMI.MDI > last.DMI.PDI:
+		trend = "下降趋势延续"
+	case last.DMI.ADX < 20:
+		trend = "无趋势震荡(ADX<20)"
+	}
+	fmt.Printf("READ 趋势: ADX=%.1f PDI/MDI=%.1f/%.1f SAR/ST=%s/%s CHOP=%.1f → %s\n",
+		last.DMI.ADX, last.DMI.PDI, last.DMI.MDI, longShort(last.SAR.Long), longShort(last.SuperTrend.Long), last.CHOP, trend)
 
-	// Trend strength
-	if last.DMI.ADX > 25 && last.DMI.PDI > last.DMI.MDI {
-		bulls = append(bulls, fmt.Sprintf("ADX强趋势(%.1f)", last.DMI.ADX))
+	momentum := "动量中性"
+	switch {
+	case last.RSI.RSI6 > 70:
+		momentum = "短线超买,警惕回落"
+	case last.RSI.RSI6 < 30:
+		momentum = "短线超卖,关注企稳"
+	case last.MACD.DIF > last.MACD.DEA && last.MACD.Histogram > 0:
+		momentum = "MACD金叉,动量向上"
+	case last.MACD.DIF < last.MACD.DEA && last.MACD.Histogram < 0:
+		momentum = "MACD死叉,动量转弱"
 	}
-	if last.DMI.ADX > 25 && last.DMI.MDI > last.DMI.PDI {
-		bears = append(bears, fmt.Sprintf("ADX强空头(%.1f)", last.DMI.ADX))
-	}
+	fmt.Printf("READ 动量: MACD DIF/DEA/H=%.4f/%.4f/%+.4f RSI6=%.1f KDJ-J=%.1f → %s\n",
+		last.MACD.DIF, last.MACD.DEA, last.MACD.Histogram, last.RSI.RSI6, last.KDJ.J, momentum)
 
-	// SAR/SuperTrend dual confirmation
-	if last.SAR.Long && last.SuperTrend.Long {
-		bulls = append(bulls, "SAR/ST双多")
-	} else if !last.SAR.Long && !last.SuperTrend.Long {
-		bears = append(bears, "SAR/ST双空")
+	vol := "通道内正常波动"
+	switch {
+	case last.Keltner.Squeeze:
+		vol = "波动压缩(squeeze),临近突破·方向未定"
+	case last.BOLL.PercentB > 100:
+		vol = "突破BOLL上轨,强势但偏热"
+	case last.BOLL.PercentB < 0:
+		vol = "跌破BOLL下轨,弱势但偏冷"
 	}
+	fmt.Printf("READ 波动: ATR%%=%.2f BOLL %%B=%.1f bandwidth=%.2f%% squeeze=%t → %s\n",
+		last.ATR.Pct, last.BOLL.PercentB, last.BOLL.Bandwidth, last.Keltner.Squeeze, vol)
 
-	// OBV
-	if len(obv) >= 6 && obv[n-1] > obv[n-6] {
-		bulls = append(bulls, "OBV净流入")
-	} else if len(obv) >= 6 && obv[n-1] < obv[n-6] {
-		bears = append(bears, "OBV净流出")
+	money := "量价中性"
+	switch {
+	case volRatio > 1.5:
+		money = fmt.Sprintf("量比%.2f(>1.5)放量,需看价配合", volRatio)
+	case volRatio < 0.8:
+		money = fmt.Sprintf("量比%.2f(<0.8)清淡", volRatio)
 	}
+	mfiTag := ""
+	switch {
+	case last.MFI > 80:
+		mfiTag = ",MFI>80资金偏热"
+	case last.MFI < 20:
+		mfiTag = ",MFI<20资金偏冷"
+	}
+	fmt.Printf("READ 资金: 量比=%.2f OBV=%s MFI=%.1f → %s%s\n",
+		volRatio, obvTrend(obv), last.MFI, money, mfiTag)
 
-	// MACD
-	if last.MACD.Histogram > 0 && last.MACD.DIF > last.MACD.DEA {
-		bulls = append(bulls, "MACD金叉")
-	} else if last.MACD.Histogram < 0 && last.MACD.DIF < last.MACD.DEA {
-		bears = append(bears, "MACD死叉")
+	var timing []string
+	if lastTD.SetupCount > 0 {
+		timing = append(timing, fmt.Sprintf("TD-setup %s/%d", tdSignalText(lastTD.SetupSignal), lastTD.SetupCount))
 	}
-
-	// Volume surge
-	if volRatio > 1.5 && n > 1 && candles[n-1].Close > candles[n-2].Close {
-		bulls = append(bulls, fmt.Sprintf("放量上涨(量比%.2f)", volRatio))
-	} else if volRatio > 1.5 && n > 1 && candles[n-1].Close < candles[n-2].Close {
-		bears = append(bears, fmt.Sprintf("放量下跌(量比%.2f)", volRatio))
+	if lastTD.CountdownCount > 0 {
+		timing = append(timing, fmt.Sprintf("TD-countdown %s/%d", tdSignalText(lastTD.CountdownSignal), lastTD.CountdownCount))
 	}
-
-	// TD Sequential countdown
-	cdwn := lastTD.CountdownCount
-	if cdwn > 0 && lastTD.CountdownSignal == indicator.TDSell {
-		bears = append(bears, fmt.Sprintf("TD C顶%d", cdwn))
-	}
-	if cdwn > 0 && lastTD.CountdownSignal == indicator.TDBuy {
-		bulls = append(bulls, fmt.Sprintf("TD C底%d", cdwn))
-	}
-
-	// Divergence
 	if div.Bear {
-		bears = append(bears, "顶背离")
+		t := "顶背离"
+		if !div.BearToday {
+			t = "顶背离(非当日)"
+		}
+		timing = append(timing, t)
 	}
 	if div.Bull {
-		bulls = append(bulls, "底背离")
+		t := "底背离"
+		if !div.BullToday {
+			t = "底背离(非当日)"
+		}
+		timing = append(timing, t)
 	}
+	timingText := "无明确反转择时信号"
+	if len(timing) > 0 {
+		timingText = joinComma(timing)
+	}
+	fmt.Printf("READ 择时: %s\n", timingText)
 
-	// Overbought/oversold
-	if last.RSI.RSI6 > 70 {
-		bears = append(bears, fmt.Sprintf("RSI超买(%.1f)", last.RSI.RSI6))
+	var caveats []string
+	if score.Signals.Overbought {
+		if w, nn := perfWin10(perfs, "超买反转"); nn >= 10 && w < 35 {
+			caveats = append(caveats, fmt.Sprintf("超买本股win10=%.0f%%(<35%%),已降权", w))
+		}
 	}
-	if last.RSI.RSI6 < 30 {
-		bulls = append(bulls, fmt.Sprintf("RSI超卖(%.1f)", last.RSI.RSI6))
+	if div.Bear {
+		if w, nn := perfWin10(perfs, "顶背离"); nn >= 10 && w < 40 {
+			caveats = append(caveats, fmt.Sprintf("顶背离本股win10=%.0f%%(<40%%),已降权", w))
+		}
 	}
-	if last.BIAS.BIAS24 > 10 {
-		bears = append(bears, fmt.Sprintf("乖离偏大(BIAS24=%.1f)", last.BIAS.BIAS24))
+	caveatText := "无"
+	if len(caveats) > 0 {
+		caveatText = joinComma(caveats)
 	}
-	if last.BIAS.BIAS24 < -10 {
-		bulls = append(bulls, fmt.Sprintf("负乖离偏大(BIAS24=%.1f)", last.BIAS.BIAS24))
-	}
-
-	// Score extremes
-	if score.Total >= 70 {
-		bulls = append(bulls, fmt.Sprintf("评分偏强(%d)", score.Total))
-	}
-	if score.Total <= 35 {
-		bears = append(bears, fmt.Sprintf("评分偏弱(%d)", score.Total))
-	}
-
-	verdict := "中性"
-	if len(bulls) > len(bears) {
-		verdict = "偏多"
-	} else if len(bears) > len(bulls) {
-		verdict = "偏空"
-	}
-
-	bullStr := "-"
-	if len(bulls) > 0 {
-		bullStr = joinComma(bulls)
-	}
-	bearStr := "-"
-	if len(bears) > 0 {
-		bearStr = joinComma(bears)
-	}
-	fmt.Printf("BULLBEAR bull=[%s] bear=[%s] verdict=%s\n", bullStr, bearStr, verdict)
+	fmt.Printf("READ 综述: 评分%d(%s) 加权研判=%s(多%d/空%d) | PERF修正:%s\n",
+		score.Total, score.Label, v.Verdict, v.BullScore, v.BearScore, caveatText)
 }
 
 func joinComma(ss []string) string {

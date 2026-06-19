@@ -293,3 +293,90 @@ func TestTDShortUsesTechnicalDirection(t *testing.T) {
 		t.Fatalf("tdShort(top countdown) = %q, want C顶13", top)
 	}
 }
+
+// flat* build the minimal fixtures evalBullBear reads: it only touches the last
+// Result/TD and the candle/obv slices (for MA, price direction, OBV). Flat
+// candles make every MA equal (no MA-arrangement vote) and price direction
+// neutral, isolating whichever signal the case sets on the last bar.
+func flatCandles(n int, close float64) []indicator.Candle {
+	cs := make([]indicator.Candle, n)
+	for i := range cs {
+		cs[i] = indicator.Candle{High: close, Low: close, Close: close, Volume: 1}
+	}
+	return cs
+}
+
+func flatResults(n int, last indicator.Result) []indicator.Result {
+	rs := make([]indicator.Result, n)
+	rs[n-1] = last
+	return rs
+}
+
+func flatTDs(n int, last indicator.TD) []indicator.TD {
+	ts := make([]indicator.TD, n)
+	ts[n-1] = last
+	return ts
+}
+
+func TestEvalBullBear(t *testing.T) {
+	const n = 61 // ≥ ma60 window + the look-back for OBV/price direction
+	mk := func(last indicator.Result, td indicator.TD, div divergenceState, perfs []perfStat, volRatio float64) bullBearVerdict {
+		return evalBullBear(flatCandles(n, 10), flatResults(n, last), flatTDs(n, td), make([]float64, n), div, perfs, volRatio)
+	}
+	// noTrend cancels the trend vote: SAR long + ST short is neither dual-long
+	// nor dual-short, and ADX=0/flat-MA add nothing.
+	noTrend := func(r indicator.Result) indicator.Result {
+		r.SAR.Long, r.SuperTrend.Long = true, false
+		return r
+	}
+
+	t.Run("超买同源只计一票_无score回灌_PERF无效降权", func(t *testing.T) {
+		last := noTrend(indicator.Result{})
+		last.RSI.RSI6 = 85    // -3
+		last.WR.WR14 = 5      // -3 (high=超卖反口径,低=超买)
+		last.BIAS.BIAS24 = 20 // -3
+		last.KDJ.J = 110      // -2
+		// 旧实现会把 RSI/BIAS 各投一票再叠加"评分偏弱",至少 3 个 bear;
+		// 新实现同轴只取最极端一项,且不回灌 score → 恰好 1 个 bear。
+		v := mk(last, indicator.TD{}, divergenceState{}, []perfStat{perfStatOf("超买反转", 20, 20)}, 1.0)
+		if len(v.Bears) != 1 || len(v.Bulls) != 0 {
+			t.Fatalf("bulls=%d bears=%d, want 0/1; bears=%+v", len(v.Bulls), len(v.Bears), v.Bears)
+		}
+		if v.BearScore != 1 { // -3 经 win10=20%(<35) 减半向零截断为 -1
+			t.Errorf("BearScore=%d, want 1", v.BearScore)
+		}
+		if !strings.Contains(v.Bears[0].Label, "降权") {
+			t.Errorf("bear label %q missing 降权 note", v.Bears[0].Label)
+		}
+	})
+
+	t.Run("超买样本不足_不降权", func(t *testing.T) {
+		last := noTrend(indicator.Result{})
+		last.RSI.RSI6 = 85
+		v := mk(last, indicator.TD{}, divergenceState{}, []perfStat{perfStatOf("超买反转", 5, 0)}, 1.0)
+		if v.BearScore != 3 {
+			t.Errorf("BearScore=%d, want 3 (n<10 不调权)", v.BearScore)
+		}
+		if v.Verdict != "偏空" {
+			t.Errorf("Verdict=%q, want 偏空", v.Verdict)
+		}
+		if len(v.Bears) == 1 && strings.Contains(v.Bears[0].Label, "降权") {
+			t.Errorf("bear label %q should not be downweighted", v.Bears[0].Label)
+		}
+	})
+
+	t.Run("加权研判方向取决于权重和", func(t *testing.T) {
+		var last indicator.Result
+		last.RSI.RSI6, last.WR.WR14, last.KDJ.J, last.BIAS.BIAS24 = 50, 50, 50, 0 // 中性摆动,无超买超卖票
+		last.SAR.Long, last.SuperTrend.Long = true, true                          // SAR/ST 双多 → 趋势确认 +1
+		last.MACD.DIF, last.MACD.DEA, last.MACD.Histogram = 1, 0, 1               // MACD 金叉 +2
+		td := indicator.TD{CountdownCount: 13, CountdownSignal: indicator.TDBuy}  // TD 见底 +3
+		v := mk(last, td, divergenceState{}, nil, 1.0)
+		if v.BearScore != 0 || v.BullScore != 6 {
+			t.Fatalf("bullW=%d bearW=%d, want 6/0 (趋势1+MACD2+TD3); bulls=%+v", v.BullScore, v.BearScore, v.Bulls)
+		}
+		if v.Verdict != "偏多" {
+			t.Errorf("Verdict=%q, want 偏多", v.Verdict)
+		}
+	})
+}
