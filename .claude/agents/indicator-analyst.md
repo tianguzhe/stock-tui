@@ -64,7 +64,7 @@ go run ./cmd/indicator-analyze -save bj920819
 | `SUPERTREND` | value、trend、reversed | 平滑趋势态和移动风险线 |
 | `DONCHIAN_BREAK` | bull20/bear20/bull55/bear55 | 真突破/跌破判断，只信这一行 |
 | `VolMA...OBV...` | VolMA5/10/20、median20、量比、OBV、近5日涨跌日均量 | 量能确认或背离 |
-| `SCORE` | total、delta、各分项、label | 唯一综合评分来源 |
+| `SCORE` | total、delta、各分项、**adj/perfadj/late**、label | 综合评分;total=固定尺(历史可比)、adj=经 PERF 自适应(perfadj)与末端拥挤(late)调整后的分 |
 | `当前策略触发` | 8类布尔值与满足项数，div today | 策略矩阵的唯一触发来源 |
 | `DIVERGENCE` | bull/bear、score、today、当前/基准极值日期价格与 DIF/RSI6 | 背离方向、强度、时效 |
 | `TD_NOW` | setup 方向/计数/perfected，countdown 方向/计数 | TD 择时反转 |
@@ -72,7 +72,7 @@ go run ./cmd/indicator-analyze -save bj920819
 | `近20日` | 高低点及对应 DIF/RSI6 | 近期拐点和背离辅助 |
 | `连续上涨/下跌` | 连续天数 | 短线节奏 |
 | `BULLBEAR` | bull/bear 加权项(`label·wN`)、bullW/bearW、verdict、score | 加权去重的多空研判;verdict 来自加权和非裸计数 |
-| `READ 趋势/动量/波动/资金/择时/综述` | 每维度一句自然语言解读 | CLI 派生的口径化综述,顶部结论可直接引用 |
+| `READ 趋势/动量/波动/资金/择时/末端/综述` | 每维度一句自然语言解读(`READ 末端` 给连涨天数、bias24/atr、是否末端追高) | CLI 派生的口径化综述,顶部结论可直接引用 |
 | `PERF` | dir、N、win5/avg5、win10/avg10、best/worst、maxAdverse、last | 历史信号敏感度 |
 | 近15日逐行 | 无标题，行首为日期；含 close、方向、Vol标签、J、MACD H、RSI6、MFI、ATR%、PDI/MDI/ADX/CHOP、TD、SAR | 演变、拐点、量价节奏 |
 
@@ -81,6 +81,7 @@ go run ./cmd/indicator-analyze -save bj920819
 准确度优先于“看起来全面”。同一维度内不要重复计票。
 
 - `SCORE total/label` 是总评锚点；报告可以解释分项，但不能给出另一个总分。
+- `SCORE adj`(`adj=`)= total 经 **PERF 自适应**(`perfadj`，按本股超买/顶背离 win10 调权)与**末端拥挤**(`late`，连涨≥5 或 bias24/atr>4 触发的追高惩罚)调整后的分；`total` 保持固定尺以便历史可比，`adj` 反映本股历史有效性与末端风险。当 `adj` 明显低于 `total`(perfadj/late 为负)时，结论须点出原因——超买/背离在本股历史有效被加权，或处于末端追高。`READ 末端` 一行即 `late` 的人话版。
 - `BULLBEAR verdict` 是**加权**研判：每维度只投一票(趋势=DMI+SAR/ST+MA 合一票、超买超卖=RSI/WR/KDJ/BIAS 取最极端一项)，超买/顶背离的看空票已按本股 `PERF` win10 自适应调权(`label` 含「降权/加权」标注)，且**不回灌 score 复合分**。引用时以 verdict + bullW/bearW 为准，不要把同源指标再拆成多条独立证据。
 - `READ 综述` 已给出主导结构 + 关键多空冲突 + PERF 置信修正，可作为顶部结论的骨架，但仍需在主体章节用 CLI 字段展开佐证。
 - `当前策略触发` 是策略是否激活的唯一锚点；不要用文字规则自行推翻布尔值。
@@ -102,7 +103,7 @@ go run ./cmd/indicator-analyze -save bj920819
 
 用 4-6 行直接回答：
 
-- 当前技术状态：引用 `SCORE total/label` 与 `BULLBEAR verdict`(加权研判)。
+- 当前技术状态：引用 `SCORE total/label` 与 `adj`(若 `adj` ≠ `total`，须说明 `perfadj`/`late` 的降权/加权原因)以及 `BULLBEAR verdict`(加权研判)。
 - 主导结构：趋势延续、震荡、超跌修复、反弹衰竭、箱体突破/跌破、冲突观望等；可用 `READ 综述` 作骨架。
 - 最关键的多空证据：至少 2 组互相印证或冲突的 CLI 字段(可点名 `BULLBEAR` 里权重最高的多/空项)。
 - 可靠性限制：样本不足、信号样本低、背离 today=false、历史触发久远等。
@@ -222,6 +223,8 @@ go run ./cmd/indicator-analyze -save bj920819
 - SuperTrend：ATR(10)*3 趋势线；比 SAR 更平滑，reversed=true 表示本根翻转。
 - TD Sequential：项目实现包含 price flip、Setup 9、Countdown 13、反向 setup 切换；不含 TDST、13-vs-8 校验、recycling。见底=偏多，见顶=偏空。
 - FIB：`FibRetracementOf` 最近 lookback 窗口极值法；高点更近为上升回撤支撑，低点更近为下降反弹阻力；输出 0/23.6/38.2/50/61.8/78.6/100%。
+- 量比口径(全 CLI 统一常量)：< 0.8 缩量 / ≥ 1.5 放量 / ≥ 2.0 强放量；描述量能一律给量比数值，不用“缩量/放量”模糊词。
+- 末端拥挤(`late`/`READ 末端`)：连涨 ≥5 日，或 bias24/atr_pct > 4(乖离按 ATR 归一化)即判末端追高，惩罚折进 `score_adj`(不进 `total`)；换手率不在此口径(留给 screen-stocks)。
 - VolMA、量比、OBV、近5日量价、SCORE、策略触发、DIVERGENCE、PERF 都是 `indicator-analyze` CLI 附加计算，不属于 `indicator.Calculate` 原始指标。
 
 ## 6. 表述禁令
