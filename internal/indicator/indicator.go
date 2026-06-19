@@ -13,6 +13,7 @@ type Result struct {
 	KDJ        KDJ
 	MACD       MACD
 	RSI        RSI
+	StochRSI   StochRSI
 	WR         WR
 	DMI        DMI
 	CMI        float64
@@ -43,6 +44,14 @@ type RSI struct {
 	RSI6  float64
 	RSI12 float64
 	RSI24 float64
+}
+
+// StochRSI rescales RSI6 within its own recent range, restoring timing
+// resolution when RSI itself is pinned in an overbought/oversold zone
+// ("钝化"). K is the smoothed StochRSI (%K), D is the signal line (%D).
+type StochRSI struct {
+	K float64
+	D float64
 }
 
 type WR struct {
@@ -120,6 +129,7 @@ func Calculate(candles []Candle) []Result {
 	fillKDJ(candles, results)
 	fillMACD(candles, results)
 	fillRSI(candles, results)
+	fillStochRSI(candles, results) // reads results[i].RSI.RSI6, so must run after fillRSI
 	fillWR(candles, results)
 	fillDMI(candles, results)
 	fillCMI(candles, results)
@@ -189,6 +199,59 @@ func fillRSI(candles []Candle, results []Result) {
 			RSI24: wilderRSI(g24, l24),
 		}
 	}
+}
+
+func fillStochRSI(candles []Candle, results []Result) {
+	// StochRSI applies the stochastic oscillator to the RSI6 series: where RSI6
+	// sits within its own [min,max] over the lookback window. When RSI6 is pinned
+	// high (overbought "钝化"), this re-expands the flat range so %K/%D crossovers
+	// still give timing. Source RSI6 matches divergence() for consistency.
+	const lookback = 14
+	const smooth = 3
+	rawStoch := make([]float64, len(candles))
+	kSeries := make([]float64, len(candles))
+	for i := range candles {
+		rsiNow := results[i].RSI.RSI6
+		minRSI, maxRSI := rsiNow, rsiNow
+		start := i - lookback + 1
+		if start < 0 {
+			start = 0
+		}
+		for j := start; j <= i; j++ {
+			v := results[j].RSI.RSI6
+			if v < minRSI {
+				minRSI = v
+			}
+			if v > maxRSI {
+				maxRSI = v
+			}
+		}
+		if maxRSI == minRSI {
+			rawStoch[i] = 50 // flat window: neutral, matching wr/wilderRSI convention
+		} else {
+			rawStoch[i] = (rsiNow - minRSI) / (maxRSI - minRSI) * 100
+		}
+		kSeries[i] = smaTail(rawStoch, i, smooth)
+		results[i].StochRSI = StochRSI{
+			K: kSeries[i],
+			D: smaTail(kSeries, i, smooth),
+		}
+	}
+}
+
+// smaTail averages the up-to-`period` most recent values ending at index end.
+// Warmup (fewer than period available) degrades to whatever exists, matching
+// the project's "seed from first bar, no NaN" smoothing style.
+func smaTail(series []float64, end, period int) float64 {
+	start := end - period + 1
+	if start < 0 {
+		start = 0
+	}
+	sum := 0.0
+	for j := start; j <= end; j++ {
+		sum += series[j]
+	}
+	return sum / float64(end-start+1)
 }
 
 func fillWR(candles []Candle, results []Result) {

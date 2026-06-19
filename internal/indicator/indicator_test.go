@@ -149,6 +149,40 @@ func TestCalculateSampleValues(t *testing.T) {
 	}
 }
 
+// TestStochRSI verifies the stochastic-of-RSI semantics by boundary cases
+// rather than a brittle golden number: a flat RSI series must read neutral 50,
+// outputs stay within [0,100], and a fresh rally after a decline pins %K high.
+func TestStochRSI(t *testing.T) {
+	// Flat closes -> every RSI6 == 50 -> window min==max -> neutral 50.
+	flat := make([]Candle, 16)
+	for i := range flat {
+		flat[i] = Candle{High: 10.2, Low: 9.8, Close: 10.0}
+	}
+	flatLast := Calculate(flat)[len(flat)-1]
+	assertNear(t, "flat StochRSI K", flatLast.StochRSI.K, 50, 1e-9)
+	assertNear(t, "flat StochRSI D", flatLast.StochRSI.D, 50, 1e-9)
+
+	// Decline (low RSI base) then a sustained rally: the latest RSI6 readings sit
+	// at the top of the lookback window, so smoothed %K must be high.
+	closes := []float64{
+		20, 19.5, 19, 18.5, 18, 17.5, 17, 16.5, 16, // 9-bar decline
+		16.6, 17.4, 18.3, 19.3, 20.4, 21.6, 22.9, 24.3, // 8-bar rally
+	}
+	rally := make([]Candle, len(closes))
+	for i, c := range closes {
+		rally[i] = Candle{High: c + 0.2, Low: c - 0.2, Close: c}
+	}
+	for i, r := range Calculate(rally) {
+		if r.StochRSI.K < 0 || r.StochRSI.K > 100 || r.StochRSI.D < 0 || r.StochRSI.D > 100 {
+			t.Fatalf("bar %d StochRSI out of [0,100]: K=%v D=%v", i, r.StochRSI.K, r.StochRSI.D)
+		}
+	}
+	rallyLast := Calculate(rally)[len(rally)-1]
+	if rallyLast.StochRSI.K <= 80 {
+		t.Fatalf("rally StochRSI K = %v, want > 80 (RSI6 near window top)", rallyLast.StochRSI.K)
+	}
+}
+
 // TestCalculateCHOPStaysNonNegative guards the warmup window: the first bar's
 // high/low feed rangeHL, so its true range must also feed sumTR, otherwise an
 // early bar with a wide range drives sum(TR)/rangeHL below 1 and CHOP negative.

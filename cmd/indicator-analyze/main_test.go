@@ -227,8 +227,8 @@ func TestPerformanceCountsRisingEdgesOnly(t *testing.T) {
 
 func TestPerformanceUsesSignalNames(t *testing.T) {
 	perfs := performance(nil, nil, nil, nil, nil)
-	if len(perfs) < 12 {
-		t.Fatalf("performance() returned %d rows, want at least 12", len(perfs))
+	if len(perfs) < 14 {
+		t.Fatalf("performance() returned %d rows, want at least 14", len(perfs))
 	}
 
 	if perfs[10].Name != "TD见底Countdown" {
@@ -236,6 +236,40 @@ func TestPerformanceUsesSignalNames(t *testing.T) {
 	}
 	if perfs[11].Name != "TD见顶Countdown" {
 		t.Fatalf("TD top signal name = %q, want TD见顶Countdown", perfs[11].Name)
+	}
+	if perfs[12].Name != "StochRSI钝化多头" {
+		t.Fatalf("StochRSI bull signal name = %q, want StochRSI钝化多头", perfs[12].Name)
+	}
+	if perfs[13].Name != "StochRSI钝化空头" {
+		t.Fatalf("StochRSI bear signal name = %q, want StochRSI钝化空头", perfs[13].Name)
+	}
+}
+
+// TestStochStagnation verifies the AND-gate: a %K/%D crossover only fires when
+// RSI6 is pinned in the matching extreme zone AND %K came from the
+// overbought/oversold band — each guard independently suppresses the signal.
+func TestStochStagnation(t *testing.T) {
+	cases := []struct {
+		name                           string
+		rsi6, kNow, dNow, kPrev, dPrev float64
+		wantBull, wantBear             bool
+	}{
+		{"空头转向: 高位钝化+%K从超买下穿", 82, 70, 75, 85, 80, false, true},
+		{"空头不触发: RSI未钝化(60≤75)", 60, 70, 75, 85, 80, false, false},
+		{"空头不触发: %K前值未超买(78≤80)", 82, 70, 75, 78, 76, false, false},
+		{"空头不触发: 无下穿(%K仍在%D上)", 82, 88, 82, 85, 80, false, false},
+		{"多头转向: 低位钝化+%K从超卖上穿", 18, 25, 20, 15, 18, true, false},
+		{"多头不触发: RSI未钝化(40≥25)", 40, 25, 20, 15, 18, false, false},
+		{"多头不触发: %K前值未超卖(25≥20)", 18, 30, 25, 25, 28, false, false},
+		{"多头不触发: 无上穿(%K仍在%D下)", 18, 12, 16, 15, 18, false, false},
+		{"正常区双侧不触发", 50, 60, 40, 30, 45, false, false},
+	}
+	for _, tc := range cases {
+		gotBull, gotBear := stochStagnation(tc.rsi6, tc.kNow, tc.dNow, tc.kPrev, tc.dPrev)
+		if gotBull != tc.wantBull || gotBear != tc.wantBear {
+			t.Errorf("%s: stochStagnation() = (bull=%t, bear=%t), want (bull=%t, bear=%t)",
+				tc.name, gotBull, gotBear, tc.wantBull, tc.wantBear)
+		}
 	}
 }
 

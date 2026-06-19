@@ -212,6 +212,13 @@ func printAnalysis(data seriesData) store.Snapshot {
 	fmt.Printf("RSI %.2f/%.2f/%.2f | WR %.2f/%.2f | BIAS %.2f/%.2f/%.2f\n",
 		last.RSI.RSI6, last.RSI.RSI12, last.RSI.RSI24, last.WR.WR10, last.WR.WR14,
 		last.BIAS.BIAS6, last.BIAS.BIAS12, last.BIAS.BIAS24)
+	stochBull, stochBear := false, false
+	if n >= 2 {
+		prevStoch := results[n-2].StochRSI
+		stochBull, stochBear = stochStagnation(last.RSI.RSI6, last.StochRSI.K, last.StochRSI.D, prevStoch.K, prevStoch.D)
+	}
+	fmt.Printf("STOCHRSI K=%.1f D=%.1f | RSI6=%.1f 钝化=%s 择时=%s\n",
+		last.StochRSI.K, last.StochRSI.D, last.RSI.RSI6, stagnationZone(last.RSI.RSI6), stochTimingText(stochBull, stochBear))
 	fmt.Printf("DMI PDI=%.2f MDI=%.2f ADX=%.2f ADXR=%.2f | CMI=%.2f | CHOP=%.2f\n",
 		last.DMI.PDI, last.DMI.MDI, last.DMI.ADX, last.DMI.ADXR, last.CMI, last.CHOP)
 	fmt.Printf("RISK ATR14=%.3f ATR%%=%.2f | BOLL mid=%.3f upper=%.3f lower=%.3f %%B=%.1f bandwidth=%.2f%% | Donchian20 %.3f..%.3f Donchian55 %.3f..%.3f | MFI14=%.1f\n",
@@ -398,6 +405,8 @@ type signalState struct {
 	BreakBear       bool
 	RevertBull      bool
 	RevertBear      bool
+	StochStagBull   bool // StochRSI %K up-cross inside an oversold-pinned RSI zone
+	StochStagBear   bool // StochRSI %K down-cross inside an overbought-pinned RSI zone
 }
 
 func scoreResult(candles []indicator.Candle, results []indicator.Result, obv []float64, avgUpVol, avgDownVol, volRatio float64) scoreState {
@@ -708,7 +717,45 @@ func evalSignals(candles []indicator.Candle, results []indicator.Result, obv []f
 	s.BreakBear = s.BreakBearScore >= 2
 	s.RevertBull = s.RevertBullScore >= 2
 	s.RevertBear = s.RevertBearScore >= 2
+	s.StochStagBull, s.StochStagBear = stochStagnation(r.RSI.RSI6, r.StochRSI.K, r.StochRSI.D, prev.StochRSI.K, prev.StochRSI.D)
 	return s
+}
+
+// stochStagnation flags a StochRSI %K/%D crossover that occurs while RSI6 is
+// pinned in an extreme zone ("钝化") — the timing signal RSI alone can't give
+// because it has lost resolution at the top/bottom. It is a sidecar timing cue,
+// deliberately kept OUT of the score (same momentum dimension as RSI/KDJ — see
+// CLAUDE.md「指标分工」: avoid double-counting one axis as independent votes).
+func stochStagnation(rsi6, kNow, dNow, kPrev, dPrev float64) (bull, bear bool) {
+	crossDown := kPrev >= dPrev && kNow < dNow
+	crossUp := kPrev <= dPrev && kNow > dNow
+	bear = rsi6 > 75 && crossDown && kPrev > 80 // high-zone 钝化 + %K rolling over from overbought
+	bull = rsi6 < 25 && crossUp && kPrev < 20   // low-zone 钝化 + %K turning up from oversold
+	return
+}
+
+// stagnationZone labels RSI6's 钝化 state for display.
+func stagnationZone(rsi6 float64) string {
+	switch {
+	case rsi6 > 75:
+		return "高位"
+	case rsi6 < 25:
+		return "低位"
+	default:
+		return "正常"
+	}
+}
+
+// stochTimingText renders the stagnation-timing cue for the current bar.
+func stochTimingText(bull, bear bool) string {
+	switch {
+	case bear:
+		return "今日空头转向"
+	case bull:
+		return "今日多头转向"
+	default:
+		return "-"
+	}
 }
 
 type divergenceState struct {
@@ -816,6 +863,7 @@ func performance(candles []indicator.Candle, dates []string, results []indicator
 		newPerf("均值回归多头", "多头"), newPerf("均值回归空头", "空头"),
 		newPerf("底背离", "多头"), newPerf("顶背离", "空头"),
 		newPerf("TD见底Countdown", "多头"), newPerf("TD见顶Countdown", "空头"),
+		newPerf("StochRSI钝化多头", "多头"), newPerf("StochRSI钝化空头", "空头"),
 	}
 	if len(candles) <= 90 {
 		return perfs
@@ -861,6 +909,12 @@ func performance(candles []indicator.Candle, dates []string, results []indicator
 			} else if tds[i].CountdownSignal == indicator.TDSell {
 				recordPerf(&perfs[11], candles, dates, i)
 			}
+		}
+		if s.StochStagBull && !prev.StochStagBull {
+			recordPerf(&perfs[12], candles, dates, i)
+		}
+		if s.StochStagBear && !prev.StochStagBear {
+			recordPerf(&perfs[13], candles, dates, i)
 		}
 		prev, prevDiv = s, d
 	}
