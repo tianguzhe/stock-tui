@@ -31,3 +31,4 @@ stockdb
 
 # 临时分析数据
 analysis/
+*.test

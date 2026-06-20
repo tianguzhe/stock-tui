@@ -49,6 +49,10 @@ func run(args []string) error {
 		return cmdBacktest(rest)
 	case "backtest-portfolio":
 		return cmdBacktestPortfolio(rest)
+	case "screen":
+		return cmdScreen(rest)
+	case "check-data":
+		return cmdCheckData(rest)
 	default:
 		return usageErr()
 	}
@@ -63,7 +67,9 @@ func usageErr() error {
   stockdb rs-rank                         compute RS20/RS60/RS120 percentile ranks
   stockdb backfill                        backfill decision_log outcomes from snapshots
   stockdb backtest [options]              run strategy backtest
-  stockdb backtest-portfolio [options]    run portfolio backtest with position management`)
+  stockdb backtest-portfolio [options]    run portfolio backtest with position management
+  stockdb screen [options]                multi-factor stock screening (replaces screen-stocks.py)
+  stockdb check-data                      data quality checks (RS coverage, continuity, backfill progress)`)
 }
 
 func openStore() (*store.Store, error) {
@@ -377,5 +383,19 @@ func cmdBacktestPortfolio(args []string) error {
 
 	engine := backtest.NewPortfolioEngine(st.DB(), st, config)
 	return engine.Run()
+}
+
+func cmdScreen(args []string) error {
+	fs := flag.NewFlagSet("screen", flag.ExitOnError)
+	holdings := fs.String("holdings", "", "持仓，格式：代码:成本:股数,... 如 sh601991:8.504:1300")
+	maxResults := fs.Int("max", 10, "持仓+候选总上限（默认10）")
+	capital := fs.Float64("capital", 0, "总资金（元）；提供时按单笔风险1%/止损距离输出候选建议仓位")
+	dryRun := fs.Bool("dry-run", false, "仅输出不写入decision_log")
+
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	return runScreen(*holdings, *maxResults, *capital, *dryRun)
 }
 

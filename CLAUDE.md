@@ -74,8 +74,10 @@
 - 深度技术面分析优先用固定命令 `go run ./cmd/indicator-analyze <代码>`；不要再写一次性 `cmd/<name>/main.go`。
 - `indicator-analyze` 会拉腾讯日K、处理 `qfqday/day` 回退、复用 `indicator.Calculate` / `TDSequential` / `FibRetracementOf`，并输出 SCORE、DIVERGENCE、TD、FIB、PERF 与近15日演变。
 - 批量落库：`go build -o /tmp/ia ./cmd/indicator-analyze && sqlite3 data/stock.db "SELECT code FROM instrument;" | xargs -I{} /tmp/ia -save {}`（预编译避免 285 次重复编译，全池约 90 秒）
-- 多因子选股筛选：`./scripts/screen-stocks.sh --holdings 代码:成本:股数,...`，持仓固定置顶（附浮盈），剩余位补最多 7 只优质候选（⭐⭐⭐→⭐⭐，不凑数），输出直接贴入日志"四、候补&推荐"
-  - 示例：`./scripts/screen-stocks.sh --holdings sh601991:8.504:1300,sh603256:193.752:100,sh605589:53.176:200`
+- 多因子选股筛选：**已统一为 Go 实现**（类型安全、性能更优）
+  - **推荐**：`go run ./cmd/stockdb screen --holdings 代码:成本:股数,...` 或快捷脚本 `./scripts/screen-stocks.sh --holdings ...`
+  - 旧版 Python `scripts/screen-stocks.py` 已弃用（保留作参考实现）
+  - 示例：`go run ./cmd/stockdb screen --holdings sh601991:8.504:1300,sh603256:193.752:100 --max 10 --capital 68000`
   - `--dry-run` 临时查询不写 decision_log（正式落库每日一次即可）；`--capital 68000` 输出候选建议仓位（单笔风险1%/止损距离）
   - 持仓须先 `-save` 落库，否则显示"无快照数据"
 
