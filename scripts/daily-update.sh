@@ -1,6 +1,6 @@
 #!/bin/bash
 # 每日收盘后数据更新脚本
-# 用途：批量保存快照、更新RS排名、回填决策结果
+# 用途：更新热榜、批量保存快照、更新RS排名、回填决策结果
 # 时间：每个交易日收盘后执行（建议 15:30 或之后）
 
 set -e  # 遇到错误立即退出
@@ -14,8 +14,13 @@ echo "时间: $(date '+%Y-%m-%d %H:%M:%S')"
 echo "项目: $PROJECT_ROOT"
 echo ""
 
-# 1. 批量保存快照数据
-echo "=== 1/4 批量保存快照数据 ==="
+# 1. 更新同花顺热榜（确保 instrument 表在批量 -save 前已更新）
+echo "=== 1/5 更新同花顺热榜 ==="
+go run ./cmd/stockdb hot
+echo ""
+
+# 2. 批量保存快照数据
+echo "=== 2/5 批量保存快照数据 ==="
 echo "预编译 indicator-analyze..."
 go build -o /tmp/ia ./cmd/indicator-analyze
 
@@ -34,18 +39,18 @@ DURATION=$((END_TIME - START_TIME))
 echo "✅ 批量保存完成，耗时 ${DURATION} 秒"
 echo ""
 
-# 2. 更新 RS 排名
-echo "=== 2/4 更新 RS 相对强度排名 ==="
+# 3. 更新 RS 排名
+echo "=== 3/5 更新 RS 相对强度排名 ==="
 go run ./cmd/stockdb rs-rank
 echo ""
 
-# 3. 回填决策结果
-echo "=== 3/4 回填决策结果 ==="
+# 4. 回填决策结果
+echo "=== 4/5 回填决策结果 ==="
 go run ./cmd/stockdb backfill
 echo ""
 
-# 4. 生成选股表（如果有持仓）
-echo "=== 4/4 生成选股表 ==="
+# 5. 生成选股表（如果有持仓）
+echo "=== 5/5 生成选股表 ==="
 if [ -f "$PROJECT_ROOT/.holdings" ]; then
   HOLDINGS=$(cat "$PROJECT_ROOT/.holdings")
   echo "持仓配置: $HOLDINGS"
@@ -57,7 +62,7 @@ else
 fi
 echo ""
 
-# 5. 统计当日数据
+# 统计当日数据
 echo "=== 数据统计 ==="
 TODAY=$(date '+%Y-%m-%d')
 SNAPSHOT_COUNT=$(sqlite3 data/stock.db "SELECT COUNT(*) FROM snapshot WHERE trade_date = '$TODAY';")

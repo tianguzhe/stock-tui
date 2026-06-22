@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"stock-tui/internal/api"
 	"stock-tui/internal/backtest"
 	"stock-tui/internal/market"
 	"stock-tui/internal/store"
@@ -51,6 +52,8 @@ func run(args []string) error {
 		return cmdBacktestPortfolio(rest)
 	case "screen":
 		return cmdScreen(rest)
+	case "hot":
+		return cmdHot(rest)
 	case "check-data":
 		return cmdCheckData(rest)
 	default:
@@ -69,6 +72,7 @@ func usageErr() error {
   stockdb backtest [options]              run strategy backtest
   stockdb backtest-portfolio [options]    run portfolio backtest with position management
   stockdb screen [options]                multi-factor stock screening (replaces screen-stocks.py)
+  stockdb hot [--top N]                   fetch THS hot list and import into instrument table
   stockdb check-data                      data quality checks (RS coverage, continuity, backfill progress)`)
 }
 
@@ -385,6 +389,54 @@ func cmdBacktestPortfolio(args []string) error {
 	return engine.Run()
 }
 
+func cmdHot(args []string) error {
+	fs := flag.NewFlagSet("hot", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	topN := fs.Int("top", 0, "only import the top N hottest stocks (0=all)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	stocks, err := api.FetchHotStocks()
+	if err != nil {
+		return fmt.Errorf("hot: %w", err)
+	}
+	if *topN > 0 && len(stocks) > *topN {
+		stocks = stocks[:*topN]
+	}
+
+	st, err := openStore()
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+
+	entries := make([]store.HotStockEntry, len(stocks))
+	for i, s := range stocks {
+		entries[i] = store.HotStockEntry{
+			Code:   s.Code,
+			Name:   s.Name,
+			Market: s.Market,
+		}
+	}
+
+	inserted, err := st.ImportHotStocks(entries)
+	if err != nil {
+		return fmt.Errorf("hot: %w", err)
+	}
+
+	fmt.Printf("热榜共 %d 只，大盘主板 %d 只，新增入库 %d 只\n",
+		len(stocks), len(entries), inserted)
+	for i, s := range stocks {
+		if i >= 10 {
+			fmt.Printf("  ...（及另外 %d 只）\n", len(stocks)-10)
+			break
+		}
+		fmt.Printf("  %s  %s\n", s.Code, s.Name)
+	}
+	return nil
+}
+
 func cmdScreen(args []string) error {
 	fs := flag.NewFlagSet("screen", flag.ExitOnError)
 	holdings := fs.String("holdings", "", "持仓，格式：代码:成本:股数,... 如 sh601991:8.504:1300")
@@ -398,4 +450,3 @@ func cmdScreen(args []string) error {
 
 	return runScreen(*holdings, *maxResults, *capital, *dryRun)
 }
-

@@ -382,3 +382,61 @@ func TestCloseAfterUsesGlobalTradingDayAndRequiresExactCodeSnapshot(t *testing.T
 		t.Fatalf("expected exact fourth global day close=25 date=2026-06-05, got close=%v date=%q", close, date)
 	}
 }
+
+func TestImportHotStocksInsertIgnore(t *testing.T) {
+	s := openTemp(t)
+
+	entries := []HotStockEntry{
+		{Code: "sh600519", Name: "贵州茅台", Market: "sh"},
+		{Code: "sz000001", Name: "平安银行", Market: "sz"},
+	}
+	inserted, err := s.ImportHotStocks(entries)
+	if err != nil {
+		t.Fatalf("ImportHotStocks: %v", err)
+	}
+	if inserted != 2 {
+		t.Errorf("inserted = %d, want 2", inserted)
+	}
+
+	// Verify the new stock was created.
+	var name string
+	if err := s.db.QueryRow(`SELECT name FROM instrument WHERE code = 'sz000001'`).Scan(&name); err != nil {
+		t.Fatalf("query new: %v", err)
+	}
+	if name != "平安银行" {
+		t.Errorf("sz000001 name = %q, want 平安银行", name)
+	}
+}
+
+func TestImportHotStocksIgnoresExisting(t *testing.T) {
+	s := openTemp(t)
+
+	// Seed one pre-existing instrument with a custom name.
+	if err := s.UpsertInstrument("sh600519", "茅台", "sh", "custom"); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	// Import the same code with a different name — INSERT OR IGNORE must not overwrite.
+	inserted, err := s.ImportHotStocks([]HotStockEntry{
+		{Code: "sh600519", Name: "贵州茅台", Market: "sh"},
+		{Code: "sz000001", Name: "平安银行", Market: "sz"},
+	})
+	if err != nil {
+		t.Fatalf("ImportHotStocks: %v", err)
+	}
+	if inserted != 1 {
+		t.Errorf("inserted = %d, want 1 (only sz000001 is new)", inserted)
+	}
+
+	// Verify the existing stock's name was NOT overwritten.
+	var name, note string
+	if err := s.db.QueryRow(`SELECT name, note FROM instrument WHERE code = 'sh600519'`).Scan(&name, &note); err != nil {
+		t.Fatalf("query existing: %v", err)
+	}
+	if name != "茅台" {
+		t.Errorf("sh600519 name = %q, want 茅台 (should be untouched)", name)
+	}
+	if note != "custom" {
+		t.Errorf("sh600519 note = %q, want custom (should be untouched)", note)
+	}
+}

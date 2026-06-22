@@ -35,10 +35,11 @@ type Store struct {
 
 // Instrument is a tracked symbol in the watchlist.
 type Instrument struct {
-	Code   string
-	Name   string
-	Market string
-	Note   string
+	Code     string
+	Name     string
+	Market   string
+	Note     string
+	HotScore int
 }
 
 // Snapshot is one analysis result for a symbol on a trading day. Fields mirror
@@ -431,6 +432,60 @@ WHERE code = ? AND tag_id = (SELECT id FROM tag WHERE name = ?)`, code, tag)
 		return fmt.Errorf("remove tag %s from %s: %w", tag, code, err)
 	}
 	return nil
+}
+
+// HotStockEntry is a minimal data transfer type for ImportHotStocks.
+// Defined here to avoid a circular import with the api package.
+type HotStockEntry struct {
+	Code   string
+	Name   string
+	Market string
+}
+
+// ImportHotStocks inserts new instruments from the THS hot list.
+// Uses INSERT OR IGNORE: existing instruments are never modified, matching the
+// original Python import-hot-stocks.py behavior.
+//
+// Returns the number of newly inserted instruments.
+func (s *Store) ImportHotStocks(stocks []HotStockEntry) (int, error) {
+	before, err := s.instrumentCount()
+	if err != nil {
+		return 0, err
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+
+	now := time.Now().Format(time.RFC3339)
+	for _, st := range stocks {
+		if _, err := tx.Exec(`
+INSERT OR IGNORE INTO instrument (code, name, market, note, created_at)
+VALUES (?, ?, ?, '', ?)`,
+			st.Code, st.Name, st.Market, now); err != nil {
+			return 0, fmt.Errorf("insert %s: %w", st.Code, err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+
+	after, err := s.instrumentCount()
+	if err != nil {
+		return 0, err
+	}
+	return after - before, nil
+}
+
+func (s *Store) instrumentCount() (int, error) {
+	var n int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM instrument`).Scan(&n); err != nil {
+		return 0, err
+	}
+	return n, nil
 }
 
 // SaveSnapshot upserts s, keyed by (code, trade_date): re-analyzing the same
