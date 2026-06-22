@@ -27,7 +27,7 @@ func FetchHotStocks() ([]HotStock, error) {
 	}
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("fetch THS hot list: %w", err)
 	}
@@ -37,7 +37,7 @@ func FetchHotStocks() ([]HotStock, error) {
 		return nil, fmt.Errorf("THS hot list: HTTP %d", resp.StatusCode)
 	}
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 10<<20))
 	if err != nil {
 		return nil, fmt.Errorf("read THS response: %w", err)
 	}

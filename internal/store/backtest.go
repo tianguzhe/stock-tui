@@ -257,22 +257,22 @@ func (s *Store) ListBacktestSummaries(limit int) ([]BacktestSummary, error) {
 
 	summaries := []BacktestSummary{}
 	for rows.Next() {
-		var s BacktestSummary
+		var sum BacktestSummary
 		err := rows.Scan(
-			&s.BacktestRunID, &s.RunDate, &s.Config,
-			&s.StartDate, &s.EndDate,
-			&s.TotalSignals, &s.WinCount, &s.WinRate,
-			&s.AvgReturn, &s.MedianReturn, &s.BestReturn, &s.WorstReturn,
-			&s.SignalStats, &s.BullMarketWinRate, &s.BearMarketWinRate,
-			&s.MaxDrawdown, &s.SharpeRatio, &s.DurationMS,
+			&sum.BacktestRunID, &sum.RunDate, &sum.Config,
+			&sum.StartDate, &sum.EndDate,
+			&sum.TotalSignals, &sum.WinCount, &sum.WinRate,
+			&sum.AvgReturn, &sum.MedianReturn, &sum.BestReturn, &sum.WorstReturn,
+			&sum.SignalStats, &sum.BullMarketWinRate, &sum.BearMarketWinRate,
+			&sum.MaxDrawdown, &sum.SharpeRatio, &sum.DurationMS,
 		)
 		if err != nil {
 			return nil, err
 		}
-		summaries = append(summaries, s)
+		summaries = append(summaries, sum)
 	}
 
-	return summaries, nil
+	return summaries, rows.Err()
 }
 
 // GetBacktestResults 获取回测详细结果
@@ -308,7 +308,7 @@ func (s *Store) GetBacktestResults(runID string) ([]BacktestResult, error) {
 		results = append(results, r)
 	}
 
-	return results, nil
+	return results, rows.Err()
 }
 
 // SignalStat 信号统计

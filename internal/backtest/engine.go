@@ -159,8 +159,17 @@ func (e *Engine) findSignals() ([]Signal, error) {
 
 	args := []interface{}{e.config.StartDate, e.config.EndDate}
 
-	// 添加筛选条件
+	// 添加筛选条件（列名白名单防注入）
+	allowedFilterCols := map[string]bool{
+		"code": true, "trade_date": true, "close": true,
+		"score_total": true, "adx": true, "sar_long": true,
+		"st_long": true, "obv_up": true, "div_bull": true, "div_bear": true,
+		"sig_trend_bull": true, "sig_overbought": true, "sig_oversold": true,
+	}
 	for key, val := range e.config.Filters {
+		if !allowedFilterCols[key] {
+			return nil, fmt.Errorf("不允许的筛选列: %q", key)
+		}
 		switch v := val.(type) {
 		case string:
 			query += fmt.Sprintf(" AND %s = ?", key)
@@ -219,7 +228,7 @@ func (e *Engine) findSignals() ([]Signal, error) {
 		e.appendSignals(&signals, s)
 	}
 
-	return signals, nil
+	return signals, rows.Err()
 }
 
 // appendSignals 根据触发标志追加信号
@@ -399,6 +408,11 @@ func (e *Engine) simulateTrade(sig Signal) store.BacktestResult {
 
 			return result
 		}
+	}
+
+	// 检查迭代是否因错误中断
+	if err := rows.Err(); err != nil {
+		return result // 返回空 ExitDate，等价于数据不足
 	}
 
 	// Debug: 检查是否没有数据

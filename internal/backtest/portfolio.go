@@ -115,7 +115,10 @@ func (e *PortfolioEngine) Run() error {
 				continue
 			}
 
-			daysHeld := e.countTradingDays(pos.EntryDate, date)
+			daysHeld, err := e.countTradingDays(pos.EntryDate, date)
+			if err != nil {
+				continue
+			}
 
 			// 退出条件按优先级：盘中止损（看当日最低）> 盘中止盈（看当日最高）> 到期（收盘）。
 			// 持仓为多头，成交价取触发价（止损/止盈线）或到期收盘价。
@@ -213,22 +216,38 @@ func (e *PortfolioEngine) Run() error {
 		dailyEquity = append(dailyEquity, equity)
 	}
 
-	// 4. 计算最终收益
-	finalEquity := capital
+	// 4. 关闭剩余持仓（按收盘价强制平仓，记录为 Trade 以纳入胜率统计）
 	for _, pos := range positions {
-		currentPrice, err := e.getPrice(pos.Code, e.config.EndDate)
-		if err == nil {
-			finalEquity += float64(pos.Shares) * currentPrice
+		exitPrice, err := e.getPrice(pos.Code, e.config.EndDate)
+		if err != nil {
+			exitPrice = pos.EntryPrice // fallback
 		}
+		revenue := float64(pos.Shares) * exitPrice
+		commission := revenue * e.config.Commission
+		pnl := revenue - pos.Cost - commission
+		capital += revenue - commission
+		trades = append(trades, Trade{
+			EntryDate:  pos.EntryDate,
+			ExitDate:   e.config.EndDate,
+			Code:       pos.Code,
+			SignalType: pos.SignalType,
+			EntryPrice: pos.EntryPrice,
+			ExitPrice:  exitPrice,
+			Shares:     pos.Shares,
+			PnL:        pnl,
+			ReturnPct:  (exitPrice - pos.EntryPrice) / pos.EntryPrice * 100,
+			ExitReason: "回测结束",
+		})
 	}
+	positions = nil // all closed above; avoid misleading "未平仓" display
 
-	totalReturn := (finalEquity - e.config.InitialCapital) / e.config.InitialCapital * 100
+	totalReturn := (capital - e.config.InitialCapital) / e.config.InitialCapital * 100
 
 	// 5. 计算统计指标
 	stats := e.calculateStats(trades, dailyEquity)
 
-	// 6. 打印结果
-	e.printResults(totalReturn, finalEquity, stats, trades, positions)
+	// 6. 打印结果（所有持仓已在步骤4平仓，capital 即最终权益）
+	e.printResults(totalReturn, capital, stats, trades, positions)
 
 	fmt.Printf("\n耗时: %d ms\n", time.Since(startTime).Milliseconds())
 
@@ -257,7 +276,7 @@ func (e *PortfolioEngine) getTradingDays() ([]string, error) {
 		days = append(days, date)
 	}
 
-	return days, nil
+	return days, rows.Err()
 }
 
 // getSignals 获取当日信号
@@ -288,15 +307,15 @@ func (e *PortfolioEngine) getPrice(code, date string) (float64, error) {
 }
 
 // countTradingDays 计算两个日期之间的交易日数
-func (e *PortfolioEngine) countTradingDays(from, to string) int {
+func (e *PortfolioEngine) countTradingDays(from, to string) (int, error) {
 	var count int
-	e.db.QueryRow(`
+	err := e.db.QueryRow(`
 		SELECT COUNT(DISTINCT trade_date)
 		FROM snapshot
 		WHERE trade_date > ? AND trade_date <= ?
 	`, from, to).Scan(&count)
 
-	return count
+	return count, err
 }
 
 // PortfolioStats 组合统计

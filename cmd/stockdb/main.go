@@ -278,7 +278,7 @@ func cmdBackfill(_ []string) error {
 }
 
 func cmdBacktest(args []string) error {
-	fs := flag.NewFlagSet("backtest", flag.ExitOnError)
+	fs := flag.NewFlagSet("backtest", flag.ContinueOnError)
 	startDate := fs.String("start", "2025-01-01", "开始日期 (YYYY-MM-DD)")
 	endDate := fs.String("end", time.Now().Format("2006-01-02"), "结束日期 (YYYY-MM-DD)")
 	signals := fs.String("signals", "all", "信号类型（逗号分隔，或 all）")
@@ -337,7 +337,7 @@ func cmdBacktest(args []string) error {
 }
 
 func cmdBacktestPortfolio(args []string) error {
-	fs := flag.NewFlagSet("backtest-portfolio", flag.ExitOnError)
+	fs := flag.NewFlagSet("backtest-portfolio", flag.ContinueOnError)
 	startDate := fs.String("start", "2025-01-01", "开始日期 (YYYY-MM-DD)")
 	endDate := fs.String("end", time.Now().Format("2006-01-02"), "结束日期 (YYYY-MM-DD)")
 	signals := fs.String("signals", "all", "信号类型（逗号分隔，或 all）")
@@ -438,7 +438,7 @@ func cmdHot(args []string) error {
 }
 
 func cmdScreen(args []string) error {
-	fs := flag.NewFlagSet("screen", flag.ExitOnError)
+	fs := flag.NewFlagSet("screen", flag.ContinueOnError)
 	holdings := fs.String("holdings", "", "持仓，格式：代码:成本:股数,... 如 sh601991:8.504:1300")
 	maxResults := fs.Int("max", 10, "持仓+候选总上限（默认10）")
 	capital := fs.Float64("capital", 0, "总资金（元）；提供时按单笔风险1%/止损距离输出候选建议仓位")

@@ -10,12 +10,15 @@ import (
 	"os"
 	"sort"
 	"strconv"
+	"time"
 
 	"stock-tui/internal/api"
 	"stock-tui/internal/indicator"
 	"stock-tui/internal/market"
 	"stock-tui/internal/store"
 )
+
+var httpClient = &http.Client{Timeout: 15 * time.Second}
 
 const defaultBars = 800
 
@@ -109,7 +112,7 @@ func fetchDailyKline(code string, bars int) (seriesData, error) {
 	}
 	req.Header.Set("User-Agent", "Mozilla/5.0")
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return seriesData{}, fmt.Errorf("fetch %s: %w", code, err)
 	}
@@ -118,7 +121,7 @@ func fetchDailyKline(code string, bars int) (seriesData, error) {
 		return seriesData{}, fmt.Errorf("fetch %s: HTTP %s", code, resp.Status)
 	}
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 10<<20))
 	if err != nil {
 		return seriesData{}, err
 	}
@@ -1533,7 +1536,11 @@ func rawString(raw json.RawMessage) string {
 }
 
 func rawFloat(raw json.RawMessage) float64 {
-	value, _ := strconv.ParseFloat(rawString(raw), 64)
+	s := rawString(raw)
+	value, err := strconv.ParseFloat(s, 64)
+	if err != nil && s != "" && s != "0" && s != "0.00" {
+		fmt.Fprintf(os.Stderr, "warn: rawFloat: %q -> 0\n", s)
+	}
 	return value
 }
 
@@ -1578,6 +1585,14 @@ func rangeLowHigh(candles []indicator.Candle, start, end int) (float64, float64)
 	}
 	if end > len(candles) {
 		end = len(candles)
+	}
+	if start >= end {
+		// Empty range — return last candle's values to avoid Inf→NaN.
+		if len(candles) > 0 {
+			last := candles[len(candles)-1]
+			return last.Low, last.High
+		}
+		return 0, 0
 	}
 	low, high := math.Inf(1), math.Inf(-1)
 	for i := start; i < end; i++ {

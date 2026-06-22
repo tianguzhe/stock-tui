@@ -3,7 +3,6 @@ package api
 import (
 	"fmt"
 	"io"
-	"net/http"
 	"regexp"
 	"strconv"
 	"strings"
@@ -41,7 +40,7 @@ func FetchStocks(codes []string) ([]Stock, error) {
 	if err != nil {
 		return nil, err
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("请求失败: %w", err)
 	}
@@ -50,7 +49,7 @@ func FetchStocks(codes []string) ([]Stock, error) {
 		return nil, err
 	}
 
-	reader := transform.NewReader(resp.Body, simplifiedchinese.GBK.NewDecoder())
+	reader := transform.NewReader(io.LimitReader(resp.Body, 10<<20), simplifiedchinese.GBK.NewDecoder())
 	body, err := io.ReadAll(reader)
 	if err != nil {
 		return nil, fmt.Errorf("解码失败: %w", err)

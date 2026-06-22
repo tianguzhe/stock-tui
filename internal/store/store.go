@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
 	"stock-tui/internal/market"
@@ -262,10 +263,14 @@ CREATE INDEX IF NOT EXISTS idx_decision_log_pending ON decision_log(outcome_pct)
 		"sar_value REAL",
 		"supertrend_value REAL",
 	} {
-		s.db.Exec("ALTER TABLE snapshot ADD COLUMN " + col) //nolint:errcheck
+		if _, err := s.db.Exec("ALTER TABLE snapshot ADD COLUMN " + col); err != nil && !isDuplicateColumnErr(err) {
+			return err
+		}
 	}
 	// Add hot_score to instrument table
-	s.db.Exec("ALTER TABLE instrument ADD COLUMN hot_score INTEGER NOT NULL DEFAULT 0") //nolint:errcheck
+	if _, err := s.db.Exec("ALTER TABLE instrument ADD COLUMN hot_score INTEGER NOT NULL DEFAULT 0"); err != nil && !isDuplicateColumnErr(err) {
+		return err
+	}
 
 	// Clear ret values that are all-zero but were written as Go zero-values before
 	// the nDayReturn computation existed. All three being exactly 0 is impossible
@@ -651,6 +656,12 @@ func boolToInt(b bool) int {
 	return 0
 }
 
+// isDuplicateColumnErr returns true if err indicates a "duplicate column" SQLite error
+// from ALTER TABLE ADD COLUMN, which is expected during idempotent migrations.
+func isDuplicateColumnErr(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "duplicate column name")
+}
+
 // UpdateRSRankings reads the ret20/ret60/ret120 from the latest cross-sectional snapshot
 // (same trade_date for all codes), computes percentile ranks (0–100), and writes them back
 // as rs20/rs60/rs120. Returns the number of codes successfully updated.
@@ -713,15 +724,18 @@ WHERE trade_date = ?
 	// Reuse the trade_date selected above instead of recomputing MAX(trade_date)
 	// per row: the SELECT already pinned each code to its latest snapshot.
 	updated := 0
+	var lastErr error
 	for i, e := range entries {
 		_, err := s.db.Exec(
 			`UPDATE snapshot SET rs20=?, rs60=?, rs120=? WHERE code=? AND trade_date=?`,
 			rank20[i], rank60[i], rank120[i], e.code, e.tradeDate)
-		if err == nil {
+		if err != nil {
+			lastErr = err
+		} else {
 			updated++
 		}
 	}
-	return updated, nil
+	return updated, lastErr
 }
 
 // Decision is one recommendation or hold record written by screen-stocks.
@@ -831,6 +845,9 @@ func (s *Store) CloseOnDate(code, tradeDate string) (float64, error) {
 // after startDate. Returns 0 and "" when the global date is missing, or when the
 // code has no snapshot on that exact target date.
 func (s *Store) CloseAfter(code, startDate string, n int) (float64, string, error) {
+	if n < 1 {
+		return 0, "", fmt.Errorf("CloseAfter: n must be >= 1, got %d", n)
+	}
 	var close float64
 	var tradeDate string
 	err := s.db.QueryRow(`

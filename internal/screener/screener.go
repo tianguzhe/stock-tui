@@ -14,6 +14,12 @@ const (
 	MinRSCoverage = 90.0 // RS20 覆盖率阈值（%）
 )
 
+// Compiled once; used by cdwnTopN, tdSafe, tdTopCount.
+var (
+	reCdwnTopN = regexp.MustCompile(`顶/(\d+)`)
+	reTopSetup = regexp.MustCompile(`见顶/(\d+)`)
+)
+
 // Tier represents stock rating levels.
 type Tier string
 
@@ -90,7 +96,8 @@ func WilsonBounds(winPct float64, n int) (lower, upper float64) {
 	if n == 0 {
 		return 0.0, 100.0
 	}
-	p := winPct / 100.0
+	// Clamp to [0,1] to avoid NaN from sqrt of negative value.
+	p := math.Max(0, math.Min(1, winPct/100.0))
 	denom := 1 + z*z/float64(n)
 	centre := p + z*z/(2*float64(n))
 	margin := z * math.Sqrt(p*(1-p)/float64(n)+z*z/(4*float64(n)*float64(n)))
@@ -165,8 +172,7 @@ func perfOK(c *Candidate) bool {
 
 // cdwnTopN extracts countdown top sequence count from "见顶/N" format.
 func cdwnTopN(tdCountdown string) int {
-	re := regexp.MustCompile(`顶/(\d+)`)
-	matches := re.FindStringSubmatch(tdCountdown)
+	matches := reCdwnTopN.FindStringSubmatch(tdCountdown)
 	if len(matches) > 1 {
 		n, _ := strconv.Atoi(matches[1])
 		return n
@@ -177,8 +183,7 @@ func cdwnTopN(tdCountdown string) int {
 // tdSafe checks TD safety: setup 见顶/8-9 or countdown 见顶/7-13 are high-risk zones.
 func tdSafe(c *Candidate) bool {
 	if strings.Contains(c.TDSetup, "见顶") {
-		re := regexp.MustCompile(`见顶/(\d+)`)
-		matches := re.FindStringSubmatch(c.TDSetup)
+		matches := reTopSetup.FindStringSubmatch(c.TDSetup)
 		if len(matches) > 1 {
 			n, _ := strconv.Atoi(matches[1])
 			if n >= 8 {
@@ -195,8 +200,7 @@ func tdSafe(c *Candidate) bool {
 
 // tdTopCount returns the highest TD top count (setup or countdown).
 func tdTopCount(c *Candidate) int {
-	re := regexp.MustCompile(`顶/(\d+)`)
-	if matches := re.FindStringSubmatch(c.TDSetup); len(matches) > 1 {
+	if matches := reTopSetup.FindStringSubmatch(c.TDSetup); len(matches) > 1 {
 		n, _ := strconv.Atoi(matches[1])
 		return n
 	}
