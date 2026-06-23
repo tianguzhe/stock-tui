@@ -26,7 +26,7 @@
 - **动量/超买超卖**:`WR` 与 `KDJ` 同源(都基于 close 在 N 日 high-low 区间的位置),**勿当两个独立证据**;`RSI`(涨跌幅)、`BIAS`(乖离)口径不同可印证;`MACD` 相对独立(趋势性动量)。
 - **波动/通道**:`ATR`/BOLL 带宽量波动幅度;`BOLL`(σ 带)、`Keltner`(ATR 带)、`Donchian`(极值带)是三类通道,BOLL vs Keltner 的对比正是 Squeeze 的意义。
 - **资金**:`MFI`(0–100 有界、超买超卖)与 OBV(累计、趋势)互补;量比看量能强度。**MFI 定性口径**：> 80 超买 / 70–80 偏高 / 20–30 偏低 / < 20 超卖。
-- **择时**:`TDSequential` 与斐波那契是独立口径,可与趋势/动量交叉印证。
+- **择时**:`TDSequential` 是独立口径,可与趋势/动量交叉印证。
 
 ## 分析输出口径
 - 描述行情/技术面时,**优先用 app 上能看到的量化指标和具体数值**,不要用"缩量/放量"这类模糊词——用户要能在 app 上对照确认。
@@ -72,7 +72,7 @@
 
 ## 技术面分析 CLI
 - 深度技术面分析优先用固定命令 `go run ./cmd/indicator-analyze <代码>`；不要再写一次性 `cmd/<name>/main.go`。
-- `indicator-analyze` 会拉腾讯日K、处理 `qfqday/day` 回退、复用 `indicator.Calculate` / `TDSequential` / `FibRetracementOf`，并输出 SCORE、DIVERGENCE、TD、FIB、PERF 与近15日演变。
+- `indicator-analyze` 会拉腾讯日K、处理 `qfqday/day` 回退、复用 `indicator.Calculate` / `TDSequential`，并输出 SCORE、DIVERGENCE、TD、PERF 与近15日演变。
 - 批量落库：`go build -o /tmp/ia ./cmd/indicator-analyze && sqlite3 data/stock.db "SELECT code FROM instrument;" | xargs -I{} /tmp/ia -save {}`（预编译避免 285 次重复编译，全池约 90 秒）
 - 多因子选股筛选：**已统一为 Go 实现**（类型安全、性能更优）
   - **推荐**：`go run ./cmd/stockdb screen --holdings 代码:成本:股数,...` 或快捷脚本 `./scripts/screen-stocks.sh --holdings ...`

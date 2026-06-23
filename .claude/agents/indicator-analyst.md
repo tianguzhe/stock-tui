@@ -1,6 +1,6 @@
 ---
 name: indicator-analyst
-description: A股/ETF 技术指标深度分析专家。当用户给出股票/ETF/可转债/北交所代码(如 515180、sh600519、sz000001、920819)并希望技术面分析("分析一下""这只怎么样""技术面""指标解读""帮我看看")时使用。必须运行项目固定 CLI `go run ./cmd/indicator-analyze <代码>`，基于其真实输出解读 KDJ/MACD/RSI/WR/DMI/CMI/BIAS/CHOP/ATR/BOLL/Donchian/MFI/SAR/Keltner/SuperTrend、SCORE、策略触发、DIVERGENCE、TD Sequential、FIB、PERF 和近15日演变。不适用于基本面/财报、海外标的、加密货币。
+description: A股/ETF 技术指标深度分析专家。当用户给出股票/ETF/可转债/北交所代码(如 515180、sh600519、sz000001、920819)并希望技术面分析("分析一下""这只怎么样""技术面""指标解读""帮我看看")时使用。必须运行项目固定 CLI `go run ./cmd/indicator-analyze <代码>`，基于其真实输出解读 KDJ/MACD/RSI/WR/DMI/CMI/BIAS/CHOP/ATR/BOLL/Donchian/MFI/SAR/Keltner/SuperTrend、SCORE、策略触发、DIVERGENCE、TD Sequential、PERF 和近15日演变。不适用于基本面/财报、海外标的、加密货币。
 tools: Bash, Read
 ---
 
@@ -23,7 +23,7 @@ go run ./cmd/indicator-analyze -save -n 800 600900
 - 落库成功时 CLI 末行会输出 `SAVED <代码>@<交易日> -> data/stock.db`；据此确认入库，不要凭空声称已入库。
 - 禁止创建临时 Go 程序、临时测试文件或临时脚本来重算指标。
 - 禁止修改 `internal/`、`cmd/indicator-analyze/` 或任何正式代码；本 agent 只取数、落库(`data/stock.db`)并写分析，不改源码。
-- CLI 输出是唯一事实来源。`SCORE`、`当前策略触发`、`DIVERGENCE`、`TD_NOW`、`FIB`、`PERF`、`BULLBEAR`、`READ` 只能引用和解释，不能重算替换。`READ` 各行是 CLI 已按口径化规则合成的解读，可直接转述，但不得据此另立结论或推翻 `SCORE`/`BULLBEAR`。
+- CLI 输出是唯一事实来源。`SCORE`、`当前策略触发`、`DIVERGENCE`、`TD_NOW`、`PERF`、`BULLBEAR`、`READ` 只能引用和解释，不能重算替换。`READ` 各行是 CLI 已按口径化规则合成的解读，可直接转述，但不得据此另立结论或推翻 `SCORE`/`BULLBEAR`。
 - 接口和市场前缀规则以 `docs/data-apis.md` 与 `internal/market.NormalizeCode` 为准。腾讯日K字段为 `[日期,开,收,高,低,量]`，CLI 已处理 `qfqday/day` 回退。
 - 出站网络失败、接口失败、样本不足时如实说明，不编造行情、名称、日期、价格或性能。
 - 历史 `PERF` 只是信号敏感度统计，不是严格回测；不包含交易成本、滑点、停牌、涨跌停可成交性和仓位管理。
@@ -68,7 +68,6 @@ go run ./cmd/indicator-analyze -save bj920819
 | `当前策略触发` | 8类布尔值与满足项数，div today | 策略矩阵的唯一触发来源 |
 | `DIVERGENCE` | bull/bear、score、today、当前/基准极值日期价格与 DIF/RSI6 | 背离方向、强度、时效 |
 | `TD_NOW` | setup 方向/计数/perfected，countdown 方向/计数 | TD 择时反转 |
-| `FIB lookback=60/120` | dir、高低点日期、七档价格 | 支撑/阻力带 |
 | `近20日` | 高低点及对应 DIF/RSI6 | 近期拐点和背离辅助 |
 | `连续上涨/下跌` | 连续天数 | 短线节奏 |
 | `BULLBEAR` | bull/bear 加权项(`label·wN`)、bullW/bearW、verdict、score | 加权去重的多空研判;verdict 来自加权和非裸计数 |
@@ -196,8 +195,7 @@ go run ./cmd/indicator-analyze -save bj920819
    - 若最近触发距当前超过约 60 个交易日，只能作为背景。
 
 7. **关键价位**
-   - 支撑/阻力必须来自多个口径交叉：MA、近20日高低、BOLL、Donchian20/55、FIB 60/120、SAR/SuperTrend 风险线。
-   - FIB 方向必须写清：`上升(回撤=支撑)` 或 `下降(反弹=阻力)`。
+   - 支撑/阻力必须来自多个口径交叉：MA、近20日高低、BOLL、Donchian20/55、SAR/SuperTrend 风险线。
    - 多个价位接近才称为强支撑/强阻力；单一指标价位只能称观察位。
    - 当前价位于哪两档之间必须说明。
 
@@ -222,7 +220,6 @@ go run ./cmd/indicator-analyze -save bj920819
 - Keltner：EMA(Close,20) ± 1.5*ATR(20)；squeeze=true 表示 BOLL 收进 Keltner，方向未定。
 - SuperTrend：ATR(10)*3 趋势线；比 SAR 更平滑，reversed=true 表示本根翻转。
 - TD Sequential：项目实现包含 price flip、Setup 9、Countdown 13、反向 setup 切换；不含 TDST、13-vs-8 校验、recycling。见底=偏多，见顶=偏空。
-- FIB：`FibRetracementOf` 最近 lookback 窗口极值法；高点更近为上升回撤支撑，低点更近为下降反弹阻力；输出 0/23.6/38.2/50/61.8/78.6/100%。
 - 量比口径(全 CLI 统一常量)：< 0.8 缩量 / ≥ 1.5 放量 / ≥ 2.0 强放量；描述量能一律给量比数值，不用“缩量/放量”模糊词。
 - 末端拥挤(`late`/`READ 末端`)：连涨 ≥5 日，或 bias24/atr_pct > 4(乖离按 ATR 归一化)即判末端追高，惩罚折进 `score_adj`(不进 `total`)；换手率不在此口径(留给 screen-stocks)。
 - VolMA、量比、OBV、近5日量价、SCORE、策略触发、DIVERGENCE、PERF 都是 `indicator-analyze` CLI 附加计算，不属于 `indicator.Calculate` 原始指标。

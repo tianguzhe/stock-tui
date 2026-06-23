@@ -447,50 +447,96 @@ type HotStockEntry struct {
 	Market string
 }
 
-// ImportHotStocks inserts new instruments from the THS hot list.
-// Uses INSERT OR IGNORE: existing instruments are never modified, matching the
-// original Python import-hot-stocks.py behavior.
+// HotImportResult reports the outcome of a hot-list import.
+type HotImportResult struct {
+	Imported  int  // newly inserted instruments
+	Refreshed int  // pre-existing rows on today's list reset to hot_score=9
+	Pruned    int  // off-list rows deleted after fully decaying to 0
+	Decayed   bool // true if the once-per-day decay step ran on this call
+}
+
+// ImportHotStocks imports the THS hot list, maintaining a per-day hot_score
+// decay so off-list stocks age out (-1/day, pruned at 0). Matches the original
+// scripts/import-hot-stocks.py behavior:
+//  1. Once per calendar day (gated by metadata.last_hot_decay): prune hot_score=0
+//     rows, decrement every remaining row by 1 (clamped at 0).
+//  2. INSERT OR IGNORE today's stocks at hot_score=9 (existing rows untouched).
+//  3. Reset every stock on today's list (new + pre-existing) to hot_score=9.
 //
-// Returns the number of newly inserted instruments.
-func (s *Store) ImportHotStocks(stocks []HotStockEntry) (int, error) {
-	before, err := s.instrumentCount()
-	if err != nil {
-		return 0, err
-	}
+// Idempotent within the same calendar day: a second call skips the decay step.
+func (s *Store) ImportHotStocks(stocks []HotStockEntry) (HotImportResult, error) {
+	var res HotImportResult
+	today := time.Now().Format("2006-01-02")
 
 	tx, err := s.db.Begin()
 	if err != nil {
-		return 0, err
+		return res, err
 	}
 	defer tx.Rollback()
 
-	now := time.Now().Format(time.RFC3339)
-	for _, st := range stocks {
+	// Step 1: per-day decay (idempotent within the same calendar day).
+	var lastDecay string
+	err = tx.QueryRow(`SELECT value FROM metadata WHERE key = 'last_hot_decay'`).Scan(&lastDecay)
+	if err != nil && err != sql.ErrNoRows {
+		return res, fmt.Errorf("read last_hot_decay: %w", err)
+	}
+	if lastDecay != today {
+		res.Decayed = true
+		pr, err := tx.Exec(`DELETE FROM instrument WHERE hot_score = 0`)
+		if err != nil {
+			return res, fmt.Errorf("prune cold hot-score instruments: %w", err)
+		}
+		if n, err := pr.RowsAffected(); err == nil {
+			res.Pruned = int(n)
+		}
+		if _, err := tx.Exec(`UPDATE instrument SET hot_score = MAX(0, hot_score - 1)`); err != nil {
+			return res, fmt.Errorf("decay hot_score: %w", err)
+		}
 		if _, err := tx.Exec(`
-INSERT OR IGNORE INTO instrument (code, name, market, note, created_at)
-VALUES (?, ?, ?, '', ?)`,
-			st.Code, st.Name, st.Market, now); err != nil {
-			return 0, fmt.Errorf("insert %s: %w", st.Code, err)
+INSERT INTO metadata (key, value) VALUES ('last_hot_decay', ?)
+ON CONFLICT(key) DO UPDATE SET value = excluded.value`, today); err != nil {
+			return res, fmt.Errorf("write last_hot_decay: %w", err)
 		}
 	}
 
+	// Step 2 & 3: insert new rows at hot_score=9, then reset all of today's
+	// listed (including pre-existing) to 9. INSERT OR IGNORE keeps existing
+	// name/market/note untouched; the UPDATE only touches hot_score.
+	now := time.Now().Format(time.RFC3339)
+	hotCodes := make([]string, 0, len(stocks))
+	for _, st := range stocks {
+		r, err := tx.Exec(`
+INSERT OR IGNORE INTO instrument (code, name, market, note, created_at, hot_score)
+VALUES (?, ?, ?, '', ?, 9)`,
+			st.Code, st.Name, st.Market, now)
+		if err != nil {
+			return res, fmt.Errorf("insert %s: %w", st.Code, err)
+		}
+		if n, err := r.RowsAffected(); err == nil {
+			res.Imported += int(n)
+		}
+		hotCodes = append(hotCodes, st.Code)
+	}
+	if len(hotCodes) > 0 {
+		placeholders := strings.Repeat("?,", len(hotCodes))
+		placeholders = placeholders[:len(placeholders)-1]
+		args := make([]any, len(hotCodes))
+		for i, c := range hotCodes {
+			args[i] = c
+		}
+		if _, err := tx.Exec(
+			`UPDATE instrument SET hot_score = 9 WHERE code IN (`+placeholders+`)`,
+			args...); err != nil {
+			return res, fmt.Errorf("reset today's hot_score: %w", err)
+		}
+	}
+	// Pre-existing rows reset to 9 (already-existing on the list, not newly inserted).
+	res.Refreshed = len(stocks) - res.Imported
+
 	if err := tx.Commit(); err != nil {
-		return 0, err
+		return res, err
 	}
-
-	after, err := s.instrumentCount()
-	if err != nil {
-		return 0, err
-	}
-	return after - before, nil
-}
-
-func (s *Store) instrumentCount() (int, error) {
-	var n int
-	if err := s.db.QueryRow(`SELECT COUNT(*) FROM instrument`).Scan(&n); err != nil {
-		return 0, err
-	}
-	return n, nil
+	return res, nil
 }
 
 // SaveSnapshot upserts s, keyed by (code, trade_date): re-analyzing the same

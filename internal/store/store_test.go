@@ -390,45 +390,57 @@ func TestImportHotStocksInsertIgnore(t *testing.T) {
 		{Code: "sh600519", Name: "贵州茅台", Market: "sh"},
 		{Code: "sz000001", Name: "平安银行", Market: "sz"},
 	}
-	inserted, err := s.ImportHotStocks(entries)
+	res, err := s.ImportHotStocks(entries)
 	if err != nil {
 		t.Fatalf("ImportHotStocks: %v", err)
 	}
-	if inserted != 2 {
-		t.Errorf("inserted = %d, want 2", inserted)
+	if res.Imported != 2 {
+		t.Errorf("Imported = %d, want 2", res.Imported)
 	}
 
-	// Verify the new stock was created.
+	// Verify the new stock was created with hot_score=9 (today's hot list).
 	var name string
-	if err := s.db.QueryRow(`SELECT name FROM instrument WHERE code = 'sz000001'`).Scan(&name); err != nil {
+	var hot int
+	if err := s.db.QueryRow(`SELECT name, hot_score FROM instrument WHERE code = 'sz000001'`).Scan(&name, &hot); err != nil {
 		t.Fatalf("query new: %v", err)
 	}
 	if name != "平安银行" {
 		t.Errorf("sz000001 name = %q, want 平安银行", name)
+	}
+	if hot != 9 {
+		t.Errorf("sz000001 hot_score = %d, want 9 (today's hot list)", hot)
 	}
 }
 
 func TestImportHotStocksIgnoresExisting(t *testing.T) {
 	s := openTemp(t)
 
-	// Seed one pre-existing instrument with a custom name.
+	// Seed one pre-existing instrument with a custom name. Set hot_score=9 so it
+	// looks like yesterday's hot-list entry rather than a fully-decayed cold row
+	// (which the decay step would prune before the INSERT OR IGNORE runs).
 	if err := s.UpsertInstrument("sh600519", "茅台", "sh", "custom"); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
+	if _, err := s.db.Exec(`UPDATE instrument SET hot_score = 9 WHERE code = 'sh600519'`); err != nil {
+		t.Fatalf("seed hot_score: %v", err)
+	}
 
 	// Import the same code with a different name — INSERT OR IGNORE must not overwrite.
-	inserted, err := s.ImportHotStocks([]HotStockEntry{
+	res, err := s.ImportHotStocks([]HotStockEntry{
 		{Code: "sh600519", Name: "贵州茅台", Market: "sh"},
 		{Code: "sz000001", Name: "平安银行", Market: "sz"},
 	})
 	if err != nil {
 		t.Fatalf("ImportHotStocks: %v", err)
 	}
-	if inserted != 1 {
-		t.Errorf("inserted = %d, want 1 (only sz000001 is new)", inserted)
+	if res.Imported != 1 {
+		t.Errorf("Imported = %d, want 1 (only sz000001 is new)", res.Imported)
+	}
+	if res.Refreshed != 1 {
+		t.Errorf("Refreshed = %d, want 1 (sh600519 reset to 9)", res.Refreshed)
 	}
 
-	// Verify the existing stock's name was NOT overwritten.
+	// Verify the existing stock's name/note were NOT overwritten.
 	var name, note string
 	if err := s.db.QueryRow(`SELECT name, note FROM instrument WHERE code = 'sh600519'`).Scan(&name, &note); err != nil {
 		t.Fatalf("query existing: %v", err)
@@ -438,5 +450,98 @@ func TestImportHotStocksIgnoresExisting(t *testing.T) {
 	}
 	if note != "custom" {
 		t.Errorf("sh600519 note = %q, want custom (should be untouched)", note)
+	}
+}
+
+func TestImportHotStocksDecay(t *testing.T) {
+	s := openTemp(t)
+
+	// Seed instruments mimicking various decay stages. None are on today's list,
+	// so they should all decrement by 1 and the score=0 row should be pruned.
+	seed := []struct {
+		code string
+		hot  int
+	}{
+		{"sh600001", 9},
+		{"sh600002", 5},
+		{"sh600003", 1},
+		{"sh600004", 0}, // pruned by decay
+	}
+	for _, r := range seed {
+		if err := s.UpsertInstrument(r.code, r.code, "sh", ""); err != nil {
+			t.Fatalf("seed %s: %v", r.code, err)
+		}
+		if _, err := s.db.Exec(`UPDATE instrument SET hot_score = ? WHERE code = ?`, r.hot, r.code); err != nil {
+			t.Fatalf("seed hot_score %s: %v", r.code, err)
+		}
+	}
+
+	// Import an empty list so no stocks get inserted/reset — only the decay step runs.
+	res, err := s.ImportHotStocks(nil)
+	if err != nil {
+		t.Fatalf("ImportHotStocks: %v", err)
+	}
+	if !res.Decayed {
+		t.Error("Decayed = false, want true (first call of the day)")
+	}
+	if res.Pruned != 1 {
+		t.Errorf("Pruned = %d, want 1 (the hot_score=0 row)", res.Pruned)
+	}
+	if res.Imported != 0 {
+		t.Errorf("Imported = %d, want 0", res.Imported)
+	}
+
+	// Remaining rows should all have decremented by 1.
+	for _, r := range seed {
+		if r.hot == 0 {
+			continue
+		}
+		var got int
+		if err := s.db.QueryRow(`SELECT hot_score FROM instrument WHERE code = ?`, r.code).Scan(&got); err != nil {
+			t.Fatalf("query %s: %v", r.code, err)
+		}
+		want := r.hot - 1
+		if got != want {
+			t.Errorf("%s hot_score = %d, want %d", r.code, got, want)
+		}
+	}
+	var remaining int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM instrument`).Scan(&remaining); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if remaining != len(seed)-1 {
+		t.Errorf("remaining rows = %d, want %d", remaining, len(seed)-1)
+	}
+}
+
+func TestImportHotStocksIdempotentSameDay(t *testing.T) {
+	s := openTemp(t)
+
+	// Seed one off-list row at hot_score=3.
+	if err := s.UpsertInstrument("sh600001", "x", "sh", ""); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if _, err := s.db.Exec(`UPDATE instrument SET hot_score = 3 WHERE code = 'sh600001'`); err != nil {
+		t.Fatalf("seed hot_score: %v", err)
+	}
+
+	// First call: decay runs -> hot_score becomes 2.
+	if _, err := s.ImportHotStocks(nil); err != nil {
+		t.Fatalf("first import: %v", err)
+	}
+	// Second call same day: decay must NOT run again.
+	res, err := s.ImportHotStocks(nil)
+	if err != nil {
+		t.Fatalf("second import: %v", err)
+	}
+	if res.Decayed {
+		t.Error("Decayed = true on second same-day call, want false")
+	}
+	var got int
+	if err := s.db.QueryRow(`SELECT hot_score FROM instrument WHERE code = 'sh600001'`).Scan(&got); err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	if got != 2 {
+		t.Errorf("hot_score = %d after second call, want 2 (no double decay)", got)
 	}
 }

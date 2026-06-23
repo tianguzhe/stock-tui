@@ -255,8 +255,6 @@ func printAnalysis(data seriesData) store.Snapshot {
 		div.Bull, div.BullScore, div.BullToday, div.Bear, div.BearScore, div.BearToday) // score /1
 	printDivergence(div, dates, candles, results)
 	printTD(tds[n-1])
-	printFib(candles, dates, 60)
-	printFib(candles, dates, 120)
 	printRecentExtremes(candles, dates, results)
 	printStreak(candles)
 	verdict := evalBullBear(candles, results, tds, obv, div, perfs, volRatio)
@@ -1042,20 +1040,6 @@ func printTD(td indicator.TD) {
 	}
 	fmt.Printf("TD_NOW setup=%s/%d%s countdown=%s/%d\n",
 		tdSignalText(td.SetupSignal), td.SetupCount, tdPerf, tdSignalText(td.CountdownSignal), td.CountdownCount)
-}
-
-func printFib(candles []indicator.Candle, dates []string, lookback int) {
-	fib := indicator.FibRetracementOf(candles, lookback)
-	dir := "上升(回撤=支撑)"
-	if !fib.Uptrend {
-		dir = "下降(反弹=阻力)"
-	}
-	fmt.Printf("FIB lookback=%d dir=%s high=%.3f(%s) low=%.3f(%s)",
-		lookback, dir, fib.High, dates[fib.HighIndex], fib.Low, dates[fib.LowIndex])
-	for _, level := range fib.Levels {
-		fmt.Printf(" %.1f%%=%.3f", level.Ratio*100, level.Price)
-	}
-	fmt.Println()
 }
 
 func printRecentExtremes(candles []indicator.Candle, dates []string, results []indicator.Result) {

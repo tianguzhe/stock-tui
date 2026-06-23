@@ -420,13 +420,17 @@ func cmdHot(args []string) error {
 		}
 	}
 
-	inserted, err := st.ImportHotStocks(entries)
+	res, err := st.ImportHotStocks(entries)
 	if err != nil {
 		return fmt.Errorf("hot: %w", err)
 	}
 
-	fmt.Printf("热榜共 %d 只，大盘主板 %d 只，新增入库 %d 只\n",
-		len(stocks), len(entries), inserted)
+	fmt.Printf("热榜共 %d 只，大盘主板 %d 只，新增入库 %d 只，热度更新 %d 只",
+		len(stocks), len(entries), res.Imported, res.Refreshed)
+	if res.Decayed {
+		fmt.Printf("，清理冷门 %d 只", res.Pruned)
+	}
+	fmt.Println()
 	for i, s := range stocks {
 		if i >= 10 {
 			fmt.Printf("  ...（及另外 %d 只）\n", len(stocks)-10)
