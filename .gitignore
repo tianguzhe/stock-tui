@@ -30,5 +30,4 @@ stockdb
 .ace-tool/
 
 # 临时分析数据
-analysis/
 *.test
