@@ -444,7 +444,7 @@ func cmdHot(args []string) error {
 func cmdScreen(args []string) error {
 	fs := flag.NewFlagSet("screen", flag.ContinueOnError)
 	holdings := fs.String("holdings", "", "持仓，格式：代码:成本:股数,... 如 sh601991:8.504:1300")
-	maxResults := fs.Int("max", 10, "持仓+候选总上限（默认10）")
+	maxResults := fs.Int("max", 0, "持仓+候选总上限（默认：持仓数+7）")
 	capital := fs.Float64("capital", 0, "总资金（元）；提供时按单笔风险1%/止损距离输出候选建议仓位")
 	dryRun := fs.Bool("dry-run", false, "仅输出不写入decision_log")
 
@@ -452,5 +452,15 @@ func cmdScreen(args []string) error {
 		return err
 	}
 
-	return runScreen(*holdings, *maxResults, *capital, *dryRun)
+	// 默认值：持仓数 + 7 个候选
+	max := *maxResults
+	if max == 0 {
+		holdingsList, err := parseHoldings(*holdings)
+		if err != nil {
+			return err
+		}
+		max = len(holdingsList) + 7
+	}
+
+	return runScreen(*holdings, max, *capital, *dryRun)
 }

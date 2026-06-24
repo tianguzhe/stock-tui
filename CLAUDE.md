@@ -8,7 +8,7 @@
 - `internal/store` — SQLite 存储层（snapshot/decision_log/instrument）
 - `scripts/` — 每日更新/选股/日志生成/测试脚本
 - `docs/journal/` — 每日复盘日志
-- `docs/holdings-monitor/` — 持仓监控文档
+- `docs/holdings-monitor/` — 持仓监控文档（含候选观察状态）
 
 ## 行情数据
 - 拉行情/K线前先查 `docs/data-apis.md`(腾讯/东财/新浪接口、OHLC 字段顺序、`sh`/`sz` 前缀、`Candle` 映射都已记录)。
@@ -57,6 +57,7 @@
 ## 持仓格式与浮盈计算
 - 用户描述持仓时用 `成本价*股数`（如 `8.504*1300`）；浮盈 = (今收 - 成本) × 股数。
 - 脚本参数格式：`代码:成本:股数`（如 `sh601991:8.504:1300`）。
+- 更新持仓时用 `股数*成本价` 格式（如 `200*46.212`），注意顺序与脚本参数相反。
 
 ## PERF 历史驱动的信号权重（核心方法论）
 - 推荐/评估标的前，**先查该股自身 PERF 历史**，不用同一把尺子量所有股：
@@ -78,6 +79,7 @@
   - **推荐**：`go run ./cmd/stockdb screen --holdings 代码:成本:股数,...` 或快捷脚本 `./scripts/screen-stocks.sh --holdings ...`
   - 旧版 Python `scripts/screen-stocks.py` 已弃用（保留作参考实现）
   - 示例：`go run ./cmd/stockdb screen --holdings sh601991:8.504:1300,sh603256:193.752:100 --max 10 --capital 68000`
+  - `--max` 默认值为**持仓数+7**（动态计算），可手动指定固定上限
   - `--dry-run` 临时查询不写 decision_log（正式落库每日一次即可）；`--capital 68000` 输出候选建议仓位（单笔风险1%/止损距离）
   - 持仓须先 `-save` 落库，否则显示"无快照数据"
 
@@ -133,7 +135,8 @@
 ```bash
 # 1. 收盘后批量更新快照（含换手率/市值/PE；预编译二进制，全池约90秒）
 go build -o /tmp/ia ./cmd/indicator-analyze && sqlite3 data/stock.db \
-  "SELECT code FROM instrument;" | xargs -I{} /tmp/ia -save {}
+  "SELECT code FROM instrument;" | xargs -I{} -P 1 /tmp/ia -save {}
+# ⚠️ 注意：-P 4 并发会导致 SQLITE_BUSY 错误，建议用 -P 1
 
 # 2. 计算 RS 相对强度百分位排名（横截面 ret20 排名，全量落库当日即有效）
 go run ./cmd/stockdb rs-rank
