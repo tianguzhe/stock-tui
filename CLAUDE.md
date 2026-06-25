@@ -55,9 +55,8 @@
 - 后续若要添加多个关键百分比标示线,按从背景到前景排序:百分比线/昨收线/开盘线在前,价格线永远最后;测试应断言价格 series 为连续原始价格序列。
 
 ## 持仓格式与浮盈计算
-- 用户描述持仓时用 `成本价*股数`（如 `8.504*1300`）；浮盈 = (今收 - 成本) × 股数。
-- 脚本参数格式：`代码:成本:股数`（如 `sh601991:8.504:1300`）。
-- 更新持仓时用 `股数*成本价` 格式（如 `200*46.212`），注意顺序与脚本参数相反。
+- 持仓以**手(1手=100股)**为最小单位。`.holdings` 文件格式：`代码:成本:手数`（如 `sh601138:65.490:2`）。
+- 浮盈 = (今收 - 成本) × 手数 × 100。
 
 ## PERF 历史驱动的信号权重（核心方法论）
 - 推荐/评估标的前，**先查该股自身 PERF 历史**，不用同一把尺子量所有股：
@@ -76,9 +75,9 @@
 - `indicator-analyze` 会拉腾讯日K、处理 `qfqday/day` 回退、复用 `indicator.Calculate` / `TDSequential`，并输出 SCORE、DIVERGENCE、TD、PERF 与近15日演变。
 - 批量落库：`go build -o /tmp/ia ./cmd/indicator-analyze && sqlite3 data/stock.db "SELECT code FROM instrument;" | xargs -I{} /tmp/ia -save {}`（预编译避免 285 次重复编译，全池约 90 秒）
 - 多因子选股筛选：**已统一为 Go 实现**（类型安全、性能更优）
-  - **推荐**：`go run ./cmd/stockdb screen --holdings 代码:成本:股数,...` 或快捷脚本 `./scripts/screen-stocks.sh --holdings ...`
+  - **推荐**：`go run ./cmd/stockdb screen --holdings 代码:成本:手数,...` 或快捷脚本 `./scripts/screen-stocks.sh --holdings ...`
   - 旧版 Python `scripts/screen-stocks.py` 已弃用（保留作参考实现）
-  - 示例：`go run ./cmd/stockdb screen --holdings sh601991:8.504:1300,sh603256:193.752:100 --max 10 --capital 68000`
+  - 示例：`go run ./cmd/stockdb screen --holdings sh601138:65.490:2,sh600522:25.008:1 --max 10 --capital 68000`
   - `--max` 默认值为**持仓数+7**（动态计算），可手动指定固定上限
   - `--dry-run` 临时查询不写 decision_log（正式落库每日一次即可）；`--capital 68000` 输出候选建议仓位（单笔风险1%/止损距离）
   - 持仓须先 `-save` 落库，否则显示"无快照数据"
@@ -123,7 +122,7 @@
 | 章节 | 内容 | 填写时机 |
 |------|------|---------|
 | 一、昨日复盘 | 预判对比表（自动回填）、止损触发、小结 | 开盘前 |
-| 二、持仓 | 持仓快照表（成本/股数/浮盈/score/TD/ADX/SAR/OBV）+ 每只2行关键信号 | 收盘后 |
+| 二、持仓 | 持仓快照表（成本/手数/浮盈/score/TD/ADX/SAR/OBV）+ 每只2行关键信号 | 收盘后 |
 | 三、明日预判 & 计划 | 预判方向 + 操作触发条件 + 止损，合一张表 | 收盘后 |
 | 四、候补 & 推荐 | 候补入场条件 + 持仓置顶的选股表（`screen-stocks.sh` 生成）| 收盘后 |
 
@@ -146,7 +145,7 @@ go run ./cmd/stockdb backfill
 
 # 4. 生成选股表（持仓置顶 + 优质候选，合计≤10只）
 ./scripts/screen-stocks.sh \
-  --holdings <代码:成本:股数,...>
+  --holdings <代码:成本:手数,...>
 
 # 5. 生成次日日志模板（含昨日预判自动回填）
 ./scripts/gen-journal.sh
