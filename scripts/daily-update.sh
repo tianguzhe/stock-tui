@@ -2,6 +2,7 @@
 # 每日收盘后数据更新脚本
 # 用途：更新热榜、批量保存快照、更新RS排名、回填决策结果
 # 时间：每个交易日收盘后执行（建议 15:30 或之后）
+# ⚠️ 流程顺序不可调整：热榜必须第一步执行
 
 set -e  # 遇到错误立即退出
 
@@ -14,9 +15,12 @@ echo "时间: $(date '+%Y-%m-%d %H:%M:%S')"
 echo "项目: $PROJECT_ROOT"
 echo ""
 
-# 1. 更新同花顺热榜（确保 instrument 表在批量 -save 前已更新）
+# 0. 【必须第一步】更新同花顺热榜（确保 instrument 表在批量 -save 前已更新）
 echo "=== 1/5 更新同花顺热榜 ==="
-go run ./cmd/stockdb hot
+if ! go run ./cmd/stockdb hot; then
+  echo "❌ 热榜更新失败，请检查网络连接"
+  exit 1
+fi
 echo ""
 
 # 2. 批量保存快照数据
@@ -28,11 +32,12 @@ echo "获取股票列表..."
 STOCK_COUNT=$(sqlite3 data/stock.db "SELECT COUNT(*) FROM instrument;")
 echo "共 $STOCK_COUNT 只股票"
 
-echo "开始批量保存（预计耗时 60-120 秒）..."
+echo "开始批量保存（预计耗时 90-150 秒）..."
 START_TIME=$(date +%s)
 
+# ⚠️ -P 4 会导致 SQLITE_BUSY 错误，使用 -P 1 串行执行
 sqlite3 data/stock.db "SELECT code FROM instrument;" | \
-  xargs -I{} -P 4 /tmp/ia -save {}
+  xargs -I{} -P 1 /tmp/ia -save {}
 
 END_TIME=$(date +%s)
 DURATION=$((END_TIME - START_TIME))

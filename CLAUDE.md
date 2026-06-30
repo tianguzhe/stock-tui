@@ -132,10 +132,13 @@
 
 **每日工作流**：
 ```bash
+# 0. 【必须第一步】更新同花顺热榜（确保 instrument 表在批量 -save 前已更新）
+./scripts/import-hot-stocks.sh
+
 # 1. 收盘后批量更新快照（含换手率/市值/PE；预编译二进制，全池约90秒）
 go build -o /tmp/ia ./cmd/indicator-analyze && sqlite3 data/stock.db \
   "SELECT code FROM instrument;" | xargs -I{} -P 1 /tmp/ia -save {}
-# ⚠️ 注意：-P 4 并发会导致 SQLITE_BUSY 错误，建议用 -P 1
+# ⚠️ 注意：-P 4 并发会导致 SQLITE_BUSY 错误，必须用 -P 1
 
 # 2. 计算 RS 相对强度百分位排名（横截面 ret20 排名，全量落库当日即有效）
 go run ./cmd/stockdb rs-rank
@@ -152,6 +155,8 @@ go run ./cmd/stockdb backfill
 
 # 6. 填写日志：二、持仓 → 三、明日预判 → 四、候补&推荐（贴步骤4输出）
 ```
+
+**⚠️ 流程顺序不可调整**：热榜必须第一步执行，否则后续批量保存的股票池不完整。
 
 **日志字段速查**：
 - `TD`：优先显示 countdown，无则显示 setup；snapshot 落库格式均为 `见顶/N`/`见底/N`（CLI 近15日行才用 `C顶N` 短格式）；setup `见顶/8` 次日警惕进入 countdown
