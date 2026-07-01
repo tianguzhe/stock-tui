@@ -14,12 +14,25 @@ import (
 	"github.com/guptarohit/asciigraph"
 )
 
+// tickObserver 是仅供测试使用的调度/处理观察回调。
+// 生产环境为 nil，每次 tick 仅多一次 nil 检查。
+// 测试可通过 tickObserver = func(kind string){...} 注入计数。
+var tickObserver func(kind string)
+
+const (
+	tickObsSchedule = "schedule" // tick() 调度
+	tickObsProcess  = "process"  // tickMsg 被处理
+)
+
 // ── 样式 ──────────────────────────────────────────────────────────────────────
 
 var (
-	red   = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
-	green = lipgloss.NewStyle().Foreground(lipgloss.Color("46"))
-	dim   = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
+	red   = lipgloss.NewStyle().Foreground(lipgloss.Color("#f38ba8")) // Catppuccin Mocha red
+	green = lipgloss.NewStyle().Foreground(lipgloss.Color("#a6e3a1")) // Catppuccin Mocha green
+	dim   = lipgloss.NewStyle().Foreground(lipgloss.Color("#6c7086")) // Catppuccin Mocha overlay0 / dim gray
+
+	subtextStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#a6adc8")) // Catppuccin Mocha subtext0
+	mauveStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("#cba6f7")) // Catppuccin Mocha mauve
 
 	headerStyle = lipgloss.NewStyle().
 			Bold(true).
@@ -71,9 +84,15 @@ var bossCols = []tableColumn{
 	{"COMMAND", 7, lipgloss.Left},
 }
 
+// simple 模式下 sys 标签池（按股票在列表中的位置循环取，纯粹脱敏风格化）
+var simpleSysLabels = []string{
+	"CPU", "GPU", "NETWORK", "MEMORY", "DISK",
+	"PROC", "IO", "CACHE", "KERNEL", "SHELL",
+}
+
 // ── 消息 ─────────────────────────────────────────────────────────────────────
 
-type tickMsg time.Time
+type tickMsg struct{}
 type stocksMsg []api.Stock
 type stocksErrMsg struct{ err error }
 type minuteMsg struct {
@@ -104,15 +123,19 @@ type Model struct {
 	loadingChart bool
 	chartErr     error
 	bossMode     bool
+	simpleMode   bool
+	labelMode    string
 }
 
-func New(codes []string, interval time.Duration, bossMode bool) Model {
+func New(codes []string, interval time.Duration, bossMode, simpleMode bool) Model {
 	return Model{
 		codes:       codes,
 		loading:     true,
 		interval:    interval,
 		autoRefresh: true,
 		bossMode:    bossMode,
+		simpleMode:  simpleMode,
+		labelMode:   "sys",
 		startedAt:   time.Now(),
 	}
 }
@@ -181,12 +204,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.height = msg.Height
 
 	case tickMsg:
-		// 自动刷新关闭时丢弃 tick，不再续期
+		if tickObserver != nil {
+			tickObserver(tickObsProcess)
+		}
+		// 自维持调度：始终续期下一拍，autoRefresh 只决定是否 fetch。
+		// 这样 r 切换不会叠加多个 tick。
+		next := tick(m.interval)
 		if !m.autoRefresh {
-			return m, nil
+			return m, next
 		}
 		m.loading = true
-		return m, tea.Batch(fetchStocks(m.codes), tick(m.interval))
+		return m, tea.Batch(fetchStocks(m.codes), next)
 
 	case stocksMsg:
 		m.stocks = []api.Stock(msg)
@@ -194,6 +222,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.loading = false
 		m.err = nil
 		m.updated = time.Now()
+		// simple 模式没有选中行，跳过分时拉取
+		if m.simpleMode {
+			return m, nil
+		}
 		// 刷新选中股票的分时数据
 		return m, m.startSelectedMinuteFetch()
 
@@ -223,13 +255,33 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "r":
 			m.autoRefresh = !m.autoRefresh
 			if m.autoRefresh {
-				// 开启时立即刷新并重启 tick 循环
+				// 重新开启时立即拉一次数据；tick 调度由自维持的 tickMsg 处理器负责
 				m.loading = true
-				return m, tea.Batch(fetchStocks(m.codes), m.startSelectedMinuteFetch(), tick(m.interval))
+				batch := []tea.Cmd{fetchStocks(m.codes)}
+				if !m.simpleMode {
+					batch = append(batch, m.startSelectedMinuteFetch())
+				}
+				return m, tea.Batch(batch...)
+			}
+			return m, nil
+		case "b":
+			if !m.simpleMode {
+				return m, nil
+			}
+			if m.labelMode == "name" {
+				m.labelMode = "sys"
+			} else {
+				m.labelMode = "name"
 			}
 		case "up", "k":
+			if m.simpleMode {
+				return m, nil
+			}
 			return m, m.moveSelection(-1)
 		case "down", "j":
+			if m.simpleMode {
+				return m, nil
+			}
 			return m, m.moveSelection(1)
 		}
 	}
@@ -240,6 +292,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m Model) View() string {
 	if m.width == 0 {
 		return "正在加载..."
+	}
+	if m.simpleMode {
+		return m.renderSimpleView()
 	}
 	if m.bossMode {
 		return m.renderBossView()
@@ -291,6 +346,113 @@ func (m Model) renderBossView() string {
 	sb.WriteString(dim.Render("  F1 Help  F2 Setup  F3 Search  F5 Tree  r Refresh  q Quit"))
 
 	return sb.String()
+}
+
+// ── Simple 模式 ──────────────────────────────────────────────────────────────
+
+func (m Model) renderSimpleView() string {
+	var sb strings.Builder
+
+	sb.WriteString(m.renderSimpleStatus() + "\n")
+
+	if m.err != nil {
+		sb.WriteString(red.Render("✗ "+m.err.Error()) + "\n")
+	}
+
+	if m.loading && len(m.stocks) == 0 {
+		sb.WriteString(dim.Render("正在加载...") + "\n")
+	} else {
+		sb.WriteString(m.renderSimpleStockLines() + "\n")
+	}
+
+	sb.WriteString(m.renderSimpleHelp())
+
+	return sb.String()
+}
+
+func (m Model) renderSimpleStatus() string {
+	updatedText := "正在刷新..."
+	if !m.loading && !m.updated.IsZero() {
+		updatedText = "updated " + m.updated.Format("15:04:05")
+	}
+	autoLabel := "auto:on"
+	if !m.autoRefresh {
+		autoLabel = "auto:off"
+	}
+	return dim.Render(updatedText) + "  " + dim.Render(autoLabel)
+}
+
+func (m Model) renderSimpleHelp() string {
+	parts := []string{
+		dim.Render("[") + mauveStyle.Render("b") + dim.Render("]") + " " + subtextStyle.Render("labels"),
+		dim.Render("[") + mauveStyle.Render("r") + dim.Render("]") + " " + subtextStyle.Render("refresh"),
+		dim.Render("[") + mauveStyle.Render("q") + dim.Render("]") + " " + subtextStyle.Render("quit"),
+	}
+	return strings.Join(parts, "  ")
+}
+
+// renderSimpleStockLines 把所有股票按终端宽度自动换行，输出多行（不含末尾换行）。
+func (m Model) renderSimpleStockLines() string {
+	if len(m.stocks) == 0 {
+		return ""
+	}
+	sep := "     " // item 间固定 5 空格
+	sepW := lipgloss.Width(sep)
+	budget := max(1, m.width-2) // 留 2 列边距
+
+	var lines []string
+	var line strings.Builder
+	used := 0
+	for i, stock := range m.stocks {
+		item := m.renderSimpleItem(stock, i)
+		iw := lipgloss.Width(item)
+		need := iw
+		if used > 0 {
+			need += sepW
+		}
+		if used > 0 && used+need > budget {
+			lines = append(lines, line.String())
+			line.Reset()
+			used = 0
+		}
+		if used > 0 {
+			line.WriteString(sep)
+		}
+		line.WriteString(item)
+		used += need
+	}
+	if line.Len() > 0 {
+		lines = append(lines, line.String())
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (m Model) renderSimpleItem(stock api.Stock, idx int) string {
+	label := m.simpleLabel(stock, idx)
+	p := stock.Precision
+	if p == 0 {
+		p = 2
+	}
+	price := fmt.Sprintf("%.*f", p, stock.Price)
+	sign := "+"
+	if stock.ChangePct < 0 {
+		sign = ""
+	}
+	pct := fmt.Sprintf("%s%.*f%%", sign, p, stock.ChangePct)
+	// 整段（label + price + pct）按涨跌统一着色
+	value := label + " " + price + " " + pct
+	style := red
+	if stock.ChangePct < 0 {
+		style = green
+	}
+	return style.Render(value)
+}
+
+func (m Model) simpleLabel(stock api.Stock, idx int) string {
+	if m.labelMode == "sys" {
+		return simpleSysLabels[idx%len(simpleSysLabels)]
+	}
+	return stock.Name
 }
 
 func (m Model) statusLine(titleText, activeTag, pausedTag, loadingText, updatedPrefix string) string {
@@ -922,8 +1084,11 @@ func fetchMinute(code string) tea.Cmd {
 }
 
 func tick(d time.Duration) tea.Cmd {
+	if tickObserver != nil {
+		tickObserver(tickObsSchedule)
+	}
 	return tea.Tick(d, func(t time.Time) tea.Msg {
-		return tickMsg(t)
+		return tickMsg{}
 	})
 }
 

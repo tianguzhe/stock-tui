@@ -24,8 +24,9 @@ var defaultCodes = []string{
 }
 
 type appConfig struct {
-	codes    []string
-	bossMode bool
+	codes      []string
+	bossMode   bool
+	simpleMode bool
 }
 
 func main() {
@@ -35,8 +36,14 @@ func main() {
 		os.Exit(2)
 	}
 
-	m := ui.New(cfg.codes, 5*time.Second, cfg.bossMode)
-	p := tea.NewProgram(m, tea.WithAltScreen())
+	m := ui.New(cfg.codes, 5*time.Second, cfg.bossMode, cfg.simpleMode)
+	// simple 模式伪装系统监控输出，需内联（非全屏）写入终端滚动区
+	// 表格 / boss 模式仍是全屏 TUI，必须保留 AltScreen
+	var opts []tea.ProgramOption
+	if !cfg.simpleMode {
+		opts = append(opts, tea.WithAltScreen())
+	}
+	p := tea.NewProgram(m, opts...)
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "错误: %v\n", err)
 		os.Exit(1)
@@ -49,9 +56,22 @@ func parseConfig(args []string) (appConfig, error) {
 
 	codeList := fs.String("c", "", "comma-separated stock codes")
 	bossMode := fs.String("b", "boss", "boss mode")
+	simpleMode := fs.Bool("simple", false, "simple one-line mode (mutually exclusive with -b)")
 
 	if err := fs.Parse(args); err != nil {
 		return appConfig{}, err
+	}
+
+	if *simpleMode {
+		bossExplicit := false
+		fs.Visit(func(f *flag.Flag) {
+			if f.Name == "b" {
+				bossExplicit = true
+			}
+		})
+		if bossExplicit {
+			return appConfig{}, fmt.Errorf("-simple 与 -b 互斥，不能同时使用")
+		}
 	}
 
 	codes := defaultCodes
@@ -66,7 +86,7 @@ func parseConfig(args []string) (appConfig, error) {
 		return appConfig{}, err
 	}
 
-	return appConfig{codes: codes, bossMode: boss}, nil
+	return appConfig{codes: codes, bossMode: boss, simpleMode: *simpleMode}, nil
 }
 
 func parseBossMode(raw string) (bool, error) {

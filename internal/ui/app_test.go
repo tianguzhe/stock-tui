@@ -9,6 +9,7 @@ import (
 
 	"stock-tui/internal/api"
 
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
 
@@ -405,4 +406,159 @@ func TestBossModeMasksErrors(t *testing.T) {
 func stripANSI(s string) string {
 	re := regexp.MustCompile(`\x1b\[[0-9;]*m`)
 	return re.ReplaceAllString(s, "")
+}
+
+// TestSimpleViewRowsLeftAligned 验证 simple 视图每行左对齐在第 0 列
+func TestSimpleViewRowsLeftAligned(t *testing.T) {
+	m := Model{
+		simpleMode:  true,
+		width:       120,
+		height:      24,
+		autoRefresh: true,
+		labelMode:   "sys",
+		updated:     time.Date(2026, 6, 30, 23, 4, 26, 0, time.Local),
+		stocks: []api.Stock{
+			{Code: "sh600522", Name: "中天科技", Price: 55.27, ChangePct: -8.92, Precision: 2},
+			{Code: "sh601138", Name: "工业富联", Price: 70.04, ChangePct: -2.92, Precision: 2},
+		},
+	}
+	got := stripANSI(m.View())
+	lines := strings.Split(got, "\n")
+	if len(lines) < 3 {
+		t.Fatalf("expected at least 3 lines, got %d:\n%s", len(lines), got)
+	}
+	// status / stocks / help 都应从第 0 列开始
+	for i, want := range []string{"updated", "CPU", "[b]"} {
+		line := lines[i]
+		if !strings.HasPrefix(line, want) {
+			t.Errorf("line %d = %q, want prefix %q (left-align broken)", i, line, want)
+		}
+	}
+	// 帮助行不应有前导空格
+	if strings.HasPrefix(lines[2], " ") {
+		t.Errorf("help line %q has leading space", lines[2])
+	}
+}
+
+// TestSimpleViewKeyChips 验证帮助行使用 [b] [r] [q] 键位 chip
+func TestSimpleViewKeyChips(t *testing.T) {
+	m := Model{
+		simpleMode: true,
+		width:      80,
+		height:     24,
+		updated:    time.Date(2026, 6, 30, 12, 0, 0, 0, time.Local),
+	}
+	got := stripANSI(m.View())
+	for _, chip := range []string{"[b]", "[r]", "[q]"} {
+		if !strings.Contains(got, chip) {
+			t.Errorf("help line missing chip %q in:\n%s", chip, got)
+		}
+	}
+}
+
+// TestRDoesNotStackTicks 回归测试：反复按 r 不能叠加多个 tick
+// 旧实现里 r handler 在「开启」时无条件再调度一个 tick(interval)，
+// 与已在飞的 tick 并存，长期会指数增长。
+func TestRDoesNotStackTicks(t *testing.T) {
+	var scheduleCount int
+	tickObserver = func(kind string) {
+		if kind == tickObsSchedule {
+			scheduleCount++
+		}
+	}
+	defer func() { tickObserver = nil }()
+
+	// 用 1 小时间隔：测试期间没有真 tick 触发
+	m := New([]string{"sh600519"}, time.Hour, false, true)
+	_ = m.Init()
+
+	afterInit := scheduleCount
+	if afterInit != 1 {
+		t.Fatalf("Init 后 schedule=%d, want 1", afterInit)
+	}
+
+	const toggles = 20
+	m2 := m
+	for i := 0; i < toggles; i++ {
+		updated, _ := m2.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'r'}})
+		m2 = updated.(Model)
+	}
+
+	afterToggles := scheduleCount
+	if afterToggles != afterInit {
+		t.Errorf("r 切换叠加了 tick: schedule %d → %d（预期不变）", afterInit, afterToggles)
+	}
+}
+
+// TestTickSchedulerSelfSustains 验证 tickMsg 自维持：处理后仍会调度下一个 tick
+func TestTickSchedulerSelfSustains(t *testing.T) {
+	var scheduleCount, processCount int
+	tickObserver = func(kind string) {
+		switch kind {
+		case tickObsSchedule:
+			scheduleCount++
+		case tickObsProcess:
+			processCount++
+		}
+	}
+	defer func() { tickObserver = nil }()
+
+	m := New([]string{"sh600519"}, time.Hour, false, true)
+	_ = m.Init()
+	initial := scheduleCount
+
+	m.autoRefresh = false
+	updated, _ := m.Update(tickMsg{})
+	m2 := updated.(Model)
+	if m2.autoRefresh != false {
+		t.Fatal("autoRefresh 被改写")
+	}
+	if got := scheduleCount; got != initial+1 {
+		t.Errorf("关闭状态下 tickMsg 应仍续期: schedule %d → %d", initial, got)
+	}
+	if processCount != 1 {
+		t.Errorf("tickMsg 未被处理")
+	}
+}
+
+// TestRImmediateFetchOnReenable 验证重新开启自动刷新时立即拉数据（行为保持）
+func TestRImmediateFetchOnReenable(t *testing.T) {
+	tickObserver = func(string) {}
+	defer func() { tickObserver = nil }()
+
+	m := New([]string{"sh600519"}, time.Hour, false, true)
+	_ = m.Init()
+	m.autoRefresh = false
+
+	// 关闭→开启：r 应翻为 true 并立即 fetch
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'r'}})
+	m2 := updated.(Model)
+	if !m2.autoRefresh {
+		t.Fatal("r 一次后 autoRefresh=false, want true")
+	}
+	if cmd == nil {
+		t.Fatal("r 开启后应返回 fetch cmd, got nil")
+	}
+}
+
+// TestBKeyOnlyInSimpleMode 验证 b 键仅在 simple 模式下生效
+func TestBKeyOnlyInSimpleMode(t *testing.T) {
+	m := Model{
+		simpleMode: false,
+		labelMode:  "name",
+		stocks:     []api.Stock{{Code: "sh600519", Name: "贵州茅台"}},
+	}
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'b'}})
+	m2 := updated.(Model)
+	if m2.labelMode != "name" {
+		t.Errorf("非 simple 模式下 b 键不应改 labelMode: got %q, want %q", m2.labelMode, "name")
+	}
+
+	// simple 模式：b 应正常切换
+	sm := Model{simpleMode: true, labelMode: "name"}
+	updated, _ = sm.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'b'}})
+	sm2 := updated.(Model)
+	if sm2.labelMode != "sys" {
+		t.Errorf("simple 模式下 b 键应切到 sys: got %q", sm2.labelMode)
+	}
 }
