@@ -9,12 +9,12 @@ import (
 // TestWilsonBounds tests Wilson 95% confidence interval calculation.
 func TestWilsonBounds(t *testing.T) {
 	tests := []struct {
-		name       string
-		winPct     float64
-		n          int
-		wantLower  float64
-		wantUpper  float64
-		tolerance  float64
+		name      string
+		winPct    float64
+		n         int
+		wantLower float64
+		wantUpper float64
+		tolerance float64
 	}{
 		{
 			name:      "small sample wide interval N=10 win=40%",
@@ -66,34 +66,35 @@ func TestWilsonBounds(t *testing.T) {
 // baseCandidate returns a candidate that passes all filters (⭐⭐⭐).
 func baseCandidate() Candidate {
 	return Candidate{
-		Code:           "sh600000",
-		Name:           "测试股份",
-		HotScore:       5,
-		ScoreTotal:     72,
-		ADX:            42.0,
-		ChangePct:      1.5,
-		Close:          10.0,
-		RS20:           sql.NullFloat64{Float64: 85, Valid: true},
-		RS60:           sql.NullFloat64{Float64: 85, Valid: true},
-		RS120:          sql.NullFloat64{Float64: 85, Valid: true},
-		Bias24:         5.0,
-		ATRPct:         5.0,
-		Streak:         2,
-		MA20:           9.0,
-		SARLong:        true,
-		SuperTrendLong: true,
-		OBVUp:          true,
-		MACDHist:       1.0,
-		DivBear:        false,
-		SigOverbought:  false,
-		TDSetup:        "见顶/3",
-		TDCountdown:    "-/0",
-		VolRatio:       1.0,
-		TurnoverRate:   10.0,
-		MarketCap:      300,
-		PE:             15.0,
-		KeltnerSqueeze: false,
-		SARValue:       sql.NullFloat64{Float64: 9.5, Valid: true},
+		Code:            "sh600000",
+		Name:            "测试股份",
+		HotScore:        5,
+		ScoreTotal:      72,
+		ADX:             42.0,
+		ChangePct:       1.5,
+		Close:           10.0,
+		RS20:            sql.NullFloat64{Float64: 85, Valid: true},
+		RS60:            sql.NullFloat64{Float64: 85, Valid: true},
+		RS120:           sql.NullFloat64{Float64: 85, Valid: true},
+		Bias24:          5.0,
+		ATRPct:          5.0,
+		Streak:          2,
+		MA20:            9.0,
+		SARLong:         true,
+		SuperTrendLong:  true,
+		OBVUp:           true,
+		OBVUp3Day:       true,
+		MACDHist:        1.0,
+		DivBear:         false,
+		SigOverbought:   false,
+		TDSetup:         "见顶/3",
+		TDCountdown:     "-/0",
+		VolRatio:        1.0,
+		TurnoverRate:    10.0,
+		MarketCap:       300,
+		PE:              15.0,
+		KeltnerSqueeze:  false,
+		SARValue:        sql.NullFloat64{Float64: 9.5, Valid: true},
 		SuperTrendValue: sql.NullFloat64{Float64: 9.3, Valid: true},
 	}
 }
@@ -532,6 +533,69 @@ func TestPositionHint(t *testing.T) {
 	}
 }
 
+// TestOBV3DayFilter tests OBV 3-day sustained inflow as a tier requirement.
+//
+// Design: 1-day OBV is the coreTech baseline (passes filter); 3-day sustained
+// is required for star tiers (⭐⭐/⭐⭐⭐). 1-day-only demotes to 👁️观察.
+// Backtest 2026-06: 1-day-only group 70.2% / +8.87% vs 3-day 82.6% / +21.02%.
+// Keep 1-day-only as watch (visible, sortable) instead of hard-exclude.
+func TestOBV3DayFilter(t *testing.T) {
+	tests := []struct {
+		name string
+		mod  func(*Candidate)
+		want Tier
+	}{
+		{
+			name: "3-day sustained OBV - pass star3",
+			mod: func(c *Candidate) {
+				c.OBVUp = true
+				c.OBVUp3Day = true
+			},
+			want: TierStar3,
+		},
+		{
+			name: "single-day OBV - demote to watch",
+			mod: func(c *Candidate) {
+				c.OBVUp = true
+				c.OBVUp3Day = false
+			},
+			want: TierWatch,
+		},
+		{
+			name: "OBV outflow - exclude",
+			mod: func(c *Candidate) {
+				c.OBVUp = false
+				c.OBVUp3Day = false
+			},
+			want: TierNone,
+		},
+		{
+			name: "3-day OBV but red day pullback with strong RS - watch",
+			mod: func(c *Candidate) {
+				c.OBVUp = true
+				c.OBVUp3Day = true
+				c.ChangePct = -1.0
+				c.ScoreTotal = 70
+				c.ADX = 40
+				c.RS20 = sql.NullFloat64{Float64: 88, Valid: true}
+				c.VolRatio = 0.9
+			},
+			want: TierWatch,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := baseCandidate()
+			tt.mod(&c)
+			got := ComputeTier(&c)
+			if got != tt.want {
+				t.Errorf("ComputeTier() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 // TestTDFunctions tests TD Sequential helper functions.
 func TestTDFunctions(t *testing.T) {
 	t.Run("cdwnTopN", func(t *testing.T) {
@@ -554,9 +618,9 @@ func TestTDFunctions(t *testing.T) {
 
 	t.Run("tdSafe", func(t *testing.T) {
 		tests := []struct {
-			name  string
-			c     Candidate
-			want  bool
+			name string
+			c    Candidate
+			want bool
 		}{
 			{
 				name: "setup 见顶/8 unsafe",

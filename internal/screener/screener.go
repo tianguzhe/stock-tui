@@ -54,6 +54,7 @@ type Candidate struct {
 	SARLong           bool
 	SuperTrendLong    bool
 	OBVUp             bool
+	OBVUp3Day         bool
 	MACDHist          float64
 	DivBear           bool
 	SigOverbought     bool
@@ -303,16 +304,21 @@ func ComputeTier(c *Candidate) Tier {
 		return TierNone
 	}
 
+	// OBV 3-day sustained inflow required for star tiers; 1-day-only demotes to watch.
+	// Backtest 2026-06: 1-day-only group 70.2% win / +8.87% vs 3-day group 82.6% / +21.02%
+	// — keep them visible as watch, don't exclude.
+	obv3Day := c.OBVUp3Day
+
 	// Red/flat days
 	if chg >= 0 {
 		if c.ScoreTotal >= 70 && c.ADX >= 38 {
-			if divState == "watch" || lateStageRisk(c) {
+			if divState == "watch" || lateStageRisk(c) || !obv3Day {
 				return TierWatch
 			}
 			return TierStar3
 		}
 		if c.ScoreTotal >= 65 && c.ADX >= 35 {
-			if divState == "watch" || lateStageRisk(c) {
+			if divState == "watch" || lateStageRisk(c) || !obv3Day {
 				return TierWatch
 			}
 			return TierStar2
@@ -431,6 +437,14 @@ func LoadSnapshots(dbPath string) (date string, candidates []Candidate, rsCovera
 		       COALESCE(s.score_adj, s.score_total) AS score_total,
 		       s.adx, s.change_pct, s.close,
 		       s.sar_long, s.supertrend_long, s.obv_up,
+		       (SELECT COALESCE(SUM(obv_up), 0) FROM snapshot s2
+		        WHERE s2.code = s.code
+		          AND s2.trade_date IN (
+		            SELECT trade_date FROM snapshot
+		            WHERE trade_date <= s.trade_date
+		            GROUP BY trade_date
+		            ORDER BY trade_date DESC LIMIT 3
+		          )) AS obv_3day_sum,
 		       s.macd_hist, s.vol_ratio,
 		       s.td_setup, s.td_countdown,
 		       s.div_bear, s.sig_overbought,
@@ -461,11 +475,11 @@ func LoadSnapshots(dbPath string) (date string, candidates []Candidate, rsCovera
 
 	for rows.Next() {
 		var c Candidate
-		var sarLongInt, stLongInt, obvUpInt, divBearInt, sigOBInt, keltSqInt, d20Int, d55Int int
+		var sarLongInt, stLongInt, obvUpInt, obv3daySumInt, divBearInt, sigOBInt, keltSqInt, d20Int, d55Int int
 		err = rows.Scan(
 			&c.Code, &c.Name, &c.HotScore,
 			&c.ScoreTotal, &c.ADX, &c.ChangePct, &c.Close,
-			&sarLongInt, &stLongInt, &obvUpInt,
+			&sarLongInt, &stLongInt, &obvUpInt, &obv3daySumInt,
 			&c.MACDHist, &c.VolRatio,
 			&c.TDSetup, &c.TDCountdown,
 			&divBearInt, &sigOBInt,
@@ -489,6 +503,7 @@ func LoadSnapshots(dbPath string) (date string, candidates []Candidate, rsCovera
 		c.SARLong = sarLongInt == 1
 		c.SuperTrendLong = stLongInt == 1
 		c.OBVUp = obvUpInt == 1
+		c.OBVUp3Day = obv3daySumInt >= 3
 		c.DivBear = divBearInt == 1
 		c.SigOverbought = sigOBInt == 1
 		c.KeltnerSqueeze = keltSqInt == 1
