@@ -16,7 +16,7 @@ echo "项目: $PROJECT_ROOT"
 echo ""
 
 # 0. 【必须第一步】更新同花顺热榜（确保 instrument 表在批量 -save 前已更新）
-echo "=== 1/5 更新同花顺热榜 ==="
+echo "=== 1/6 更新同花顺热榜 ==="
 if ! go run ./cmd/stockdb hot; then
   echo "❌ 热榜更新失败，请检查网络连接"
   exit 1
@@ -24,7 +24,7 @@ fi
 echo ""
 
 # 2. 批量保存快照数据
-echo "=== 2/5 批量保存快照数据 ==="
+echo "=== 2/6 批量保存快照数据 ==="
 echo "预编译 indicator-analyze..."
 go build -o /tmp/ia ./cmd/indicator-analyze
 
@@ -45,17 +45,23 @@ echo "✅ 批量保存完成，耗时 ${DURATION} 秒"
 echo ""
 
 # 3. 更新 RS 排名
-echo "=== 3/5 更新 RS 相对强度排名 ==="
+echo "=== 3/6 更新 RS 相对强度排名 ==="
 go run ./cmd/stockdb rs-rank
 echo ""
 
 # 4. 回填决策结果
-echo "=== 4/5 回填决策结果 ==="
+echo "=== 4/6 回填决策结果 ==="
 go run ./cmd/stockdb backfill
 echo ""
 
-# 5. 生成选股表（如果有持仓）
-echo "=== 5/5 生成选股表 ==="
+# 5. 数据质量检查
+echo "=== 5/6 数据质量检查 ==="
+go run ./cmd/stockdb check-data 2>&1 | head -25
+echo "（完整报告：go run ./cmd/stockdb check-data）"
+echo ""
+
+# 6. 生成选股表（如果有持仓）
+echo "=== 6/6 生成选股表 ==="
 if [ -f "$PROJECT_ROOT/.holdings" ]; then
   HOLDINGS=$(cat "$PROJECT_ROOT/.holdings")
   echo "持仓配置: $HOLDINGS"
