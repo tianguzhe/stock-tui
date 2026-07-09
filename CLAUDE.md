@@ -215,10 +215,12 @@
 # 0. 【必须第一步】更新同花顺热榜（确保 instrument 表在批量 -save 前已更新）
 ./scripts/import-hot-stocks.sh
 
-# 1. 收盘后批量更新快照（含换手率/市值/PE；预编译二进制，全池约90秒）
+# 1. 收盘后批量更新快照（含换手率/市值/PE + CYQ 筹码衍生指标；预编译二进制，全池约150秒）
 go build -o /tmp/ia ./cmd/indicator-analyze && sqlite3 data/stock.db \
   "SELECT code FROM instrument;" | xargs -I{} -P 1 /tmp/ia -save {}
 # ⚠️ 注意：-P 4 并发会导致 SQLITE_BUSY 错误，必须用 -P 1
+# ⚠️ tdx 协议单次连接约 100~170ms，比纯 HTTP 慢，步骤 1 时间已从 90s 增至约 150s
+#     预编译后全池约 285 只，实测跑通 tdx 约 9/6 个 host，失败时自动回退 HTTP
 
 # 2. 计算 RS 相对强度百分位排名（横截面 ret20 排名，全量落库当日即有效）
 go run ./cmd/stockdb rs-rank
