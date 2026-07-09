@@ -7,6 +7,8 @@ type Candle struct {
 	Low    float64
 	Close  float64
 	Volume float64
+	Open   float64 // 开盘价(为 CYQ 筹码指标预留)
+	Amount float64 // 成交额(元,为 CYQ VWAP 预留)
 }
 
 type Result struct {

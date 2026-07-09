@@ -1,21 +1,30 @@
 # stock-tui
 
 ## 目录结构
-- `cmd/indicator-analyze` — 单标的深度技术面分析 CLI
+- `cmd/indicator-analyze` — 单标的深度技术面分析 CLI（tdx TCP 协议主力 + HTTP 兜底）
 - `cmd/stockdb` — 数据库管理（tag/history/rs-rank/backfill/backtest）
 - `internal/api` — 实时行情 API 封装
-- `internal/indicator` — 技术指标计算引擎
+- `internal/indicator` — 技术指标计算引擎（含 CYQ 筹码分布衍生指标）
 - `internal/store` — SQLite 存储层（snapshot/decision_log/instrument）
 - `scripts/` — 每日更新/选股/日志生成/测试脚本
 - `docs/journal/` — 每日复盘日志
 - `docs/holdings-monitor/` — 持仓监控文档（含候选观察状态）
+- `docs/cyq-data-source-notes.md` — CYQ 筹码指标数据源注意事项
 
 ## 行情数据
-- 拉行情/K线前先查 `docs/data-apis.md`(腾讯/东财/新浪接口、OHLC 字段顺序、`sh`/`sz` 前缀、`Candle` 映射都已记录)。
-- `internal/api` 仅封装实时报价 `FetchStocks` 与分时 `FetchMinute`,**无日K**——日K需按 docs 自行拉取。
+- 数据源优先级：**通达信 TCP 协议主力**(`github.com/quantbeing/tdx`) → 腾讯 HTTP → 东财 HTTP(兜底)。`indicator-analyze` 自动链式回退。
+- `internal/api` 仅封装实时报价 `FetchStocks` 与分时 `FetchMinute`,**无日K**——日K走 tdx 协议或 HTTP 自拉。
+- 接口文档见 `docs/data-apis.md`(腾讯/东财/新浪 OHLC 字段顺序、`sh`/`sz`/`bj` 前缀映射、换手率字段均已更新)。
 
 ## 技术指标
 - `indicator.Calculate([]Candle) []Result`(KDJ/MACD/RSI/WR/DMI/CMI/BIAS/CHOP/ATR/BOLL/Donchian/MFI/SAR/Keltner/SuperTrend);`WR` 为正值口径(**值越大越超卖**,与标准威廉符号相反)。
+- `Candle` 结构体字段: `Open`、`High`、`Low`、`Close`、`Volume`(股数)、`Amount`(元)。`Amount` 用于 CYQ 的 VWAP(均价),Volume=0 时回退为 (H+L)/2。
+- `indicator.CalcCYQ([]Candle, []float64, float64) []CYQResult` 计算筹码衍生指标(持仓成本衰减模型):
+  - `WinnerClose`/`WinnerOpen`/`WinnerHigh`/`WinnerLow` = 该价格的获利盘比例(0~1)
+  - `ASR` = 活动筹码(收盘±10%区间筹码量,0~100)
+  - `CYQK_Open/High/Low/Close` = 博弈K线(获利盘OHLC,0~100),`CYQK_Length` = 收-开
+  - `VolumeLessBigKline`(无量长阳:长度>18%且换手<3%)、`Ratio90v3`(90比3)、`IsLowPosition`(PRY1<40%)
+  - 前置依赖:至少 60 根日K(推荐 250+),换手率用小数(0.0646=6.46%),价格须前复权
 - `MFI` 读取 `Candle.Volume`;其他核心价格指标不依赖成交量。ATR14 用 Wilder RMA;BOLL 为 20 日 ±2σ;Donchian 输出 20/55 日通道。
 - `SAR` 为 Wilder 抛物线转向(AF 0.02→0.20,触破翻转),输出 `Value`(止损/翻转价)、`Long`(多空 stance)、`Reversed`(本根是否刚翻转)。`Keltner` 为 EMA20±1.5×ATR20 通道,`Squeeze` = BOLL(20,2σ) 完全收进 Keltner 内(波动压缩、突破临近);`Keltner` 读取已算好的 `BOLL`,故 `Calculate` 内在 `fillBOLL` 之后填充。
 - `SuperTrend` 为 ATR 通道趋势跟踪(ATR10×3),输出 `Value`(趋势线:多头=下轨支撑/空头=上轨压力)、`Long`(趋势 stance)、`Reversed`(本根是否刚翻转);比 `SAR` 更平滑、噪音更低,适合作"当前趋势态"总览。与 SAR/Keltner 同属 ATR 系趋势工具,解读时注意三者不要互相当独立证据(见下「指标分工」)。
@@ -142,7 +151,8 @@
 
 ## 技术面分析 CLI
 - 深度技术面分析优先用固定命令 `go run ./cmd/indicator-analyze <代码>`；不要再写一次性 `cmd/<name>/main.go`。
-- `indicator-analyze` 会拉腾讯日K、处理 `qfqday/day` 回退、复用 `indicator.Calculate` / `TDSequential`，并输出 SCORE、DIVERGENCE、TD、PERF 与近15日演变。
+- `indicator-analyze` 数据流：**tdx TCP 协议**(`github.com/quantbeing/tdx`)主力 → 腾讯 HTTP(兜底,OHLCV) → 东财 HTTP(换手率兜底 f61)。自动链式回退，一次 tdx 握手即返回全量 OHLCV + Amount + 流通股本(换手率本地算)。输出含 SCORE、DIVERGENCE、TD、PERF、CYQ(筹码分布两行)与近15日演变。
+- 快速提取关键字段：`go run ./cmd/indicator-analyze <code> 2>/dev/null | grep -E "SCORE|TD_NOW|SAR_KELT|DIVERGENCE|PERF|CYQ"`
 - 批量落库：`go build -o /tmp/ia ./cmd/indicator-analyze && sqlite3 data/stock.db "SELECT code FROM instrument;" | xargs -I{} /tmp/ia -save {}`（预编译避免 285 次重复编译，全池约 90 秒）
 - 多因子选股筛选：**已统一为 Go 实现**（类型安全、性能更优）
   - **推荐**：`go run ./cmd/stockdb screen --holdings 代码:成本:手数,...` 或快捷脚本 `./scripts/screen-stocks.sh --holdings ...`
@@ -230,7 +240,23 @@ go run ./cmd/stockdb backfill
 
 **日志字段速查**：
 - `TD`：优先显示 countdown，无则显示 setup；snapshot 落库格式均为 `见顶/N`/`见底/N`（CLI 近15日行才用 `C顶N` 短格式）；setup `见顶/8` 次日警惕进入 countdown
+- `CYQ`：CLI 输出两行——`WINNER`(获利盘%)/`ASR`(浮筹%)/`PRY1`(年度相对位置%) 与博弈K线 OHLC + 控盘信号(无量长阳/90比3/低位) + 状态标签(深度套牢/全民获利/筹码密集/近年底位)
 - `SAR/ST`：`多/多` = SAR 多头 + SuperTrend 多头，双确认；持仓翻空时选股表显示 `⚠️SAR/ST双空` 等警示，必须执行退出纪律
 - `止损价`：snapshot `sar_value` 列（批量落库后直接读取）；选股表"止损(距%)"列即此值；`--capital 总资金` 可输出候选建议仓位（单笔风险 1% / 止损距离）
 - 量比口径：量比 < 0.8 / > 1.5 为阈值，描述时一律写"量比 X.X（< 0.8）"格式，不用"缩量/放量"
 - 末端降级口径：乖离 `bias24/atr_pct > 4`（波动归一化）、连涨≥5日、换手 15–20% 任一触发即从推荐降为观察；市场广度（池内站上 MA20 比例）< 40% 时推荐上限减半
+
+### 数据源(2026-07 更新)
+- 数据源优先级: **tdx 协议**(`github.com/quantbeing/tdx` v0.1.3, `FromBestHost` 自动选服务器) → 腾讯 HTTP(兜底) → 东财 HTTP(换手率兜底 f61)。`indicator-analyze` 自动链式回退。
+- tdx 代码映射: `sh600522` → `model.MarketSH` + `"600522"`; `sz000001` → `model.MarketSZ` + `"000001"`.
+- tdx 日K `GetSecurityBars` 返回**按日期升序**, `bars[0]` 最旧, `bars[len-1]` 最新。
+- tdx 换手率: `GetFinanceInfo(ctx, market, code).LiutongGuben`(流通股本,单位股) → `turnover = Vol / LiutongGuben`(小数)。
+- 东财历史 K 线 `fields2=f51..f61`: f52-55 为正常小数(非 ×100)、f56 单位是**手**(×100 转股)、f61 换手率直给(%)。需带 `Referer` + 完整 UA + `DisableKeepAlives: true`，偶发 EOF 需重试。
+
+### CYQ 筹码指标
+- `indicator.CalcCYQ(candles, turnovers, freeFloatShares) []CYQResult`: 输入 Candle(需含 High/Low/Close/Volume/Amount)+换手率(小数,如 0.0646)+流通股本。输出 WinnerClose(获利盘%)/ASR(浮筹%)/PRY1(年度相对位置%)/CYQK(博弈K线 OHLC)/高控盘信号。
+- avgPrice 优先 VWAP(Amount/Volume), Volume=0 时回退 (H+L)/2——VWAP 在暴跌日比 (H+L)/2 低最多 1.44%,修正系统性偏差。
+- 前置条件: 至少 60 根日K(推荐 250+), 价格须前复权, 换手率用小数。`Candle` 现在有 `Open` 和 `Amount` 字段。
+
+### 外部探测脚本
+- 从项目外 `import "stock-tui/internal/*"` 会在 Go 1.26+ 被 `internal` 限制拒绝。解法: `/tmp/probe-xxx` 下创建独立 go.mod, 用 `replace stock-tui => /absolute/project/path` 引用; 或直接复制算法代码。

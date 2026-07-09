@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -10,12 +11,16 @@ import (
 	"os"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"stock-tui/internal/api"
 	"stock-tui/internal/indicator"
 	"stock-tui/internal/market"
 	"stock-tui/internal/store"
+
+	tdx "github.com/quantbeing/tdx"
+	"github.com/quantbeing/tdx/model"
 )
 
 var httpClient = &http.Client{Timeout: 15 * time.Second}
@@ -33,10 +38,11 @@ type klineResponse struct {
 }
 
 type seriesData struct {
-	Code    string
-	Name    string
-	Dates   []string
-	Candles []indicator.Candle
+	Code      string
+	Name      string
+	Dates     []string
+	Candles   []indicator.Candle
+	Turnovers []float64 // 每日换手率(小数,0.0646=6.46%),用于 CYQ 筹码计算
 }
 
 func main() {
@@ -66,9 +72,14 @@ func run(args []string) error {
 		return fmt.Errorf("-n must be positive")
 	}
 
-	data, err := fetchDailyKline(code, *bars)
+	// 通达信 TCP 协议主力(内含前复权日K + Amount + 换手率),
+	// 失败时回退到腾讯 HTTP(仅 OHLCV) + 东财 HTTP(换手率兜底)
+	data, err := fetchViaTDX(code, *bars)
 	if err != nil {
-		return err
+		data, err = fetchDailyKline(code, *bars)
+		if err != nil {
+			return fmt.Errorf("tdx 和 HTTP 都失败: %w", err)
+		}
 	}
 	snap := printAnalysis(data)
 	if *save {
@@ -102,6 +113,71 @@ func saveSnapshot(data seriesData, snap store.Snapshot) error {
 		return err
 	}
 	return st.SaveSnapshot(snap)
+}
+
+// fetchViaTDX 通过通达信 TCP 协议获取历史日K,作为主力数据源。
+// 一次调用即返回 OHLCV + Amount + 换手率(通过流通股本本地算)。
+// 失败时调用方应回退到 HTTP 方案。
+func fetchViaTDX(code string, count int) (seriesData, error) {
+	// 映射 sh600522 → (MarketSH, "600522")
+	var marketID model.Market
+	rawCode := code
+	if strings.HasPrefix(code, "sh") {
+		marketID = model.MarketSH
+		rawCode = code[2:]
+	} else if strings.HasPrefix(code, "sz") || strings.HasPrefix(code, "bj") {
+		marketID = model.MarketSZ
+		rawCode = code[2:]
+	} else {
+		return seriesData{}, fmt.Errorf("tdx: 未知前缀 %s", code)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	client, err := tdx.FromBestHost(ctx, tdx.Options{
+		MaxAttempts: 2,
+		Timeout:     15 * time.Second,
+	})
+	if err != nil {
+		return seriesData{}, fmt.Errorf("tdx FromBestHost: %w", err)
+	}
+	defer client.Close()
+
+	// 拉日K
+	bars, err := client.GetSecurityBars(ctx, marketID, rawCode, model.KlineDay, 0, count)
+	if err != nil {
+		return seriesData{}, fmt.Errorf("tdx GetSecurityBars: %w", err)
+	}
+	if len(bars) == 0 {
+		return seriesData{}, fmt.Errorf("tdx: 无数据")
+	}
+
+	// 拉流通股本(用于换手率),非致命
+	freeShares := 0.0
+	if fin, err := client.GetFinanceInfo(ctx, marketID, rawCode); err == nil {
+		freeShares = fin.LiutongGuben
+	}
+
+	dates := make([]string, len(bars))
+	candles := make([]indicator.Candle, len(bars))
+	turnovers := make([]float64, len(bars))
+	for i, b := range bars {
+		dates[i] = fmt.Sprintf("%04d-%02d-%02d", b.Year, b.Month, b.Day)
+		candles[i] = indicator.Candle{
+			Open:   b.Open.Float64(),
+			Close:  b.Close.Float64(),
+			High:   b.High.Float64(),
+			Low:    b.Low.Float64(),
+			Volume: b.Vol,
+			Amount: b.Amount,
+		}
+		if freeShares > 0 && b.Vol > 0 {
+			turnovers[i] = b.Vol / freeShares // 小数(0.0646=6.46%)
+		}
+	}
+
+	return seriesData{Code: code, Name: code, Dates: dates, Candles: candles, Turnovers: turnovers}, nil
 }
 
 func fetchDailyKline(code string, bars int) (seriesData, error) {
@@ -157,6 +233,7 @@ func fetchDailyKline(code string, bars int) (seriesData, error) {
 		}
 		dates[i] = rawString(row[0])
 		candles[i] = indicator.Candle{
+			Open:   rawFloat(row[1]),
 			Close:  rawFloat(row[2]),
 			High:   rawFloat(row[3]),
 			Low:    rawFloat(row[4]),
@@ -164,7 +241,105 @@ func fetchDailyKline(code string, bars int) (seriesData, error) {
 		}
 	}
 
-	return seriesData{Code: code, Name: name, Dates: dates, Candles: candles}, nil
+	// 从东财补拉换手率(用于 CYQ 筹码计算),非致命失败时静默跳过
+	turnovers := fetchEMTurnovers(code, len(candles), dates)
+
+	return seriesData{
+		Code: code, Name: name, Dates: dates, Candles: candles,
+		Turnovers: turnovers,
+	}, nil
+}
+
+// fetchEMTurnovers 从东财历史 K 线接口拉换手率,对齐到 Tencent 日期序列
+// 允许偶发 EOF(限流/重连),重试 2 次;全部失败/无数据时返回 nil
+func fetchEMTurnovers(code string, count int, tencentDates []string) []float64 {
+	// 映射 code → EM secid
+	prefix := ""
+	if len(code) >= 2 {
+		switch code[:2] {
+		case "sh":
+			prefix = "1"
+		case "sz", "bj":
+			prefix = "0"
+		}
+	}
+	if prefix == "" {
+		return nil
+	}
+	secid := prefix + "." + code[2:]
+
+	url := fmt.Sprintf(
+		"https://push2his.eastmoney.com/api/qt/stock/kline/get?secid=%s&fields1=f1,f2,f3&fields2=f51,f61&klt=101&fqt=1&end=20500101&lmt=%d",
+		secid, count)
+
+	var resp *http.Response
+	var err error
+	for attempt := 0; attempt < 3; attempt++ {
+		req, _ := http.NewRequest(http.MethodGet, url, nil)
+		req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")
+		req.Header.Set("Referer", "https://data.eastmoney.com/")
+		req.Header.Set("Accept", "application/json, text/plain, */*")
+		resp, err = httpClient.Do(req)
+		if err == nil {
+			defer resp.Body.Close()
+			break
+		}
+		if attempt < 2 {
+			time.Sleep(time.Duration(300*(attempt+1)) * time.Millisecond)
+		}
+	}
+	if err != nil || resp == nil {
+		return nil
+	}
+
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+	var emResp struct {
+		Data struct {
+			Klines []string `json:"klines"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &emResp); err != nil {
+		return nil
+	}
+
+	// 按日期对齐:先建 map[date]turnover
+	turnMap := make(map[string]float64, len(emResp.Data.Klines))
+	for _, ks := range emResp.Data.Klines {
+		// fields2=f51,f61 返回格式: "2026-07-09,4.47" (日期,换手率%)
+		commaPos := -1
+		for j := 0; j < len(ks); j++ {
+			if ks[j] == ',' {
+				commaPos = j
+				break
+			}
+		}
+		if commaPos < 0 || commaPos >= len(ks)-1 {
+			continue
+		}
+		datePart := ks[:commaPos]
+		turnPart := ks[commaPos+1:]
+		turnMap[datePart] = parseFloat(turnPart)
+	}
+
+	// 对齐到 tencentDates,找不到的日填 0
+	turns := make([]float64, len(tencentDates))
+	hasData := false
+	for i, d := range tencentDates {
+		if v, ok := turnMap[d]; ok {
+			turns[i] = v / 100 // 东财 f61 是 %,转小数
+			hasData = true
+		}
+	}
+	if !hasData {
+		return nil
+	}
+	return turns
+}
+
+func parseFloat(s string) float64 {
+	var f float64
+	fmt.Sscanf(s, "%f", &f)
+	return f
 }
 
 func printAnalysis(data seriesData) store.Snapshot {
@@ -247,6 +422,33 @@ func printAnalysis(data seriesData) store.Snapshot {
 	fmt.Printf("SCORE total=%d delta=%+d dmi=%+d ma=%+d macd=%+d kdjwr=%+d rsi=%+d bias=%+d chopcmi=%+d volume=%+d sar=%+d div=%+d adj=%d perfadj=%+d late=%+d label=%s\n",
 		score.Total, score.Delta, score.DMI, score.MA, score.MACD, score.KdjWr, score.RSI,
 		score.BIAS, score.CHOPCMI, score.Volume, score.SAR, score.Divergence, scoreAdj, perfAdj, latePen, score.Label)
+	// CYQ 筹码指标(换手率数据不足时跳过)
+	if n := len(data.Turnovers); n == len(candles) && n > 0 {
+		cyq := indicator.CalcCYQ(candles, data.Turnovers, 0)
+		if len(cyq) > 0 {
+			lastC := cyq[len(cyq)-1]
+			cyqLabel := "中性"
+			switch {
+			case lastC.WinnerClose*100 < 10:
+				cyqLabel = "深度套牢"
+			case lastC.WinnerClose*100 > 90:
+				cyqLabel = "全民获利"
+			}
+			if lastC.ASR > 50 {
+				cyqLabel += "·筹码密集"
+			} else if lastC.ASR < 25 {
+				cyqLabel += "·筹码稀疏"
+			}
+			if lastC.PRY1 < 40 {
+				cyqLabel += "·近年底位"
+			}
+			fmt.Printf("CYQ WINNER=%.1f%%  ASR=%.1f%%  PRY1=%.1f%%  | 博弈K线 开=%.1f%% 收=%.1f%% 高=%.1f%% 低=%.1f%% 长=%+.1f%%\n",
+				lastC.WinnerClose*100, lastC.ASR, lastC.PRY1,
+				lastC.CYQK_Open, lastC.CYQK_Close, lastC.CYQK_High, lastC.CYQK_Low, lastC.CYQK_Length)
+			fmt.Printf("CYQ 控盘: 无量长阳=%s  90比3=%s  低位=%s  | %s\n",
+				ynMark(lastC.VolumeLessBigKline), ynMark(lastC.Ratio90v3), ynMark(lastC.IsLowPosition), cyqLabel)
+		}
+	}
 	fmt.Printf("当前策略触发: trendBull=%t(%d/4) trendBear=%t(%d/4) oversold=%t(%d/4) overbought=%t(%d/4) breakBull=%t(%d/3) breakBear=%t(%d/3) revertBull=%t(%d/3) revertBear=%t(%d/3) divBull=%t(%d/1,today=%t) divBear=%t(%d/1,today=%t)\n",
 		score.Signals.TrendBull, score.Signals.TrendBullScore, score.Signals.TrendBear, score.Signals.TrendBearScore,
 		score.Signals.Oversold, score.Signals.OversoldScore, score.Signals.Overbought, score.Signals.OverboughtScore,
@@ -1732,6 +1934,13 @@ func longShort(long bool) string {
 		return "多"
 	}
 	return "空"
+}
+
+func ynMark(v bool) string {
+	if v {
+		return "是"
+	}
+	return "否"
 }
 
 func scoreLabel(score int) string {
