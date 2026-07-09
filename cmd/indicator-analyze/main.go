@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -11,16 +10,12 @@ import (
 	"os"
 	"sort"
 	"strconv"
-	"strings"
 	"time"
 
 	"stock-tui/internal/api"
 	"stock-tui/internal/indicator"
 	"stock-tui/internal/market"
 	"stock-tui/internal/store"
-
-	tdx "github.com/quantbeing/tdx"
-	"github.com/quantbeing/tdx/model"
 )
 
 var httpClient = &http.Client{Timeout: 15 * time.Second}
@@ -57,11 +52,12 @@ func run(args []string) error {
 	fs.SetOutput(io.Discard)
 	bars := fs.Int("n", defaultBars, "number of daily bars")
 	save := fs.Bool("save", false, "persist the analysis snapshot to the SQLite store")
+	useTDX := fs.Bool("tdx", false, "use TDX TCP protocol as primary data source")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if fs.NArg() != 1 {
-		return fmt.Errorf("usage: go run ./cmd/indicator-analyze [-n bars] [-save] <code>")
+		return fmt.Errorf("usage: go run ./cmd/indicator-analyze [-n bars] [-save] [-tdx] <code>")
 	}
 
 	code, ok := market.NormalizeCode(fs.Arg(0))
@@ -72,13 +68,23 @@ func run(args []string) error {
 		return fmt.Errorf("-n must be positive")
 	}
 
-	// 通达信 TCP 协议主力(内含前复权日K + Amount + 换手率),
-	// 失败时回退到腾讯 HTTP(仅 OHLCV) + 东财 HTTP(换手率兜底)
-	data, err := fetchViaTDX(code, *bars)
-	if err != nil {
+	// -save 省 TDX：-save 默认纯 HTTP，避免批量保存时每个标的 100-170ms 的 TDX 握手开销
+	// -save -tdx 组合则恢复 TDX 优先（获取更精确的 Amount + 本地换手率）
+	// 纯分析模式（无 -save）保持 TDX 优先以获取最优数据质量
+	var data seriesData
+	var err error
+	if *save && !*useTDX {
 		data, err = fetchDailyKline(code, *bars)
 		if err != nil {
-			return fmt.Errorf("tdx 和 HTTP 都失败: %w", err)
+			return fmt.Errorf("HTTP 获取失败: %w", err)
+		}
+	} else {
+		data, err = fetchViaTDX(code, *bars)
+		if err != nil {
+			data, err = fetchDailyKline(code, *bars)
+			if err != nil {
+				return fmt.Errorf("tdx 和 HTTP 都失败: %w", err)
+			}
 		}
 	}
 	snap := printAnalysis(data)
@@ -113,71 +119,6 @@ func saveSnapshot(data seriesData, snap store.Snapshot) error {
 		return err
 	}
 	return st.SaveSnapshot(snap)
-}
-
-// fetchViaTDX 通过通达信 TCP 协议获取历史日K,作为主力数据源。
-// 一次调用即返回 OHLCV + Amount + 换手率(通过流通股本本地算)。
-// 失败时调用方应回退到 HTTP 方案。
-func fetchViaTDX(code string, count int) (seriesData, error) {
-	// 映射 sh600522 → (MarketSH, "600522")
-	var marketID model.Market
-	rawCode := code
-	if strings.HasPrefix(code, "sh") {
-		marketID = model.MarketSH
-		rawCode = code[2:]
-	} else if strings.HasPrefix(code, "sz") || strings.HasPrefix(code, "bj") {
-		marketID = model.MarketSZ
-		rawCode = code[2:]
-	} else {
-		return seriesData{}, fmt.Errorf("tdx: 未知前缀 %s", code)
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	client, err := tdx.FromBestHost(ctx, tdx.Options{
-		MaxAttempts: 2,
-		Timeout:     15 * time.Second,
-	})
-	if err != nil {
-		return seriesData{}, fmt.Errorf("tdx FromBestHost: %w", err)
-	}
-	defer client.Close()
-
-	// 拉日K
-	bars, err := client.GetSecurityBars(ctx, marketID, rawCode, model.KlineDay, 0, count)
-	if err != nil {
-		return seriesData{}, fmt.Errorf("tdx GetSecurityBars: %w", err)
-	}
-	if len(bars) == 0 {
-		return seriesData{}, fmt.Errorf("tdx: 无数据")
-	}
-
-	// 拉流通股本(用于换手率),非致命
-	freeShares := 0.0
-	if fin, err := client.GetFinanceInfo(ctx, marketID, rawCode); err == nil {
-		freeShares = fin.LiutongGuben
-	}
-
-	dates := make([]string, len(bars))
-	candles := make([]indicator.Candle, len(bars))
-	turnovers := make([]float64, len(bars))
-	for i, b := range bars {
-		dates[i] = fmt.Sprintf("%04d-%02d-%02d", b.Year, b.Month, b.Day)
-		candles[i] = indicator.Candle{
-			Open:   b.Open.Float64(),
-			Close:  b.Close.Float64(),
-			High:   b.High.Float64(),
-			Low:    b.Low.Float64(),
-			Volume: b.Vol,
-			Amount: b.Amount,
-		}
-		if freeShares > 0 && b.Vol > 0 {
-			turnovers[i] = b.Vol / freeShares // 小数(0.0646=6.46%)
-		}
-	}
-
-	return seriesData{Code: code, Name: code, Dates: dates, Candles: candles, Turnovers: turnovers}, nil
 }
 
 func fetchDailyKline(code string, bars int) (seriesData, error) {

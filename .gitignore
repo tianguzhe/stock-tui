@@ -23,8 +23,8 @@ __pycache__/
 .DS_Store
 
 # Go 编译产物
-indicator-analyze
-stockdb
+/indicator-analyze
+/stockdb
 
 # 工具缓存
 .ace-tool/

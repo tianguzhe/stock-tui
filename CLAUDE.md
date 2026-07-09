@@ -1,7 +1,7 @@
 # stock-tui
 
 ## 目录结构
-- `cmd/indicator-analyze` — 单标的深度技术面分析 CLI（tdx TCP 协议主力 + HTTP 兜底）
+- `cmd/indicator-analyze` — 单标的深度技术面分析 CLI（tdx.go 单独存放 TDX TCP 协议逻辑，-tdx 标志显式启用）
 - `cmd/stockdb` — 数据库管理（tag/history/rs-rank/backfill/backtest）
 - `internal/api` — 实时行情 API 封装
 - `internal/indicator` — 技术指标计算引擎（含 CYQ 筹码分布衍生指标）
@@ -12,7 +12,8 @@
 - `docs/cyq-data-source-notes.md` — CYQ 筹码指标数据源注意事项
 
 ## 行情数据
-- 数据源优先级：**通达信 TCP 协议主力**(`github.com/quantbeing/tdx`) → 腾讯 HTTP → 东财 HTTP(兜底)。`indicator-analyze` 自动链式回退。
+- 数据源优先级（分析模式）：**通达信 TCP 协议主力**(`github.com/quantbeing/tdx`) → 腾讯 HTTP → 东财 HTTP(兜底)。`indicator-analyze` 自动链式回退。
+- 数据源（`-save` 模式）：**默认跳过 TDX，走纯 HTTP**（腾讯 OHLCV + 东财换手率），避免批量保存时 TDX 握手开销。需要 TDX 精度时加 `-tdx` 显式启用。
 - `internal/api` 仅封装实时报价 `FetchStocks` 与分时 `FetchMinute`,**无日K**——日K走 tdx 协议或 HTTP 自拉。
 - 接口文档见 `docs/data-apis.md`(腾讯/东财/新浪 OHLC 字段顺序、`sh`/`sz`/`bj` 前缀映射、换手率字段均已更新)。
 
@@ -151,9 +152,12 @@
 
 ## 技术面分析 CLI
 - 深度技术面分析优先用固定命令 `go run ./cmd/indicator-analyze <代码>`；不要再写一次性 `cmd/<name>/main.go`。
-- `indicator-analyze` 数据流：**tdx TCP 协议**(`github.com/quantbeing/tdx`)主力 → 腾讯 HTTP(兜底,OHLCV) → 东财 HTTP(换手率兜底 f61)。自动链式回退，一次 tdx 握手即返回全量 OHLCV + Amount + 流通股本(换手率本地算)。输出含 SCORE、DIVERGENCE、TD、PERF、CYQ(筹码分布两行)与近15日演变。
+- `indicator-analyze` 数据流：
+  - **纯分析模式（无 `-save` 无 `-tdx`）**：TCP 协议主力 → 腾讯 HTTP(兜底) → 东财 HTTP(兜底换手率)
+  - **`-save` 模式**：纯 HTTP，跳过 TDX，避免批量保存时每个标的 100-170ms 的 TDX 握手开销
+  - **`-save -tdx` 或 `-tdx` 模式**：显式启用 TDX 协议（获取更精确的 Amount + 本地换手率）
 - 快速提取关键字段：`go run ./cmd/indicator-analyze <code> 2>/dev/null | grep -E "SCORE|TD_NOW|SAR_KELT|DIVERGENCE|PERF|CYQ"`
-- 批量落库：`go build -o /tmp/ia ./cmd/indicator-analyze && sqlite3 data/stock.db "SELECT code FROM instrument;" | xargs -I{} /tmp/ia -save {}`（预编译避免 285 次重复编译，全池约 90 秒）
+- 批量落库（纯 HTTP，约 90 秒）：`go build -o /tmp/ia ./cmd/indicator-analyze && sqlite3 data/stock.db "SELECT code FROM instrument;" | xargs -I{} /tmp/ia -save {}`
 - 多因子选股筛选：**已统一为 Go 实现**（类型安全、性能更优）
   - **推荐**：`go run ./cmd/stockdb screen --holdings 代码:成本:手数,...` 或快捷脚本 `./scripts/screen-stocks.sh --holdings ...`
   - 旧版 Python `scripts/screen-stocks.py` 已弃用（保留作参考实现）
@@ -215,12 +219,11 @@
 # 0. 【必须第一步】更新同花顺热榜（确保 instrument 表在批量 -save 前已更新）
 ./scripts/import-hot-stocks.sh
 
-# 1. 收盘后批量更新快照（含换手率/市值/PE + CYQ 筹码衍生指标；预编译二进制，全池约150秒）
+# 1. 收盘后批量更新快照（含换手率/市值/PE + CYQ 筹码衍生指标；预编译二进制，纯 HTTP 约 90 秒）
 go build -o /tmp/ia ./cmd/indicator-analyze && sqlite3 data/stock.db \
   "SELECT code FROM instrument;" | xargs -I{} -P 1 /tmp/ia -save {}
 # ⚠️ 注意：-P 4 并发会导致 SQLITE_BUSY 错误，必须用 -P 1
-# ⚠️ tdx 协议单次连接约 100~170ms，比纯 HTTP 慢，步骤 1 时间已从 90s 增至约 150s
-#     预编译后全池约 285 只，实测跑通 tdx 约 9/6 个 host，失败时自动回退 HTTP
+# ⚠️ -save 默认跳过 TDX（纯 HTTP），因 CYQ 需要 Amount 才需加 -tdx；全池约 285 只
 
 # 2. 计算 RS 相对强度百分位排名（横截面 ret20 排名，全量落库当日即有效）
 go run ./cmd/stockdb rs-rank
