@@ -322,7 +322,7 @@ func saveDecisions(st *store.Store, date string, candidates []screener.Candidate
 		err := st.DB().QueryRow(`
 			INSERT INTO decision_log (code, log_date, action, tier, score_total, adx, sar_long, st_long, obv_up, macd_hist, td_countdown, signals, created_at)
 			VALUES (?, ?, 'hold', '持仓', ?, ?, ?, ?, ?, ?, ?, ?, ?)
-			ON CONFLICT(code, log_date) DO UPDATE SET
+			ON CONFLICT(code, log_date, action) DO UPDATE SET
 				tier='持仓', score_total=excluded.score_total, adx=excluded.adx,
 				sar_long=excluded.sar_long, st_long=excluded.st_long, obv_up=excluded.obv_up,
 				macd_hist=excluded.macd_hist, td_countdown=excluded.td_countdown, signals=excluded.signals
@@ -339,7 +339,7 @@ func saveDecisions(st *store.Store, date string, candidates []screener.Candidate
 		err := st.DB().QueryRow(`
 			INSERT INTO decision_log (code, log_date, action, tier, score_total, adx, sar_long, st_long, obv_up, macd_hist, td_countdown, signals, created_at)
 			VALUES (?, ?, 'select', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-			ON CONFLICT(code, log_date) DO UPDATE SET
+			ON CONFLICT(code, log_date, action) DO UPDATE SET
 				tier=excluded.tier, score_total=excluded.score_total, adx=excluded.adx,
 				sar_long=excluded.sar_long, st_long=excluded.st_long, obv_up=excluded.obv_up,
 				macd_hist=excluded.macd_hist, td_countdown=excluded.td_countdown, signals=excluded.signals
