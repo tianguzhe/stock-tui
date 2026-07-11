@@ -63,7 +63,7 @@ echo ""
 # 6. 生成选股表（如果有持仓）
 echo "=== 6/6 生成选股表 ==="
 if [ -f "$PROJECT_ROOT/.holdings" ]; then
-  HOLDINGS=$(cat "$PROJECT_ROOT/.holdings")
+  HOLDINGS=$(grep -v "^#" "$PROJECT_ROOT/.holdings" | tr "\n" "," | sed "s/,\+/,/g; s/^,//; s/,$//")
   echo "持仓配置: $HOLDINGS"
   ./scripts/screen-stocks.sh --holdings "$HOLDINGS"
 else

@@ -25,6 +25,7 @@ __pycache__/
 # Go 编译产物
 /indicator-analyze
 /stockdb
+cmd/stockdb/stockdb
 
 # 工具缓存
 .ace-tool/

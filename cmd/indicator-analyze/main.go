@@ -390,6 +390,17 @@ func printAnalysis(data seriesData) store.Snapshot {
 				ynMark(lastC.VolumeLessBigKline), ynMark(lastC.Ratio90v3), ynMark(lastC.IsLowPosition), cyqLabel)
 		}
 	}
+	// CYC 成本均线(筹码面): 成交量加权均价,无需换手率
+	cyc := indicator.CalcCYC(candles)
+	if len(cyc) > 0 {
+		lastC := cyc[n-1]
+		note := ""
+		if candles[n-1].Amount <= 0 {
+			note = " (Amount=0·退化为收盘价)"
+		}
+		fmt.Printf("CYC CYC5=%.3f  CYC13=%.3f  CYC34=%.3f  CYC∞=%.3f%s\n",
+			lastC.CYC5, lastC.CYC13, lastC.CYC34, lastC.CYCInf, note)
+	}
 	fmt.Printf("当前策略触发: trendBull=%t(%d/4) trendBear=%t(%d/4) oversold=%t(%d/4) overbought=%t(%d/4) breakBull=%t(%d/3) breakBear=%t(%d/3) revertBull=%t(%d/3) revertBear=%t(%d/3) divBull=%t(%d/1,today=%t) divBear=%t(%d/1,today=%t)\n",
 		score.Signals.TrendBull, score.Signals.TrendBullScore, score.Signals.TrendBear, score.Signals.TrendBearScore,
 		score.Signals.Oversold, score.Signals.OversoldScore, score.Signals.Overbought, score.Signals.OverboughtScore,
