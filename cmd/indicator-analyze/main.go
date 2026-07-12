@@ -68,23 +68,30 @@ func run(args []string) error {
 		return fmt.Errorf("-n must be positive")
 	}
 
-	// -save 省 TDX：-save 默认纯 HTTP，避免批量保存时每个标的 100-170ms 的 TDX 握手开销
-	// -save -tdx 组合则恢复 TDX 优先（获取更精确的 Amount + 本地换手率）
-	// 纯分析模式（无 -save）保持 TDX 优先以获取最优数据质量
+	// Data source dispatch — 前复权口径对齐 -save 落库口径。
+	//
+	// tdx (github.com/quantbeing/tdx) 的 GetSecurityBars 只回原始不复权价，库本身不提供
+	// 复权。除权分红会在不复权序列里制造断崖（如 sh512480 2026-07-03 除权，不复权 2.70→1.33），
+	// 污染 BOLL bandwidth/ATR/SAR/CYQ 获利盘比例/PRY1 与回测 PERF 样本，违反 CLAUDE.md
+	// 「CYQ 须前复权」前置。
+	//
+	// 因此默认（含纯分析模式与 -save）统一走 HTTP 前复权（fetchDailyKline 请求腾讯 qfq），
+	// 与 snapshot 落库口径一致。-tdx 仅作显式开启不复权口径的选项：保留 tdx 精确 Amount +
+	// 本地换手率（cyq/cyc 的 VWAP 口径），但调用方须自负除权断崖污染指标的风险。
 	var data seriesData
 	var err error
-	if *save && !*useTDX {
-		data, err = fetchDailyKline(code, *bars)
-		if err != nil {
-			return fmt.Errorf("HTTP 获取失败: %w", err)
-		}
-	} else {
+	if *useTDX {
 		data, err = fetchViaTDX(code, *bars)
 		if err != nil {
 			data, err = fetchDailyKline(code, *bars)
 			if err != nil {
 				return fmt.Errorf("tdx 和 HTTP 都失败: %w", err)
 			}
+		}
+	} else {
+		data, err = fetchDailyKline(code, *bars)
+		if err != nil {
+			return fmt.Errorf("HTTP 获取失败: %w", err)
 		}
 	}
 	snap := printAnalysis(data)

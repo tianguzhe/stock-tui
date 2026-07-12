@@ -12,8 +12,8 @@
 - `docs/cyq-data-source-notes.md` — CYQ 筹码指标数据源注意事项
 
 ## 行情数据
-- 数据源优先级（分析模式）：**通达信 TCP 协议主力**(`github.com/quantbeing/tdx`) → 腾讯 HTTP → 东财 HTTP(兜底)。`indicator-analyze` 自动链式回退。
-- 数据源（`-save` 模式）：**默认跳过 TDX，走纯 HTTP**（腾讯 OHLCV + 东财换手率），避免批量保存时 TDX 握手开销。需要 TDX 精度时加 `-tdx` 显式启用。
+- 数据源优先级（分析模式与 `-save`）：**HTTP 前复权主力**（腾讯 `qfq` OHLCV + 东财换手率兜底）。纯分析模式与 `-save` 统一走 HTTP 前复权，与 snapshot 落库口径一致。
+- `-tdx` 显式开启通达信 TCP 协议（`github.com/quantbeing/tdx`）：保留精确 Amount + 本地换手率（CYQ/CYC 的 VWAP 口径），**但价格不前复权**——除权分红会在高价段制造断崖，污染 BOLL bandwidth/ATR/SAR/CYQ 获利盘比例/PRY1 与回测 PERF 样本，仅在需要 Amount 精度时使用。
 - `internal/api` 仅封装实时报价 `FetchStocks` 与分时 `FetchMinute`,**无日K**——日K走 tdx 协议或 HTTP 自拉。
 - 接口文档见 `docs/data-apis.md`(腾讯/东财/新浪 OHLC 字段顺序、`sh`/`sz`/`bj` 前缀映射、换手率字段均已更新)。
 
@@ -153,9 +153,9 @@
 ## 技术面分析 CLI
 - 深度技术面分析优先用固定命令 `go run ./cmd/indicator-analyze <代码>`；不要再写一次性 `cmd/<name>/main.go`。
 - `indicator-analyze` 数据流：
-  - **纯分析模式（无 `-save` 无 `-tdx`）**：TCP 协议主力 → 腾讯 HTTP(兜底) → 东财 HTTP(兜底换手率)
-  - **`-save` 模式**：纯 HTTP，跳过 TDX，避免批量保存时每个标的 100-170ms 的 TDX 握手开销
-  - **`-save -tdx` 或 `-tdx` 模式**：显式启用 TDX 协议（获取更精确的 Amount + 本地换手率）
+  - **纯分析模式（无 `-save` 无 `-tdx`）**：HTTP 前复权主力（腾讯 `qfq` OHLCV + 东财换手率兜底），与落库口径一致
+  - **`-save` 模式**：同上，纯 HTTP 前复权（避免批量保存时每个标的 100-170ms 的 TDX 握手开销）
+  - **`-tdx` 模式**（含 `-save -tdx`）：显式启用 TDX 协议（获取更精确的 Amount + 本地换手率），**价格不前复权**，除权日断崖会污染 BOLL/ATR/SAR/CYQ/PERF，仅在需要 Amount 精度时使用
 - 快速提取关键字段：`go run ./cmd/indicator-analyze <code> 2>/dev/null | grep -E "SCORE|TD_NOW|SAR_KELT|DIVERGENCE|PERF|CYQ"`
 - 批量落库（纯 HTTP，约 90 秒）：`go build -o /tmp/ia ./cmd/indicator-analyze && sqlite3 data/stock.db "SELECT code FROM instrument;" | xargs -I{} /tmp/ia -save {}`
 - 多因子选股筛选：**已统一为 Go 实现**（类型安全、性能更优）
@@ -223,7 +223,7 @@
 go build -o /tmp/ia ./cmd/indicator-analyze && sqlite3 data/stock.db \
   "SELECT code FROM instrument;" | xargs -I{} -P 1 /tmp/ia -save {}
 # ⚠️ 注意：-P 4 并发会导致 SQLITE_BUSY 错误，必须用 -P 1
-# ⚠️ -save 默认跳过 TDX（纯 HTTP），因 CYQ 需要 Amount 才需加 -tdx；全池约 285 只
+# ⚠️ -save 默认走 HTTP 前复权（前复权口径与 snapshot 一致）；若 CYQ/CYC 需精确 Amount/VWAP 才加 -tdx（代价是价格不前复权，除权日指标会失真）；全池约 285 只
 
 # 2. 计算 RS 相对强度百分位排名（横截面 ret20 排名，全量落库当日即有效）
 go run ./cmd/stockdb rs-rank
@@ -252,7 +252,8 @@ go run ./cmd/stockdb backfill
 - 末端降级口径：乖离 `bias24/atr_pct > 4`（波动归一化）、连涨≥5日、换手率≥15%（`tr >= 15`,15–20% 闭区间含端点）任一触发即从推荐降为观察；市场广度（池内站上 MA20 比例）< 40% 时推荐上限减半
 
 ### 数据源(2026-07 更新)
-- 数据源优先级: **tdx 协议**(`github.com/quantbeing/tdx` v0.1.3, `FromBestHost` 自动选服务器) → 腾讯 HTTP(兜底) → 东财 HTTP(换手率兜底 f61)。`indicator-analyze` 自动链式回退。
+- 数据源优先级(默认/`-save`): **HTTP 前复权**(腾讯 `qfq` OHLCV) → 东财 HTTP(换手率兜底 f61)。**`-tdx` 才切 tdx 协议**(`github.com/quantbeing/tdx` v0.1.3, `FromBestHost` 自动选服务器),tdx 失败仍回退 HTTP。
+- ⚠️ **tdx 协议返回不复权原始价**(库本身不提供复权,唯一相关 `GetXdxrInfo` 需调用方自行算复权但项目未用)。除权分红会在不复权序列制造断崖(sh512480 2026-07-03 不复权 2.70→1.33,前复权仅 -1.4%),污染 BOLL/ATR/SAR/CYQ/PERF。故默认改走 HTTP 前复权,与 snapshot 口径对齐;`-tdx` 仅在需精确 Amount+本地换手率时显式使用。
 - tdx 代码映射: `sh600522` → `model.MarketSH` + `"600522"`; `sz000001` → `model.MarketSZ` + `"000001"`.
 - tdx 日K `GetSecurityBars` 返回**按日期升序**, `bars[0]` 最旧, `bars[len-1]` 最新。
 - tdx 换手率: `GetFinanceInfo(ctx, market, code).LiutongGuben`(流通股本,单位股) → `turnover = Vol / LiutongGuben`(小数)。
