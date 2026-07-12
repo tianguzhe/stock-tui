@@ -304,10 +304,11 @@ func cmdBacktest(args []string) error {
 	// 解析信号类型
 	var signalList []string
 	if *signals == "all" {
+		// 趋势跟随空头 / 量价突破多头 / 量价突破空头 暂无 snapshot 落库列,
+		// findSignals 只能读为硬编码 0、永不触发,故 all 不含这三类。
 		signalList = []string{
-			"趋势跟随多头", "趋势跟随空头",
+			"趋势跟随多头",
 			"超买反转空头", "超卖反转多头",
-			"量价突破多头", "量价突破空头",
 			"顶背离空头", "底背离多头",
 		}
 	} else {
@@ -362,9 +363,10 @@ func cmdBacktestPortfolio(args []string) error {
 	// 解析信号类型
 	var signalList []string
 	if *signals == "all" {
+		// 量价突破多头 无 snapshot 落库列,回测永不触发,故 all 不含。
 		signalList = []string{
 			"趋势跟随多头", "超买反转空头", "超卖反转多头",
-			"量价突破多头", "顶背离空头", "底背离多头",
+			"顶背离空头", "底背离多头",
 		}
 	} else {
 		signalList = strings.Split(*signals, ",")

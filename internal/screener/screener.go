@@ -258,7 +258,7 @@ func lateStageRisk(c *Candidate) bool {
 		(tdTop >= 5 && divBear) ||
 		stretched ||
 		streak >= 5 ||
-		tr > 15
+		tr >= 15
 }
 
 // ComputeTier assigns rating tier to a candidate.

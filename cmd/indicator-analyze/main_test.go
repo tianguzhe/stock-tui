@@ -380,3 +380,124 @@ func TestEvalBullBear(t *testing.T) {
 		}
 	})
 }
+
+// TestCHOPCMISignFollowsDMIDirection guards the #7 口径 correction: the CHOPCMI
+// score component confirms trend *efficiency* (CHOP/CMI) but takes its *sign*
+// from DMI direction (dmiDiff = PDI - MDI), so a strong downtrend confirms
+// bearish, not bullish.  CMI uses abs() so a mirrored up/downtrend yields the
+// same CMI — only dmiDiff breaks the symmetry.
+func TestCHOPCMISignFollowsDMIDirection(t *testing.T) {
+	const n = 61
+	candles := flatCandles(n, 10)
+	obv := make([]float64, n)
+
+	mkCHOPCMI := func(last indicator.Result) int {
+		results := flatResults(n, last)
+		return scoreResult(candles, results, obv, 1, 1, 1.0).CHOPCMI
+	}
+
+	strong := indicator.Result{CHOP: 15, CMI: 95} // CHOP<30 && CMI>70 → strong trend efficiency
+
+	// Bull direction: PDI>MDI → CHOPCMI positive.
+	if got := mkCHOPCMI(withDMI(strong, 40, 10, 30)); got != 3 {
+		t.Fatalf("bull dmiDiff: CHOPCMI=%d, want +3", got)
+	}
+	// Bear direction: PDI<MDI → CHOPCMI negative (the #7 fix).
+	if got := mkCHOPCMI(withDMI(strong, 10, 40, 30)); got != -3 {
+		t.Fatalf("bear dmiDiff: CHOPCMI=%d, want -3 (sign must follow DMI, not be +3)", got)
+	}
+
+	weak := indicator.Result{CHOP: 15, CMI: 65} // CHOP<38.2 && CMI>60 → 2 magnitude
+	if got := mkCHOPCMI(withDMI(weak, 40, 10, 25)); got != 2 {
+		t.Fatalf("bull weak dmiDiff: CHOPCMI=%d, want +2", got)
+	}
+	if got := mkCHOPCMI(withDMI(weak, 10, 40, 25)); got != -2 {
+		t.Fatalf("bear weak dmiDiff: CHOPCMI=%d, want -2", got)
+	}
+
+	// Choppy market (CHOP high / CMI low) stays negative regardless of stance —
+	// chop drags any directional strategy, no direction symmetry to enforce.
+	choppy := indicator.Result{CHOP: 80, CMI: 20}
+	if got := mkCHOPCMI(withDMI(choppy, 40, 10, 30)); got != -3 {
+		t.Fatalf("choppy bull: CHOPCMI=%d, want -3", got)
+	}
+}
+
+// withDMI returns a copy of r with its DMI fields set (PDI, MDI, ADX).
+func withDMI(r indicator.Result, pdi, mdi, adx float64) indicator.Result {
+	r.DMI.PDI, r.DMI.MDI, r.DMI.ADX = pdi, mdi, adx
+	return r
+}
+
+// evalSignals: CHOP must not double-count with ADX as a second trend-strength
+// vote, and WR/KDJ must share one same-source momentum vote.  Flat candles pin
+// close==ma5==ma20 so the MA 排列 branch never trips — only the score-axis votes
+// remain, letting us assert exact counts.
+func TestEvalSignalsSameSourceNoDoubleVote(t *testing.T) {
+	const n = 61
+	i := n - 1
+	candles := flatCandles(n, 10)
+	obv := make([]float64, n)
+	results := flatResults(n, indicator.Result{})
+
+	mk := func(mutate func(*indicator.Result)) signalState {
+		last := results[i]
+		mutate(&last)
+		results[i] = last
+		return evalSignals(candles, results, obv, i)
+	}
+
+	// #5: a downtrend with ADX>25, MACD dead cross, CHOP very low (trend strong).
+	// Old code counted CHOP<38.2 + ADX>25 as TWO votes → 3 with MACD → fired
+	// TrendBear WITHOUT MA confirmation.  New code drops CHOP → only ADX + MACD =
+	// 2 votes → TrendBear must NOT fire (needs MA 排列 to reach 3).
+	t.Run("趋势同轴_CHOP不与ADX双计_无MA不触发", func(t *testing.T) {
+		s := mk(func(r *indicator.Result) {
+			r.DMI.ADX, r.DMI.PDI, r.DMI.MDI = 30, 10, 40 // ADX>25 + MDI>PDI
+			r.MACD.DIF = -0.5                            // dead cross direction
+			r.CHOP = 15                                  // very low (trend efficient) — must NOT add a vote
+			r.RSI.RSI6 = 50                              // neutral, no oversold interference
+		})
+		if s.TrendBearScore != 2 {
+			t.Fatalf("TrendBearScore=%d, want 2 (ADX + MACD; CHOP no longer double-counts)", s.TrendBearScore)
+		}
+		if s.TrendBear {
+			t.Fatalf("TrendBear fired at score=2 — must require 3 (MA 排列 guarantees independence)")
+		}
+	})
+
+	// #6: oversold with RSI<30, WR>80, KDJ<20, BIAS not extreme.  Old code counted
+	// WR and KDJ as TWO same-source votes → 3 with RSI → fired Oversold.  New code
+	// merges WR||KDJ into ONE → RSI + same-source = 2 → must NOT fire.
+	t.Run("动量同源_WR与KDJ合一票_不足3不触发", func(t *testing.T) {
+		s := mk(func(r *indicator.Result) {
+			r.RSI.RSI6 = 25                        // RSI oversold (1 vote)
+			r.WR.WR14 = 85                         // WR oversold (same-source as KDJ)
+			r.KDJ.K, r.KDJ.D, r.KDJ.J = 15, 18, 10 // KDJ oversold + J turning up (same-source)
+			r.BIAS.BIAS24 = -8                     // not extreme, so BIAS adds no vote
+		})
+		if s.OversoldScore != 2 {
+			t.Fatalf("OversoldScore=%d, want 2 (RSI + WR||KDJ merged; WR and KDJ no longer double-count)", s.OversoldScore)
+		}
+		if s.Oversold {
+			t.Fatalf("Oversold fired at score=2 — WR/KDJ must share one vote, threshold stays 3")
+		}
+	})
+
+	// Confirm the symmetric overbought path merges WR||KDJ too (catch a regression
+	// that fixes only one side).
+	t.Run("超买同源_WR与KDJ合一票_不足3不触发", func(t *testing.T) {
+		s := mk(func(r *indicator.Result) {
+			r.RSI.RSI6 = 75
+			r.WR.WR14 = 15
+			r.KDJ.K, r.KDJ.D, r.KDJ.J = 85, 88, 90
+			r.BIAS.BIAS24 = 8
+		})
+		if s.OverboughtScore != 2 {
+			t.Fatalf("OverboughtScore=%d, want 2 (RSI + WR||KDJ merged)", s.OverboughtScore)
+		}
+		if s.Overbought {
+			t.Fatalf("Overbought fired at score=2 — same-source merge must apply symmetrically")
+		}
+	})
+}

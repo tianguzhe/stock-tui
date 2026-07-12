@@ -264,6 +264,13 @@ func TestLateStageRisk(t *testing.T) {
 			want: true,
 		},
 		{
+			// 15.0% is the lower edge of the "15-20%" 末端降级 band — closed interval,
+			// consistent with streak >= 5 above. Guards against regressing to tr > 15.
+			name: "turnover 边界 15.0% 触发(闭区间)",
+			mod:  func(c *Candidate) { c.TurnoverRate = 15.0 },
+			want: true,
+		},
+		{
 			name: "large gain + volume spike",
 			mod: func(c *Candidate) {
 				c.ChangePct = 5.5

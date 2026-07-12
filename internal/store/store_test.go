@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"testing"
+	"time"
 
 	_ "modernc.org/sqlite"
 )
@@ -215,6 +216,9 @@ ALTER TABLE snapshot_legacy RENAME TO snapshot;
 	var dummy float64
 	err = reopened.db.QueryRow(
 		`SELECT COALESCE(low,0)+COALESCE(high,0)+COALESCE(turnover_rate,0)+COALESCE(market_cap,0)+COALESCE(pe,0)+COALESCE(rs20,0)+COALESCE(rs60,0)+COALESCE(rs120,0)
+		+COALESCE(ret20,0)+COALESCE(ret60,0)+COALESCE(ret120,0)
+		+COALESCE(perf_trend_follow_bull_win10,0)+COALESCE(perf_overbought_bear_win10,0)+COALESCE(perf_div_bear_win10,0)
+		+COALESCE(perf_trend_follow_bull_n,0)+COALESCE(perf_overbought_bear_n,0)+COALESCE(perf_div_bear_n,0)
 		+COALESCE(perf_trend_follow_bull_avg10,0)+COALESCE(keltner_squeeze,0)+COALESCE(donch_break20_bull,0)+COALESCE(donch_break55_bull,0)+COALESCE(score_adj,0)
 		+COALESCE(sar_value,0)+COALESCE(supertrend_value,0) FROM snapshot LIMIT 1`,
 	).Scan(&dummy)
@@ -381,6 +385,103 @@ func TestCloseAfterUsesGlobalTradingDayAndRequiresExactCodeSnapshot(t *testing.T
 	if close != 25 || date != "2026-06-05" {
 		t.Fatalf("expected exact fourth global day close=25 date=2026-06-05, got close=%v date=%q", close, date)
 	}
+}
+
+// TestDecisionLogLifecycle covers the decision-log round trip: SaveDecision dedup
+// via UNIQUE(code,log_date,action), PendingDecisions surfaces un-backfilled rows
+// older than the T+10 natural-day cutoff, BackfillDecision writes outcome/correct,
+// and StatsByTier only aggregates rows whose outcome_pct has been set.
+func TestDecisionLogLifecycle(t *testing.T) {
+	s := openTemp(t)
+
+	if err := s.UpsertInstrument("sz000001", "平安银行", "sz", ""); err != nil {
+		t.Fatalf("seed instrument: %v", err)
+	}
+
+	d := Decision{
+		Code: "sz000001", LogDate: "2026-01-01", Action: "recommend", Tier: "⭐⭐⭐",
+		ScoreTotal: 70, ADX: 25, SARLong: true, STLong: true, OBVUp: true,
+		MACDHist: 0.1, TDCountdown: "见顶/3", Signals: "trend_bull",
+	}
+	if err := s.SaveDecision(d); err != nil {
+		t.Fatalf("SaveDecision: %v", err)
+	}
+	// Duplicate (code, log_date, action) must be ignored, not error — SaveDecision
+	// uses INSERT OR IGNORE on the UNIQUE constraint.
+	if err := s.SaveDecision(d); err != nil {
+		t.Fatalf("SaveDecision duplicate should be ignored: %v", err)
+	}
+
+	pending, err := s.PendingDecisions()
+	if err != nil {
+		t.Fatalf("PendingDecisions: %v", err)
+	}
+	if len(pending) != 1 {
+		t.Fatalf("expected 1 pending decision (log_date 2026-01-01 is older than the -10 days cutoff), got %d", len(pending))
+	}
+	if pending[0].Code != "sz000001" || pending[0].Action != "recommend" {
+		t.Fatalf("unexpected pending decision: %+v", pending[0])
+	}
+	id := pending[0].ID
+
+	// A fresh (within the cutoff) decision must NOT be returned as pending.
+	fresh := Decision{Code: "sz000001", LogDate: todayISO(), Action: "hold", Tier: "持仓"}
+	if err := s.SaveDecision(fresh); err != nil {
+		t.Fatalf("SaveDecision fresh: %v", err)
+	}
+	pending, err = s.PendingDecisions()
+	if err != nil {
+		t.Fatalf("PendingDecisions after fresh: %v", err)
+	}
+	if len(pending) != 1 {
+		t.Fatalf("fresh decision (within -10 days) should not surface as pending, got %d", len(pending))
+	}
+
+	// Backfill the original pending decision.
+	if err := s.BackfillDecision(id, 3.5, "2026-01-15", true); err != nil {
+		t.Fatalf("BackfillDecision: %v", err)
+	}
+
+	// Once backfilled, it must leave the pending set.
+	pending, err = s.PendingDecisions()
+	if err != nil {
+		t.Fatalf("PendingDecisions after backfill: %v", err)
+	}
+	// Only the fresh un-backfilled hold remains; the backfilled recommend is gone.
+	stillPending := false
+	for _, p := range pending {
+		if p.ID == id {
+			stillPending = true
+		}
+	}
+	if stillPending {
+		t.Fatalf("backfilled decision %d must not remain pending: %+v", id, pending)
+	}
+
+	// StatsByTier aggregates only outcome_pct IS NOT NULL — the backfilled row
+	// counts, the un-backfilled hold does not.
+	stats, err := s.StatsByTier()
+	if err != nil {
+		t.Fatalf("StatsByTier: %v", err)
+	}
+	var found bool
+	for _, st := range stats {
+		if st.Tier == "⭐⭐⭐" {
+			found = true
+			if st.Count != 1 || st.Wins != 1 {
+				t.Fatalf("tier ⭐⭐⭐ expected count=1 wins=1, got count=%d wins=%d", st.Count, st.Wins)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("expected tier ⭐⭐⭐ in stats, got %+v", stats)
+	}
+}
+
+// todayISO returns the current date as YYYY-MM-DD, used to seed a within-cutoff
+// decision that PendingDecisions must skip.
+func todayISO() string {
+	return time.Now().Format("2006-01-02")
 }
 
 func TestImportHotStocksInsertIgnore(t *testing.T) {

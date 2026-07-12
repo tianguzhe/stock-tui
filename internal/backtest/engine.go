@@ -4,12 +4,22 @@ import (
 	"database/sql"
 	"fmt"
 	"math"
+	"os"
 	"sort"
 	"time"
 
 	"github.com/google/uuid"
 	"stock-tui/internal/store"
 )
+
+// unsupportedSignals are computed in evalSignals but never persisted to a snapshot
+// column, so findSignals can only read them as the hardcoded 0 — backtesting them
+// is a silent no-op.  Declared here so Run can warn when a user asks for one.
+var unsupportedSignals = map[string]bool{
+	"趋势跟随空头": true,
+	"量价突破多头": true,
+	"量价突破空头": true,
+}
 
 // Config 回测配置
 type Config struct {
@@ -62,10 +72,14 @@ func NewEngine(db *sql.DB, st *store.Store, config Config) *Engine {
 		config.HoldingDays = 10
 	}
 	if len(config.Signals) == 0 {
+		// Default list excludes 趋势跟随空头 / 量价突破多头 / 量价突破空头:
+		// those have no persisted snapshot columns, so findSignals only reads
+		// them as the hardcoded 0 and they would never fire.  trend_bear /
+		// break_bull / break_bear are computed in evalSignals but not stored,
+		// so backtesting them is silently a no-op.
 		config.Signals = []string{
-			"趋势跟随多头", "趋势跟随空头",
+			"趋势跟随多头",
 			"超买反转空头", "超卖反转多头",
-			"量价突破多头", "量价突破空头",
 			"顶背离空头", "底背离多头",
 		}
 	}
@@ -89,6 +103,14 @@ func (e *Engine) Run() (string, error) {
 		fmt.Printf("信号类型: %v\n", e.config.Signals)
 		fmt.Printf("持有天数: %d\n", e.config.HoldingDays)
 		fmt.Printf("止损设置: %.1f%%\n\n", e.config.StopLoss)
+	}
+
+	// Warn about signal types with no persisted snapshot column — they would run
+	// silently as 0 hits.  Surface this before the work so the user can fix flags.
+	for _, s := range e.config.Signals {
+		if unsupportedSignals[s] {
+			fmt.Fprintf(os.Stderr, "warning: 信号 %q 无 snapshot 落库列,回测不会产生结果(已从默认列表移除)\n", s)
+		}
 	}
 
 	// 1. 查询符合条件的所有信号

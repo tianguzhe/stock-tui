@@ -179,7 +179,7 @@
 
 ## snapshot 表结构关键点
 - 字段名：`trade_date`（非 `date`）、`sar_long`/`supertrend_long`（非 `sar_stance`）、下划线命名（snake_case）
-- 无 `low`/`high` 字段，回测/止损计算只能用 `close`（盘中最低点数据不可得）
+- 已有 `low`/`high` 字段(struct/CREATE TABLE/ALTER 容错/SaveSnapshot 四子处同步),回测盘中止损/止盈读 `COALESCE(low, close)` 与 `COALESCE(high, close)`(`internal/backtest/engine.go`、`portfolio.go` 的 `getPriceRange`),旧行缺失时回退 close;数据覆盖率约 79%(2026-06 起)
 - 数据是**逐日累积**的（每次 `-save` 仅保存当日），不是一次性回填历史——回测需完整 T+N 数据，数据不足时 `exit_date` 为空
 - 查看数据范围：`sqlite3 data/stock.db "SELECT MIN(trade_date), MAX(trade_date), COUNT(DISTINCT trade_date) FROM snapshot;"`
 
@@ -249,7 +249,7 @@ go run ./cmd/stockdb backfill
 - `SAR/ST`：`多/多` = SAR 多头 + SuperTrend 多头，双确认；持仓翻空时选股表显示 `⚠️SAR/ST双空` 等警示，必须执行退出纪律
 - `止损价`：snapshot `sar_value` 列（批量落库后直接读取）；选股表"止损(距%)"列即此值；`--capital 总资金` 可输出候选建议仓位（单笔风险 1% / 止损距离）
 - 量比口径：量比 < 0.8 / > 1.5 为阈值，描述时一律写"量比 X.X（< 0.8）"格式，不用"缩量/放量"
-- 末端降级口径：乖离 `bias24/atr_pct > 4`（波动归一化）、连涨≥5日、换手 15–20% 任一触发即从推荐降为观察；市场广度（池内站上 MA20 比例）< 40% 时推荐上限减半
+- 末端降级口径：乖离 `bias24/atr_pct > 4`（波动归一化）、连涨≥5日、换手率≥15%（`tr >= 15`,15–20% 闭区间含端点）任一触发即从推荐降为观察；市场广度（池内站上 MA20 比例）< 40% 时推荐上限减半
 
 ### 数据源(2026-07 更新)
 - 数据源优先级: **tdx 协议**(`github.com/quantbeing/tdx` v0.1.3, `FromBestHost` 自动选服务器) → 腾讯 HTTP(兜底) → 东财 HTTP(换手率兜底 f61)。`indicator-analyze` 自动链式回退。

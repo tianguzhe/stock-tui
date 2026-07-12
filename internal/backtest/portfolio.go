@@ -217,10 +217,15 @@ func (e *PortfolioEngine) Run() error {
 	}
 
 	// 4. 关闭剩余持仓（按收盘价强制平仓，记录为 Trade 以纳入胜率统计）
+	dataMissing := 0 // 持仓在 EndDate 无快照：capital 仍按入场价近似结算，但不计入胜率统计
 	for _, pos := range positions {
 		exitPrice, err := e.getPrice(pos.Code, e.config.EndDate)
 		if err != nil {
-			exitPrice = pos.EntryPrice // fallback
+			// EndDate 缺数据(停牌/数据不足):真实收益不可得,用入场价保守近似结算
+			// capital,但跳过该笔的 Trade 记录——否则伪 0% 收益会污染胜率/收益统计。
+			dataMissing++
+			capital += float64(pos.Shares)*pos.EntryPrice - float64(pos.Shares)*pos.EntryPrice*e.config.Commission
+			continue
 		}
 		revenue := float64(pos.Shares) * exitPrice
 		commission := revenue * e.config.Commission
@@ -250,6 +255,9 @@ func (e *PortfolioEngine) Run() error {
 	e.printResults(totalReturn, capital, stats, trades, positions)
 
 	fmt.Printf("\n耗时: %d ms\n", time.Since(startTime).Milliseconds())
+	if dataMissing > 0 {
+		fmt.Printf("注: %d 笔持仓在回测结束日无快照(停牌/数据不足),已按入场价结算权益但未计入胜率统计\n", dataMissing)
+	}
 
 	return nil
 }

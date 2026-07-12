@@ -225,6 +225,12 @@ func fetchEMTurnovers(code string, count int, tencentDates []string) []float64 {
 			defer resp.Body.Close()
 			break
 		}
+		// Go net/http may return a non-nil resp even on err — close it on this
+		// failing attempt so we never leak a keep-alive body across retries.
+		if resp != nil {
+			resp.Body.Close()
+			resp = nil
+		}
 		if attempt < 2 {
 			time.Sleep(time.Duration(300*(attempt+1)) * time.Millisecond)
 		}
@@ -718,12 +724,25 @@ func scoreResult(candles []indicator.Candle, results []indicator.Result, obv []f
 		score.BIAS = -3
 	}
 
-	// CHOPCMI: pure trend efficiency score, decoupled from DMI direction.
+	// CHOPCMI: trend-efficiency confirmation. CLAUDE.md「CMI/CHOP 仅印证」means it
+	// confirms *that* a trend is efficient, never the *direction* — CHOP and CMI
+	// are direction-agnostic (CMI uses abs()), so a steady 30-bar downtrend yields
+	// the same CMI=95 as its mirror uptrend. The strength magnitude stands (strong
+	// trend efficiency → bigger |score|), but the SIGN follows DMI direction
+	// (dmiDiff = PDI - MDI, computed above) so a bear trend confirms bearish, not
+	// bullish. The choppy case (CHOP high / CMI low) stays negative: choppy markets
+	// drag any directional strategy regardless of stance.
 	switch {
 	case last.CHOP < 30 && last.CMI > 70:
 		score.CHOPCMI = 3
+		if dmiDiff < 0 {
+			score.CHOPCMI = -3
+		}
 	case last.CHOP < 38.2 && last.CMI > 60:
 		score.CHOPCMI = 2
+		if dmiDiff < 0 {
+			score.CHOPCMI = -2
+		}
 	case last.CHOP > 70 && last.CMI < 30:
 		score.CHOPCMI = -3
 	case last.CHOP > 61.8 && last.CMI < 40:
@@ -906,10 +925,18 @@ func evalSignals(candles []indicator.Candle, results []indicator.Result, obv []f
 	crossDown60 := candles[i-1].Close >= closeMA(candles, i-1, 60) && candles[i].Close < ma60
 
 	s := signalState{
-		TrendBullScore:  countTrue(r.CHOP < 38.2, r.DMI.ADX > 25, r.MACD.DIF > 0 && r.DMI.PDI > r.DMI.MDI, candles[i].Close > ma5 && candles[i].Close > ma20 && ma5 > ma20),
-		TrendBearScore:  countTrue(r.CHOP < 38.2, r.DMI.ADX > 25, r.MACD.DIF < 0 && r.DMI.MDI > r.DMI.PDI, candles[i].Close < ma5 && candles[i].Close < ma20 && ma5 < ma20),
-		OversoldScore:   countTrue(r.RSI.RSI6 < 30, r.WR.WR14 > 80, r.KDJ.K < 20 && (r.KDJ.K > r.KDJ.D || r.KDJ.J > prev.KDJ.J), r.BIAS.BIAS24 < -10),
-		OverboughtScore: countTrue(r.RSI.RSI6 > 70, r.WR.WR14 < 20, r.KDJ.K > 80 && (r.KDJ.K < r.KDJ.D || r.KDJ.J < prev.KDJ.J), r.BIAS.BIAS24 > 10),
+		// Trend votes are 3 axis-aligned dimensions (CLAUDE.md「指标分工」: DMI
+		// strength + DMI/MACD direction + MA 排列). CHOP is same-axis with ADX
+		// trend strength — dropped here; its trend-efficiency value is already
+		// carried by the separate CHOPCMI score component, so it must not double-count.
+		TrendBullScore: countTrue(r.DMI.ADX > 25, r.MACD.DIF > 0 && r.DMI.PDI > r.DMI.MDI, candles[i].Close > ma5 && candles[i].Close > ma20 && ma5 > ma20),
+		TrendBearScore: countTrue(r.DMI.ADX > 25, r.MACD.DIF < 0 && r.DMI.MDI > r.DMI.PDI, candles[i].Close < ma5 && candles[i].Close < ma20 && ma5 < ma20),
+		// Oversold/Overbought votes are 3 axis-aligned dimensions (RSI magnitude +
+		// same-source WR/KDJ range position, merged + BIAS). WR and KDJ are both
+		// close-position-in-N-day-range — same source (CLAUDE.md), so they share ONE
+		// vote; either tripping counts, KDJ keeps its turning confirmation.
+		OversoldScore:   countTrue(r.RSI.RSI6 < 30, r.WR.WR14 > 80 || (r.KDJ.K < 20 && (r.KDJ.K > r.KDJ.D || r.KDJ.J > prev.KDJ.J)), r.BIAS.BIAS24 < -10),
+		OverboughtScore: countTrue(r.RSI.RSI6 > 70, r.WR.WR14 < 20 || (r.KDJ.K > 80 && (r.KDJ.K < r.KDJ.D || r.KDJ.J < prev.KDJ.J)), r.BIAS.BIAS24 > 10),
 		BreakBullScore:  countTrue(crossUp20 || crossUp60, vr > volSurge, obvUp),
 		BreakBearScore:  countTrue(crossDown20 || crossDown60, vr > volSurge, obvDown),
 		RevertBullScore: countTrue(r.BIAS.BIAS24 < -10, r.CHOP > 45, priceDown5 && obvUp),

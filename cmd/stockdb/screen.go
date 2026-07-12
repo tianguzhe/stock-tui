@@ -1,8 +1,8 @@
 package main
 
 import (
-	"database/sql"
 	"fmt"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -286,7 +286,8 @@ func formatSignals(c *screener.Candidate, cost float64, shares int, capital floa
 
 	// Profit or position hint
 	if cost > 0 && shares > 0 {
-		profit := (c.Close - cost) * float64(shares)
+		// shares is in 手 (1手=100股); scale to shares to compute yuan PnL.
+		profit := (c.Close - cost) * float64(shares) * 100
 		profitPct := (c.Close/cost - 1) * 100
 		parts = append(parts, fmt.Sprintf("浮盈%+.0f（%+.1f%%）", profit, profitPct))
 	} else if capital > 0 {
@@ -319,36 +320,40 @@ func saveDecisions(st *store.Store, date string, candidates []screener.Candidate
 			skippedHoldings++
 			continue
 		}
-		err := st.DB().QueryRow(`
+		_, err := st.DB().Exec(`
 			INSERT INTO decision_log (code, log_date, action, tier, score_total, adx, sar_long, st_long, obv_up, macd_hist, td_countdown, signals, created_at)
 			VALUES (?, ?, 'hold', '持仓', ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT(code, log_date, action) DO UPDATE SET
 				tier='持仓', score_total=excluded.score_total, adx=excluded.adx,
 				sar_long=excluded.sar_long, st_long=excluded.st_long, obv_up=excluded.obv_up,
 				macd_hist=excluded.macd_hist, td_countdown=excluded.td_countdown, signals=excluded.signals
-			RETURNING 1
 		`, c.Code, date, c.ScoreTotal, c.ADX, boolToInt(c.SARLong), boolToInt(c.SuperTrendLong),
-			boolToInt(c.OBVUp), c.MACDHist, c.TDCountdown, formatSignals(&c, h.Cost, h.Shares, 0), now).Scan(&upsertedHoldings)
-		if err == nil || err == sql.ErrNoRows {
-			upsertedHoldings++
+			boolToInt(c.OBVUp), c.MACDHist, c.TDCountdown, formatSignals(&c, h.Cost, h.Shares, 0), now)
+		if err != nil {
+			// Never swallow — report which holding failed so the user sees misses,
+			// since the summary count otherwise hides dropped rows.
+			fmt.Fprintf(os.Stderr, "warning: 持仓 %s 写入 decision_log 失败: %v\n", c.Code, err)
+			continue
 		}
+		upsertedHoldings++
 	}
 
 	// Save selected candidates
 	for _, c := range selected {
-		err := st.DB().QueryRow(`
+		_, err := st.DB().Exec(`
 			INSERT INTO decision_log (code, log_date, action, tier, score_total, adx, sar_long, st_long, obv_up, macd_hist, td_countdown, signals, created_at)
 			VALUES (?, ?, 'select', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT(code, log_date, action) DO UPDATE SET
 				tier=excluded.tier, score_total=excluded.score_total, adx=excluded.adx,
 				sar_long=excluded.sar_long, st_long=excluded.st_long, obv_up=excluded.obv_up,
 				macd_hist=excluded.macd_hist, td_countdown=excluded.td_countdown, signals=excluded.signals
-			RETURNING 1
 		`, c.Code, date, c.Tier, c.ScoreTotal, c.ADX, boolToInt(c.SARLong), boolToInt(c.SuperTrendLong),
-			boolToInt(c.OBVUp), c.MACDHist, c.TDCountdown, formatSignals(&c, 0, 0, 0), now).Scan(&upsertedSelected)
-		if err == nil || err == sql.ErrNoRows {
-			upsertedSelected++
+			boolToInt(c.OBVUp), c.MACDHist, c.TDCountdown, formatSignals(&c, 0, 0, 0), now)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "warning: 候选 %s 写入 decision_log 失败: %v\n", c.Code, err)
+			continue
 		}
+		upsertedSelected++
 	}
 
 	return
