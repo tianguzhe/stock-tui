@@ -4,7 +4,7 @@
 - `cmd/indicator-analyze` — 单标的深度技术面分析 CLI（tdx.go 单独存放 TDX TCP 协议逻辑，-tdx 标志显式启用）
 - `cmd/stockdb` — 数据库管理（tag/history/rs-rank/backfill/backtest）
 - `internal/api` — 实时行情 API 封装
-- `internal/indicator` — 技术指标计算引擎（含 CYQ 筹码分布衍生指标）
+- `internal/indicator` — 技术指标计算引擎（`Calculate` 核心集 + CYQ 筹码分布 / CYC 成本均线 / TD Sequential 衍生指标）
 - `internal/store` — SQLite 存储层（snapshot/decision_log/instrument）
 - `scripts/` — 每日更新/选股/日志生成/测试脚本
 - `docs/journal/` — 每日复盘日志
@@ -12,14 +12,20 @@
 - `docs/cyq-data-source-notes.md` — CYQ 筹码指标数据源注意事项
 
 ## 行情数据
-- 数据源优先级（分析模式与 `-save`）：**HTTP 前复权主力**（腾讯 `qfq` OHLCV + 东财换手率兜底）。纯分析模式与 `-save` 统一走 HTTP 前复权，与 snapshot 落库口径一致。
-- `-tdx` 显式开启通达信 TCP 协议（`github.com/quantbeing/tdx`）：保留精确 Amount + 本地换手率（CYQ/CYC 的 VWAP 口径），**但价格不前复权**——除权分红会在高价段制造断崖，污染 BOLL bandwidth/ATR/SAR/CYQ 获利盘比例/PRY1 与回测 PERF 样本，仅在需要 Amount 精度时使用。
 - `internal/api` 仅封装实时报价 `FetchStocks` 与分时 `FetchMinute`,**无日K**——日K走 tdx 协议或 HTTP 自拉。
 - 接口文档见 `docs/data-apis.md`(腾讯/东财/新浪 OHLC 字段顺序、`sh`/`sz`/`bj` 前缀映射、换手率字段均已更新)。
 
+### 数据源优先级与口径（2026-07 更新）
+- **默认 / `-save`**：**HTTP 前复权主力**——腾讯 `qfq` OHLCV(`fields2=f51..f61`：f52-55 正常小数、f56 单位是**手**(×100 转股)、f61 换手率直给 %) + 东财 HTTP(换手率兜底 f61)。需带 `Referer` + 完整 UA + `DisableKeepAlives: true`，偶发 EOF 需重试。纯分析模式与 `-save` 统一走此口径,与 snapshot 落库对齐。
+- **`-tdx` 显式启用通达信 TCP 协议**(`github.com/quantbeing/tdx` v0.1.3,`FromBestHost` 自动选服务器,tdx 失败回退 HTTP)：保留精确 Amount + 本地换手率(CYQ/CYC 的 VWAP 口径),**但价格不前复权**——库本身不提供复权(唯一相关 `GetXdxrInfo` 需调用方自算,项目未用)。除权分红在不复权序列制造断崖(sh512480 2026-07-03 不复权 2.70→1.33,前复权仅 -1.4%),污染 BOLL bandwidth/ATR/SAR/CYQ 获利盘/PRY1 与回测 PERF 样本,**仅在需精确 Amount + 本地换手率时显式使用**。
+- tdx 代码映射：`sh600522` → `model.MarketSH` + `"600522"`；`sz000001` → `model.MarketSZ` + `"000001"`。
+- tdx 日K `GetSecurityBars` 返回**按日期升序**,`bars[0]` 最旧,`bars[len-1]` 最新。
+- tdx 换手率：`GetFinanceInfo(ctx, market, code).LiutongGuben`(流通股本,单位股) → `turnover = Vol / LiutongGuben`(小数)。
+
 ## 技术指标
-- `indicator.Calculate([]Candle) []Result`(KDJ/MACD/RSI/WR/DMI/CMI/BIAS/CHOP/ATR/BOLL/Donchian/MFI/SAR/Keltner/SuperTrend);`WR` 为正值口径(**值越大越超卖**,与标准威廉符号相反)。
-- `Candle` 结构体字段: `Open`、`High`、`Low`、`Close`、`Volume`(股数)、`Amount`(元)。`Amount` 用于 CYQ 的 VWAP(均价),Volume=0 时回退为 (H+L)/2。
+- `indicator.Calculate([]Candle) []Result`(KDJ/MACD/RSI/StochRSI/WR/DMI/CMI/BIAS/CHOP/ATR/BOLL/Donchian/MFI/SAR/Keltner/SuperTrend);`WR` 为正值口径(**值越大越超卖**,与标准威廉符号相反)。`StochRSI` 挂在 `Result.RSI` 旁(`StochRSI.K/D`),在 `fillRSI` 之后填充,用于 RSI6 钝化时重新展开极端区间(CLI `stochStagnation`、score、PERF 均引用)。
+- `indicator.CalcCYC([]Candle) []CYCResult` 成本均线(N 日 VWAP = sum(Amount,N)/sum(Volume,N),非收盘价等权 MA):`CYC5`/`CYC13`/`CYC34`/`CYCInf`(全量历史加权)。Volume=0 该日跳出不参与加权,回退收盘价;前置依赖 `Amount`(元)/`Volume`(股数)。**纯展示指标**:仅 `cmd/indicator-analyze main.go:407` 一处调用打印 `CYC CYC5/13/34/∞` 一行,不进 score/screener/snapshot/PERF。
+- `Candle` 结构体字段: `Open`、`High`、`Low`、`Close`、`Volume`(股数)、`Amount`(元)。CYQ 的 avgPrice 优先 VWAP(`Amount/Volume`),Volume=0 时回退 `(H+L)/2`——VWAP 在暴跌日比 `(H+L)/2` 低最多 1.44%,修正系统性偏差。
 - `indicator.CalcCYQ([]Candle, []float64, float64) []CYQResult` 计算筹码衍生指标(持仓成本衰减模型):
   - `WinnerClose`/`WinnerOpen`/`WinnerHigh`/`WinnerLow` = 该价格的获利盘比例(0~1)
   - `ASR` = 活动筹码(收盘±10%区间筹码量,0~100)
@@ -37,10 +43,12 @@
   - **趋势总览用 ST**(确认大 stance,不易被洗出)
   - **SAR+ST 双空 + score 弱 → 硬清仓**(2026-07-02 工业富联/中天科技:SAR 早于 6/11 已空、ST 拖到 7/2 才翻,双空 + score≤44)
   - **SAR 翻空但 ST 仍多 → 高危观察**(圣泉 6/29 SAR 翻空、ST 仍多):跌破 ST 下轨值才彻底清仓;反弹则 SAR/ST 谁先翻转谁说了算
+  - **SAR 翻多但 ST 仍空 → 弱势修复**:短线反弹信号,但大趋势仍空头。站上 ST 上轨值才确认趋势反转
+  - **不一致时一律以 ST 判断大 stance**,SAR 作短线移动止损参考
   - CLI 近15日行 `SAR=空*`/`SAR=多*` 带 `*`=**当日刚翻转**;日志"止损价"列应区分 SAR 止损线(贴身)与 ST 趋势线(粗),不可混称
-- **动量/超买超卖**:`WR` 与 `KDJ` 同源(都基于 close 在 N 日 high-low 区间的位置),**勿当两个独立证据**;`RSI`(涨跌幅)、`BIAS`(乖离)口径不同可印证;`MACD` 相对独立(趋势性动量)。
+- **动量/超买超卖**:`WR` 与 `KDJ` 同源(都基于 close 在 N 日 high-low 区间的位置),**勿当两个独立证据**;`RSI`(涨跌幅)、`BIAS`(乖离)口径不同可印证;`MACD` 相对独立(趋势性动量)。`StochRSI`(K/D)= RSI6 在 14 日窗口内的位置,RSI6 钝死极端值时判别力丧失、StochRSI 重新展开该区间——见下「极端行情指标口径 → 极端超卖/超买」段。
 - **波动/通道**:`ATR`/BOLL 带宽量波动幅度;`BOLL`(σ 带)、`Keltner`(ATR 带)、`Donchian`(极值带)是三类通道,BOLL vs Keltner 的对比正是 Squeeze 的意义。
-- **资金**:`MFI`(0–100 有界、超买超卖)与 OBV(累计、趋势)互补;量比看量能强度。**MFI 定性口径**：> 80 超买 / 70–80 偏高 / 20–30 偏低 / < 20 超卖。
+- **资金**:`MFI`(0–100 有界、超买超卖,位于 `internal/indicator`)与 OBV(累计、趋势)互补;量比看量能强度。**MFI 定性口径**：> 80 超买 / 70–80 偏高 / 20–30 偏低 / < 20 超卖。**OBV 不在指标包**:实现为 `cmd/indicator-analyze main.go` 的 `obvSeries`(经典累加:收涨加量/收跌减量/平盘持平)+ `obvTrend`(近6日趋势文字"上升(净流入)"/"下降(净流出)"/"持平"),进 score 信号位 `OBVUp`、`evalBullBear`、PERF 与 CLI `OBV=` 输出;screener 的 star 分层另要求 OBV 3 日持续净流入(单日沦为 watch)。**未落 snapshot**,故选股表/回测/journal 看不到 OBV 数值,仅 CLI 运行时算。
 - **择时**:`TDSequential` 是独立口径,可与趋势/动量交叉印证。
 
 ### 极端行情指标口径
@@ -69,11 +77,6 @@
 - ATR 因 trueRange（含与前收盘差）急剧上升 → SAR/ST 止损线突然远离价格
 - 跳空后止损距离可能从 3% 突变到 15%+，之前设置的止损价失效
 - BOLL 带宽急剧扩大，`%B` 突破极端值——与连续涨跌停类似，是趋势延续信号
-
-**SAR/ST 不一致（SAR 翻空但 ST 仍多，或反之）**：
-- SAR 翻空 + ST 仍多 → "高危观察"：SAR 已发出短线风险信号，但大趋势 stance 仍多头。跌破 ST 下轨值才彻底清仓；反弹则 SAR/ST 谁先翻转谁说了算
-- SAR 翻多 + ST 仍空 → "弱势修复"：短线反弹信号，但大趋势仍空头。站上 ST 上轨值才确认趋势反转
-- 不一致时以 ST 判断大 stance，SAR 作为短线移动止损参考
 
 **TD 方向冲突（setup 与 countdown 方向不同）**：
 - setup 见底/N + countdown 见顶/M → "多空拉锯"：setup 显示下跌力竭，但 countdown 仍在计数顶部。以 countdown 方向为主（更长周期），setup 作为反弹预警
@@ -144,11 +147,9 @@
   - `PERF 超买反转空头` win10 < 35%：超买警报在本股历史近乎无效，可降权
   - `PERF 顶背离空头` win10 < 40%：顶背离历史无效，不以此降评级
   - 反之（超买/背离信号 win10 > 55%）：信号有效，应等回调再入场
-- **PERF N 为信号边沿计数**（信号 0→1 翻转才计 1 次，连续触发日不重复计数，避免重叠前向窗口灌水）；`screen-stocks.py` 的排除/容忍判断用 **Wilson 95% 置信界**（排除型须下界>50%，"历史差"型须上界<50%），小样本自动失去否决力。
+- **PERF N 为信号边沿计数**（信号 0→1 翻转才计 1 次，连续触发日不重复计数，避免重叠前向窗口灌水）；Go screen(`internal/screener.WilsonBounds`)的排除/容忍判断用 **Wilson 95% 置信界**（排除型须下界>50%，"历史差"型须上界<50%），小样本自动失去否决力。
 - **RS 排名是热榜池内百分位**（非全市场）：池子本身按热度准入，RS 高位叠加了双重动量选择，短期反转暴露是结构性的——排序已按 0.3*RS20+0.5*RS60+0.2*RS120 综合动量降权短期。
-- 快速提取 PERF 关键字段（不看全量输出）：
-  `go run ./cmd/indicator-analyze <code> 2>/dev/null | grep -E "SCORE|TD_NOW|SAR_KELT|DIVERGENCE|PERF"`
-- **score_adj 口径**：`-save` 落库两个分——`score_total` 为原始固定尺评分（历史可比），`score_adj` 为 PERF 自适应分（超买/顶背离惩罚按本股历史胜率调权：win10 低于阈值减半、高于 55% ×1.5，gate 在复合超买信号上）。`screen-stocks.py` 用 `COALESCE(score_adj, score_total)` 筛选；CLI `SCORE` 行的 `adj=`/`perfadj=` 即调整分与调整量。
+- **score_adj 口径**：`-save` 落库两个分——`score_total` 为原始固定尺评分（历史可比），`score_adj` 为 PERF 自适应分（超买/顶背离惩罚按本股历史胜率调权：win10 低于阈值减半、高于 55% ×1.5，gate 在复合超买信号上）。Go screen 用 `COALESCE(score_adj, score_total)` 筛选；CLI `SCORE` 行的 `adj=`/`perfadj=` 即调整分与调整量。
 
 ## 技术面分析 CLI
 - 深度技术面分析优先用固定命令 `go run ./cmd/indicator-analyze <代码>`；不要再写一次性 `cmd/<name>/main.go`。
@@ -157,10 +158,10 @@
   - **`-save` 模式**：同上，纯 HTTP 前复权（避免批量保存时每个标的 100-170ms 的 TDX 握手开销）
   - **`-tdx` 模式**（含 `-save -tdx`）：显式启用 TDX 协议（获取更精确的 Amount + 本地换手率），**价格不前复权**，除权日断崖会污染 BOLL/ATR/SAR/CYQ/PERF，仅在需要 Amount 精度时使用
 - 快速提取关键字段：`go run ./cmd/indicator-analyze <code> 2>/dev/null | grep -E "SCORE|TD_NOW|SAR_KELT|DIVERGENCE|PERF|CYQ"`
-- 批量落库（纯 HTTP，约 90 秒）：`go build -o /tmp/ia ./cmd/indicator-analyze && sqlite3 data/stock.db "SELECT code FROM instrument;" | xargs -I{} /tmp/ia -save {}`
+- 批量落库（纯 HTTP，全池约 90 秒，串行 `-P 1` 避免 SQLITE_BUSY）：完整命令见下「每日复盘日志 → 每日工作流」步骤 1。
 - 多因子选股筛选：**已统一为 Go 实现**（类型安全、性能更优）
   - **推荐**：`go run ./cmd/stockdb screen --holdings 代码:成本:手数,...` 或快捷脚本 `./scripts/screen-stocks.sh --holdings ...`
-  - 旧版 Python `scripts/screen-stocks.py` 已弃用（保留作参考实现）
+  - 旧版 Python `screen-stocks.py`/`test_screen_stocks.py` 已删除，选股与测试一律以 Go screen(`cmd/stockdb screen` + `internal/screener`)为准
   - 示例：`go run ./cmd/stockdb screen --holdings sh601138:65.490:2,sh600522:25.008:1 --max 10 --capital 68000`
   - `--max` 默认值为**持仓数+7**（动态计算），可手动指定固定上限
   - `--dry-run` 临时查询不写 decision_log（正式落库每日一次即可）；`--capital 68000` 输出候选建议仓位（单笔风险1%/止损距离）
@@ -169,7 +170,7 @@
 ## snapshot 加列同步清单（缺一即漏）
 1. `internal/store/store.go`：Snapshot struct → CREATE TABLE → ALTER 容错列表 → SaveSnapshot 四子处（列名/占位符/**ON CONFLICT DO UPDATE**/参数顺序；漏 DO UPDATE 同日重跑会**静默保留旧值**）
 2. `internal/store/store_test.go`：迁移测试 SELECT + round-trip 直查 SQL（`History()` 不含新列，不能靠它）+ 同日二次 save 覆盖用例
-3. `scripts/screen-stocks.py` SELECT + `scripts/test_screen_stocks.py` 的 `base_row()` fixture（缺 key 全部用例 KeyError）
+3. Go screen：`internal/screener/screener.go` 的 snapshot SELECT(line 436+)与 `rows.Scan`(line 479)缺列会报错，+ `internal/screener/screener_test.go` 补对应字段断言
 4. 全量重跑 `-save` 后新列才有值；重跑前备份：`cp data/stock.db data/stock.db.bak-$(date +%Y%m%d-%H%M)`
 
 ## decision_log 表结构关键点
@@ -195,10 +196,10 @@
 - 模块名：`stock-tui`（`go.mod` 中定义，import 路径用此）
 - 新增外部依赖需 `go get <package>`（如 `github.com/google/uuid`）
 - Store 暴露底层连接：添加 `func (s *Store) DB() *sql.DB { return s.db }` 供其他包使用
+- 从项目外 `import "stock-tui/internal/*"` 会在 Go 1.26+ 被 `internal` 限制拒绝。解法：`/tmp/probe-xxx` 下创建独立 go.mod, 用 `replace stock-tui => /absolute/project/path` 引用; 或直接复制算法代码。
 
 ## 测试
 - Go：`go test ./...`；提交前对改动的 Go 文件跑 `gofmt -w`
-- Python 筛选逻辑：`python3 scripts/test_screen_stocks.py`（自跑 print 式，无 pytest；经 importlib 加载连字符文件名，测试真实 tier/sort_key/signals 逻辑）
 
 ## 每日复盘日志
 日志目录：`docs/journal/YYYY-MM-DD/journal.md`，四段结构：
@@ -231,7 +232,7 @@ go run ./cmd/stockdb rs-rank
 # 3. 回填决策结果（信号后满 10 个交易日的 decision_log 自动结算，输出分层胜率）
 go run ./cmd/stockdb backfill
 
-# 4. 生成选股表（持仓置顶 + 优质候选，合计≤10只）
+# 4. 生成选股表（持仓置顶 + 优质候选，合计≤持仓数+7；--max 可手动指定上限）
 ./scripts/screen-stocks.sh \
   --holdings <代码:成本:手数,...>
 
@@ -247,22 +248,6 @@ go run ./cmd/stockdb backfill
 - `TD`：优先显示 countdown，无则显示 setup；snapshot 落库格式均为 `见顶/N`/`见底/N`（CLI 近15日行才用 `C顶N` 短格式）；setup `见顶/8` 次日警惕进入 countdown
 - `CYQ`：CLI 输出两行——`WINNER`(获利盘%)/`ASR`(浮筹%)/`PRY1`(年度相对位置%) 与博弈K线 OHLC + 控盘信号(无量长阳/90比3/低位) + 状态标签(深度套牢/全民获利/筹码密集/近年底位)
 - `SAR/ST`：`多/多` = SAR 多头 + SuperTrend 多头，双确认；持仓翻空时选股表显示 `⚠️SAR/ST双空` 等警示，必须执行退出纪律
-- `止损价`：snapshot `sar_value` 列（批量落库后直接读取）；选股表"止损(距%)"列即此值；`--capital 总资金` 可输出候选建议仓位（单笔风险 1% / 止损距离）
+- `止损价`：选股表"止损(距%)"列口径——**SAR 在现价下方(多头)时用 `sar_value`(贴身移动止损);SAR 翻到现价上方(空头/双空)时其线是反手位非卖出止损,回退近 20 日最低价(`low20`,跌破前低就跑)**;两者皆无则显「—」。`--capital 总资金` 按此止损线输出候选建议仓位(单笔风险 1% / 止损距离),止损线失效(无 Low20)时输出「止损距离过宽,建议观望」。
 - 量比口径：量比 < 0.8 / > 1.5 为阈值，描述时一律写"量比 X.X（< 0.8）"格式，不用"缩量/放量"
 - 末端降级口径：乖离 `bias24/atr_pct > 4`（波动归一化）、连涨≥5日、换手率≥15%（`tr >= 15`,15–20% 闭区间含端点）任一触发即从推荐降为观察；市场广度（池内站上 MA20 比例）< 40% 时推荐上限减半
-
-### 数据源(2026-07 更新)
-- 数据源优先级(默认/`-save`): **HTTP 前复权**(腾讯 `qfq` OHLCV) → 东财 HTTP(换手率兜底 f61)。**`-tdx` 才切 tdx 协议**(`github.com/quantbeing/tdx` v0.1.3, `FromBestHost` 自动选服务器),tdx 失败仍回退 HTTP。
-- ⚠️ **tdx 协议返回不复权原始价**(库本身不提供复权,唯一相关 `GetXdxrInfo` 需调用方自行算复权但项目未用)。除权分红会在不复权序列制造断崖(sh512480 2026-07-03 不复权 2.70→1.33,前复权仅 -1.4%),污染 BOLL/ATR/SAR/CYQ/PERF。故默认改走 HTTP 前复权,与 snapshot 口径对齐;`-tdx` 仅在需精确 Amount+本地换手率时显式使用。
-- tdx 代码映射: `sh600522` → `model.MarketSH` + `"600522"`; `sz000001` → `model.MarketSZ` + `"000001"`.
-- tdx 日K `GetSecurityBars` 返回**按日期升序**, `bars[0]` 最旧, `bars[len-1]` 最新。
-- tdx 换手率: `GetFinanceInfo(ctx, market, code).LiutongGuben`(流通股本,单位股) → `turnover = Vol / LiutongGuben`(小数)。
-- 东财历史 K 线 `fields2=f51..f61`: f52-55 为正常小数(非 ×100)、f56 单位是**手**(×100 转股)、f61 换手率直给(%)。需带 `Referer` + 完整 UA + `DisableKeepAlives: true`，偶发 EOF 需重试。
-
-### CYQ 筹码指标
-- `indicator.CalcCYQ(candles, turnovers, freeFloatShares) []CYQResult`: 输入 Candle(需含 High/Low/Close/Volume/Amount)+换手率(小数,如 0.0646)+流通股本。输出 WinnerClose(获利盘%)/ASR(浮筹%)/PRY1(年度相对位置%)/CYQK(博弈K线 OHLC)/高控盘信号。
-- avgPrice 优先 VWAP(Amount/Volume), Volume=0 时回退 (H+L)/2——VWAP 在暴跌日比 (H+L)/2 低最多 1.44%,修正系统性偏差。
-- 前置条件: 至少 60 根日K(推荐 250+), 价格须前复权, 换手率用小数。`Candle` 现在有 `Open` 和 `Amount` 字段。
-
-### 外部探测脚本
-- 从项目外 `import "stock-tui/internal/*"` 会在 Go 1.26+ 被 `internal` 限制拒绝。解法: `/tmp/probe-xxx` 下创建独立 go.mod, 用 `replace stock-tui => /absolute/project/path` 引用; 或直接复制算法代码。

@@ -51,6 +51,7 @@ type Candidate struct {
 	ATRPct            float64
 	Streak            int
 	MA20              float64
+	Low20             float64 // 近 20 日最低价,作 SAR 失效(空头)时的止损回退
 	SARLong           bool
 	SuperTrendLong    bool
 	OBVUp             bool
@@ -376,25 +377,56 @@ func SortKey(c *Candidate) float64 {
 }
 
 // StopText formats stop-loss price with distance%.
+// StopText formats the stop-loss line and its distance from current price.
+//
+// SAR is a trailing stop only while long (SAR below price). Once SAR flips
+// bearish it sits ABOVE price — that line is a short-cover / 反手 line, not a
+// sell stop, so showing it as "+28%" for a held long is misleading. When SAR is
+// above close (bearish) we fall back to the 20-day low (跌破前低就跑, price-
+// action stop independent of any lagging indicator). No Low20 → no honest stop
+// to display, return "—" rather than fabricate one.
 func StopText(c *Candidate) string {
-	if !c.SARValue.Valid || c.Close == 0 {
+	if c.Close == 0 {
 		return "—"
 	}
-	sar := c.SARValue.Float64
-	dist := (sar/c.Close - 1) * 100
-	return fmt.Sprintf("%.2f(%+.1f%%)", sar, dist)
+	stop, hasStop := effectiveStop(c)
+	if !hasStop {
+		return "—"
+	}
+	dist := (stop/c.Close - 1) * 100
+	return fmt.Sprintf("%.2f(%+.1f%%)", stop, dist)
+}
+
+// effectiveStop returns the stop price to surface for a held long: SAR while
+// it sits below price (bullish trailing stop), otherwise the 20-day low.
+// ok is false when neither yields an in-below-price stop.
+func effectiveStop(c *Candidate) (stop float64, ok bool) {
+	if c.SARValue.Valid && c.SARValue.Float64 < c.Close {
+		return c.SARValue.Float64, true
+	}
+	if c.Low20 > 0 && c.Low20 < c.Close {
+		return c.Low20, true
+	}
+	return 0, false
 }
 
 // PositionHint computes suggested position size based on 1% risk per trade.
+//
+// risk per share = Close - effectiveStop. When no in-below-price stop exists
+// (SAR bearish AND no 20-day low below close), we cannot bound the risk, so
+// advise waiting instead of fabricating a position size.
 func PositionHint(c *Candidate, capital float64) string {
-	if capital == 0 || !c.SARValue.Valid || c.Close == 0 {
+	if capital == 0 || c.Close == 0 {
 		return ""
 	}
-	sar := c.SARValue.Float64
-	if c.Close <= sar {
-		return "" // Stop above current price (bearish SAR)
+	stop, ok := effectiveStop(c)
+	if !ok {
+		return "止损距离过宽，建议观望"
 	}
-	riskPerShare := c.Close - sar
+	riskPerShare := c.Close - stop
+	if riskPerShare <= 0 {
+		return "止损距离过宽，建议观望"
+	}
 	shares := int(capital*0.01/riskPerShare/100) * 100
 	if shares <= 0 {
 		return "止损距离过宽，建议观望"
@@ -453,6 +485,14 @@ func LoadSnapshots(dbPath string) (date string, candidates []Candidate, rsCovera
 		       COALESCE(s.pe, 0) AS pe,
 		       s.rs20, s.rs60, s.rs120,
 		       s.bias24, s.atr_pct, s.streak, s.ma20,
+		       (SELECT COALESCE(MIN(s3.low), 0) FROM snapshot s3
+		        WHERE s3.code = s.code
+		          AND s3.trade_date IN (
+		            SELECT trade_date FROM snapshot
+		            WHERE trade_date <= s.trade_date
+		            GROUP BY trade_date
+		            ORDER BY trade_date DESC LIMIT 20
+		          )) AS low20,
 		       s.perf_trend_follow_bull_win10,
 		       s.perf_overbought_bear_win10,
 		       s.perf_div_bear_win10,
@@ -485,7 +525,7 @@ func LoadSnapshots(dbPath string) (date string, candidates []Candidate, rsCovera
 			&divBearInt, &sigOBInt,
 			&c.TurnoverRate, &c.MarketCap, &c.PE,
 			&c.RS20, &c.RS60, &c.RS120,
-			&c.Bias24, &c.ATRPct, &c.Streak, &c.MA20,
+			&c.Bias24, &c.ATRPct, &c.Streak, &c.MA20, &c.Low20,
 			&c.PerfTrendFollowBullWin10,
 			&c.PerfOverboughtBearWin10,
 			&c.PerfDivBearWin10,

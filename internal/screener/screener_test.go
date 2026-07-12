@@ -481,6 +481,27 @@ func TestStopText(t *testing.T) {
 			},
 			want: "—",
 		},
+		// SAR above close (bearish stance / SAR 反手线) must not be shown as
+		// a stop — it is the short-cover line, meaningless for an open long.
+		// Fall back to the 20-day low (跌破前低就跑 价格行为止损).
+		{
+			name: "sar above close falls back to low20",
+			c: Candidate{
+				Close:    9.43,
+				SARValue: sql.NullFloat64{Float64: 12.11, Valid: true},
+				Low20:    9.10, // 近20日低点,在现价下方
+			},
+			want: "9.10(-3.5%)", // 回退 Low20,距现价 -3.5%
+		},
+		{
+			name: "sar above close and no low20 fallback",
+			c: Candidate{
+				Close:    9.43,
+				SARValue: sql.NullFloat64{Float64: 12.11, Valid: true},
+				Low20:    0, // 无历史低点数据
+			},
+			want: "—",
+		},
 	}
 
 	for _, tt := range tests {
@@ -524,9 +545,32 @@ func TestPositionHint(t *testing.T) {
 			c: Candidate{
 				Close:    10.0,
 				SARValue: sql.NullFloat64{Float64: 10.5, Valid: true},
+				Low20:    0, // SAR 失效且无 Low20 回退
 			},
 			capital: 68000,
-			want:    "",
+			want:    "止损距离过宽，建议观望",
+		},
+		// SAR above close now falls back to Low20: riskPerShare = Close - Low20.
+		{
+			name: "sar above price uses low20 fallback",
+			c: Candidate{
+				Close:    10.0,
+				SARValue: sql.NullFloat64{Float64: 10.5, Valid: true},
+				Low20:    9.5, // riskPerShare = 10.0 - 9.5 = 0.5
+			},
+			capital: 68000,
+			// shares = floor(68000*0.01/0.5/100)*100 = floor(13.6/100)*100... see实现
+			want: "建议≤1300股",
+		},
+		{
+			name: "sar above price no low20 fallback",
+			c: Candidate{
+				Close:    10.0,
+				SARValue: sql.NullFloat64{Float64: 10.5, Valid: true},
+				Low20:    0, // 无 Low20,无法算风险距离
+			},
+			capital: 68000,
+			want:    "止损距离过宽，建议观望",
 		},
 	}
 
