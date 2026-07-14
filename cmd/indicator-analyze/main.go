@@ -191,6 +191,10 @@ func fetchDailyKline(code string, bars int) (seriesData, error) {
 
 	// 从东财补拉换手率(用于 CYQ 筹码计算),非致命失败时静默跳过
 	turnovers := fetchEMTurnovers(code, len(candles), dates)
+	// 东财失败时回退 TDX: 只拉流通股本,用 HTTP 的 Volume 本地算换手率
+	if turnovers == nil {
+		turnovers = fetchTDXTurnoverFallback(code, candles)
+	}
 
 	return seriesData{
 		Code: code, Name: name, Dates: dates, Candles: candles,
