@@ -25,19 +25,14 @@ echo ""
 
 # 2. 批量保存快照数据
 echo "=== 2/6 批量保存快照数据 ==="
-echo "预编译 indicator-analyze..."
-go build -o /tmp/ia ./cmd/indicator-analyze
 
-echo "获取股票列表..."
 STOCK_COUNT=$(sqlite3 data/stock.db "SELECT COUNT(*) FROM instrument;")
 echo "共 $STOCK_COUNT 只股票"
 
-echo "开始批量保存（预计耗时 90-150 秒）..."
+echo "开始批量保存（预计耗时 60-120 秒）..."
 START_TIME=$(date +%s)
 
-# ⚠️ -P 4 会导致 SQLITE_BUSY 错误，使用 -P 1 串行执行
-sqlite3 data/stock.db "SELECT code FROM instrument;" | \
-  xargs -I{} -P 1 /tmp/ia -save {}
+go run ./cmd/stockdb batch-save -P 4 2>&1 | tail -5
 
 END_TIME=$(date +%s)
 DURATION=$((END_TIME - START_TIME))

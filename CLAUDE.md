@@ -220,11 +220,10 @@
 # 0. 【必须第一步】更新同花顺热榜（确保 instrument 表在批量 -save 前已更新）
 ./scripts/import-hot-stocks.sh
 
-# 1. 收盘后批量更新快照（含换手率/市值/PE + CYQ 筹码衍生指标；预编译二进制，纯 HTTP 约 90 秒）
-go build -o /tmp/ia ./cmd/indicator-analyze && sqlite3 data/stock.db \
-  "SELECT code FROM instrument;" | xargs -I{} -P 1 /tmp/ia -save {}
-# ⚠️ 注意：-P 4 并发会导致 SQLITE_BUSY 错误，必须用 -P 1
-# ⚠️ -save 默认走 HTTP 前复权（前复权口径与 snapshot 一致）；若 CYQ/CYC 需精确 Amount/VWAP 才加 -tdx（代价是价格不前复权，除权日指标会失真）；全池约 285 只
+# 1. 收盘后批量更新快照（含换手率/市值/PE + CYQ 筹码衍生指标；并行 Go 进程，全量约 90 秒）
+go run ./cmd/stockdb batch-save -P 4
+# ⚠️ 4 线程并行拉取 + 串行 SQLite 写入（互斥锁避免 SQLITE_BUSY），
+#    前复权口径与 snapshot 一致；-P N 可调并发度（默认 4，CPU 高时可用 8）。
 
 # 2. 计算 RS 相对强度百分位排名（横截面 ret20 排名，全量落库当日即有效）
 go run ./cmd/stockdb rs-rank

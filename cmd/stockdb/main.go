@@ -56,6 +56,8 @@ func run(args []string) error {
 		return cmdHot(rest)
 	case "check-data":
 		return cmdCheckData(rest)
+	case "batch-save":
+		return batchSaveCmd(rest)
 	default:
 		return usageErr()
 	}
@@ -73,7 +75,9 @@ func usageErr() error {
   stockdb backtest-portfolio [options]    run portfolio backtest with position management
   stockdb screen [options]                multi-factor stock screening (replaces screen-stocks.py)
   stockdb hot [--top N]                   fetch THS hot list and import into instrument table
-  stockdb check-data                      data quality checks (RS coverage, continuity, backfill progress)`)
+  stockdb check-data                      data quality checks (RS coverage, continuity, backfill progress)
+  stockdb batch-save [-P N] [-n N]      batch-save analysis snapshots for all instruments
+`)
 }
 
 func openStore() (*store.Store, error) {

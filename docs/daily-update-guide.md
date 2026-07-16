@@ -30,7 +30,7 @@ cd /Users/yikwing/vspj/tui
 ./scripts/daily-update.sh
 ```
 
-**耗时**：约 60-120 秒
+**耗时**：约 45-120 秒（视股票数量和白盘/盘后而定）
 
 **输出示例**：
 ```
@@ -42,8 +42,12 @@ cd /Users/yikwing/vspj/tui
 
 === 2/6 批量保存快照数据 ===
 共 550 只股票
-开始批量保存（预计耗时 90-150 秒）...
-✅ 批量保存完成，耗时 102 秒
+开始批量保存（预计耗时 60-120 秒）...
+batch-save: 550 stocks, 4 workers
+progress: 10/550 ok, 0/550 err
+progress: ...
+batch-save: 550 success, 0 failed out of 550
+✅ 批量保存完成，耗时 85 秒
 
 === 3/6 更新 RS 相对强度排名 ===
 rs-rank: updated 548 stocks
