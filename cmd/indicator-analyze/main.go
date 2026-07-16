@@ -180,12 +180,14 @@ func fetchDailyKline(code string, bars int) (seriesData, error) {
 			return seriesData{}, fmt.Errorf("row %d short", i)
 		}
 		dates[i] = rawString(row[0])
+		vol := rawFloat(row[5]) * 100 // 腾讯返回 手(÷100=股)
 		candles[i] = indicator.Candle{
 			Open:   rawFloat(row[1]),
 			Close:  rawFloat(row[2]),
 			High:   rawFloat(row[3]),
 			Low:    rawFloat(row[4]),
-			Volume: rawFloat(row[5]),
+			Volume: vol,
+			Amount: rawFloat(row[2]) * vol, // Close × 股数 ≈ 成交额
 		}
 	}
 
