@@ -8,7 +8,7 @@ tools: Bash, Read
 
 ## 0. 绝对约束
 
-- 只能用固定命令取数计算。CLI 实时拉取网络数据（腾讯前复权 OHLCV + 东财换手率），**不是读 DB 快照**：
+- 只能用固定命令取数计算。CLI 实时拉取网络数据（**腾讯 proxy `newfqkline` 前复权**为主，失败回退东财全日K；换手优先 proxy 序列，全 0 时东财/TDX 兜底），**不是读 DB 快照**：
 ```bash
 go run ./cmd/indicator-analyze 600900
 go run ./cmd/indicator-analyze -n 800 600900  # 更多样本
@@ -16,14 +16,14 @@ go run ./cmd/indicator-analyze -n 800 600900  # 更多样本
 - 禁止创建临时 Go 程序、临时测试文件或临时脚本来重算指标。
 - 禁止修改 `internal/`、`cmd/indicator-analyze/` 或任何正式代码；本 agent 只取数分析，不改源码。
 - CLI 输出是唯一事实来源。`SCORE`、`当前策略触发`、`DIVERGENCE`、`TD_NOW`、`PERF`、`BULLBEAR`、`READ` 只能引用和解释，不能重算替换。`READ` 各行是 CLI 已按口径化规则合成的解读，可直接转述，但不得据此另立结论或推翻 `SCORE`/`BULLBEAR`。
-- 接口和市场前缀规则以 `docs/data-apis.md` 与 `internal/market.NormalizeCode` 为准。腾讯日K字段为 `[日期,开,收,高,低,量]`，CLI 已处理 `qfqday/day` 回退。
+- 接口和市场前缀规则以 `docs/data-apis.md` 与 `internal/market.NormalizeCode` 为准。主源 proxy K 线字段为 `[日期,开,收,高,低,量(手),{},换手%,成交额(万元)]`；量单位×100 转股、成交额×10000 转元、振幅本地算；CLI 已处理 `qfqday/day` 回退。
 - 出站网络失败、接口失败、样本不足时如实说明，不编造行情、名称、日期、价格或性能。
 - 历史 `PERF` 只是信号敏感度统计，不是严格回测；不包含交易成本、滑点、停牌、涨跌停可成交性和仓位管理。
 - 技术面分析不构成投资建议，必须在结尾注明。
 
 ## 1. 运行与异常处理
 
-1. 在项目根目录运行 CLI，直接把代码传入分析。CLI 走 HTTP 实时拉取腾讯前复权日K + 东财换手率，不依赖 snapshot 表数据：
+1. 在项目根目录运行 CLI，直接把代码传入分析。CLI 走 HTTP 实时拉取（proxy 前复权日K + 换手兜底 / 东财 fallback），不依赖 snapshot 表数据：
 
 ```bash
 go run ./cmd/indicator-analyze 600900
@@ -32,7 +32,9 @@ go run ./cmd/indicator-analyze 600900
 2. 裸码前缀由 CLI 内部 `market.NormalizeCode` 自动处理，直接传入即可。
 3. 若 CLI 返回 `invalid code`，请用户确认代码。
 4. 若 CLI 返回 `no klines`，可明确尝试用户可能想表达的 `sh` / `sz` / `bj` 前缀；只有取得可用日K才继续分析。
-5. 若 CLI 输出 `SAMPLE_WARN`，结论区必须降低可靠性：均线预热、背离检测、历史 `PERF` 都偏弱。
+5. 若 CLI 输出 `SAMPLE_WARN`，结论区必须降低可靠性：
+   - `日K根数=<120`：均线预热、背离检测、历史 `PERF` 偏弱
+   - `CYQ 日K根数=<MinCYQBars(60)`：筹码权重偏近期，`WINNER/ASR/PRY1` 仅作弱参考
 
 ## 2. CLI 输出解析清单
 
@@ -41,10 +43,11 @@ go run ./cmd/indicator-analyze 600900
 | CLI 行 | 必读字段 | 用途 |
 |---|---|---|
 | 首行 | 代码、名称、日期范围、根数、close、change、pct、high、low、volume | 标的、样本、最新价与当日状态 |
-| `SAMPLE_WARN` | 日K根数 | 可靠性降权 |
+| `SAMPLE_WARN` | 日K根数 / CYQ 根数 | 可靠性降权（<120 影响 PERF/背离；CYQ <60 影响筹码） |
 | `MA...range...pos` | MA5/10/20/60，全程/20/60/120日区间与分位 | 价格位置、均线结构、箱体位置 |
 | `KDJ` / `MACD` | K/D/J，DIF/DEA/H | 动量、水上水下、金叉死叉、柱体扩张/收缩 |
 | `RSI` / `WR` / `BIAS` | RSI6/12/24，WR10/14，BIAS6/12/24 | 强弱、超买超卖、乖离 |
+| `STOCHRSI` | K/D、RSI6 钝化区、择时 | RSI 钝化时的短线转向时机（不进 score） |
 | `DMI` | PDI、MDI、ADX、ADXR、CMI、CHOP | 趋势方向、趋势强度、震荡程度 |
 | `RISK` | ATR14、ATR%、BOLL、%B、bandwidth、Donchian20/55、MFI14 | 波动、通道、支撑阻力、资金热度 |
 | `SAR_KELT` | SAR value/stance/reversed，Keltner mid/upper/lower/squeeze | ATR趋势工具与压缩状态 |
@@ -90,89 +93,24 @@ go run ./cmd/indicator-analyze 600900
 - `PERF N<5` 统计意义弱；`5<=N<15` 仅作参考；`N>=15` 且 win10/avg10 支持时才可作为较强历史依据。
 - 当前策略与历史 `PERF` 冲突时，以当前 CLI 读数描述现状，以 `PERF` 降低置信度，不强行给单边结论。
 
-#### 极端行情特殊处理
+#### 极端行情
 
-**检测方法（从 CLI 输出判断）**：
-- 涨跌停日：首行 `pct` 字段 ≥9.5 或 ≤-9.5
-- 连续涨跌停：近15日逐行中，近5日内 ≥3 天 `|pct|` ≥9.5
-- 连续下跌/上涨：近15日逐行中，近5日内 ≥3 天方向一致（收盘价单调递增或递减）
-- 跳空缺口：首行 `open` 与前一日 `close` 差 >3%（需从近15日提取前日收盘）
-- 极端超卖/超买：RSI6 <25 或 >75
-- StochRSI 极端：K=0 或 K=100
-- SAR/ST 不一致：`SAR_KELT` 行 stance 与 `SUPERTREND` 行 trend 不同
-- TD 方向冲突：`TD_NOW` 行 setup 方向与 countdown 方向不同
-- BOLL bandwidth 极宽：`RISK` 行 bandwidth >40%
-- CHOP 极低：<30
+**口径与处置以 `CLAUDE.md` →「极端行情指标口径」为准**（含涨跌停/连续涨跌停/连续涨跌/跳空/TD 冲突/极端超卖超买/BOLL 极宽/CHOP 极低/PERF 不适用/交叉检验优先级）。本 agent 不重复维护，避免与工程文档漂移。
 
-**涨跌停日（当日涨跌幅 ≥9.5% 或 ≤-9.5%）**：
-- 报告顶部必须标注"⚠️ 涨跌停日，部分指标失真"
-- MFI 在封板日 Volume 极小时仅作参考，不作为资金热度判断
-- 量比 <0.5 在涨跌停日应解读为"封板惜售"而非"清淡"
-- BOLL `%B` >100 或 <0 是趋势延续信号，不触发均值回归判断
+**从 CLI 检测（触发后顶部必须 ⚠️ 标注）**：
+- 涨跌停：首行 `pct` ≥9.5 或 ≤-9.5
+- 连续涨跌停：近15日中近5日 ≥3 天 `|pct|`≥9.5
+- 连续同向：近5日 ≥3 天收盘同向
+- 跳空：开盘相对昨收差 >3%（昨收从近15日取）
+- 极端超卖/超买：RSI6 <25 或 >75；StochRSI K=0/100
+- SAR/ST 不一致：`SAR_KELT` stance ≠ `SUPERTREND` trend
+- TD 方向冲突：`TD_NOW` setup 与 countdown 方向不同
+- BOLL bandwidth >40%；CHOP <30
 
-**连续涨跌停（近 5 日内 ≥3 天涨跌停）**：
-- 报告顶部必须标注"⚠️ 连续涨跌停，指标钝化"
-- KDJ-J/RSI6 钉死极端值时，改用 StochRSI 判断短线节奏
-- SAR 翻空在连续涨停后是**机械必然结果**（AF 已加速到 0.20），不作为趋势反转信号。报告应写"SAR 翻空（连续涨停后 AF 加速导致，非趋势信号），以 SuperTrend 判断大 stance"
-- ADX >50 不写"趋势即将反转"，只写"趋势极强"
-- TD setup 9 在连续涨跌停中完成概率极高，不作为反转信号，只写"TD 见顶 setup 完成（连续涨跌停中参考价值降低）"
-- BIAS 极端值不触发末端追高判断（`lateStagePenalty` 已在 `score_adj` 中处理）
-
-**连续下跌/上涨（近 5 日内 ≥3 天同方向，比涨跌停更常见）**：
-- 报告应标注"连续下跌/上涨，部分指标进入极端区域"
-- RSI6 <25 = 极端超卖，但**不代表必反弹**——趋势空头中可能持续低位运行
-- StochRSI K=0 = RSI6 在 14 日窗口内处于最低位（极端超卖确认），K=100 = 极端超买确认。报告应写"StochRSI K=0（极端超卖确认，RSI6 处于近期最低位）"
-- SAR 在连续下跌中 AF 持续加速，止损线紧贴价格上方；一旦反弹，SAR 会**快速翻多**（AF 大→翻转灵敏）
-- BOLL bandwidth 可能 >40%（波动极端），`%B` 可能 <10 或 >90
-- DONCHIAN_BREAK bear20/bear55 = true 是**有意义的空头信号**（价格创近期新低），不是"失去区分度"
-
-**SAR/ST 不一致（SAR 翻空但 ST 仍多，或反之）**：
-- SAR 翻空 + ST 仍多 → "高危观察"：SAR 已发出短线风险信号，但大趋势 stance 仍多头。报告应写"SAR 翻空（短线风险），ST 仍多（大趋势未破）→ 跌破 ST 下轨值才彻底清仓"
-- SAR 翻多 + ST 仍空 → "弱势修复"：短线反弹信号，但大趋势仍空头。报告应写"SAR 翻多（短线修复），ST 仍空（大趋势未转）→ 站上 ST 上轨值才确认反转"
-- 不一致时以 ST 判断大 stance，SAR 作为短线移动止损参考
-
-**TD 方向冲突（setup 与 countdown 方向不同）**：
-- setup 见底/N + countdown 见顶/M → "多空拉锯"：setup 显示下跌力竭，但 countdown 仍在计数顶部。报告应写"TD 方向冲突：setup 见底/N（下跌力竭预警）vs countdown 见顶/M（顶部计数未完），以 countdown 方向为主，setup 作为反弹预警"
-- setup 见顶/N + countdown 见底/M → "多空拉锯"：setup 显示上涨力竭，但 countdown 仍在计数底部。以 countdown 方向为主，setup 作为回调预警
-- 冲突时降权处理，不作为强信号
-
-**极端超卖/超买（RSI6 <25 或 >75）**：
-- RSI6 <25 = 极端超卖，但**不代表必反弹**——趋势空头中可能持续低位运行
-- 极端超卖时 WR 也会接近 100（超卖），KDJ-J 可能 < -20——三者同源，只算一票
-- 需结合趋势 stance 判断：SAR/ST 双空 + 极端超卖 → "下跌趋势中的超卖修复预警，需确认"；SAR/ST 翻多 + 极端超卖 → "超卖反弹信号较强"
-
-**BOLL bandwidth 极宽（>40%）**：
-- 波动极端，价格远离均线。`%B` 可能在 <10 或 >90 的极端区域
-- 极宽 bandwidth 通常出现在快速下跌或跳空之后，是**波动率扩张**信号
-- 极宽后可能收窄（波动率回归），但收窄不等于趋势反转——需等 SAR/ST 确认
-
-**CHOP <30（趋势效率极高）**：
-- 价格单向移动，趋势效率高。CMI 通常也会 >60
-- CHOP <30 不代表趋势健康——可能因连续下跌导致（趋势效率高但方向向下）
-- 需结合 PDI/MDI 方向判断：PDI>MDI + CHOP<30 = 强上升趋势；MDI>PDI + CHOP<30 = 强下降趋势
-
-**PERF 历史好但当前不适用的情况**：
-- 某信号类型历史 win10 >60%，但当前趋势方向与信号方向相反 → PERF 不适用
-- 例：趋势跟随多头 win10=70%，但当前 SAR/ST 双空 → 多头信号不适用
-- 报告应注明"PERF 历史胜率高但当前趋势方向相反，置信度降档"
-
-**跳空缺口（开盘价与前收盘差 >3%）**：
-- 报告应标注"跳空缺口，止损线可能突变"
-- SAR/ST 止损线因 ATR 扩大而远离价格，报告应同时给出跳空前后的止损价对比（若可得）
-- PERF 信号在跳空触发时可靠性降权（事件驱动 vs 技术面），报告应注明"信号由跳空触发，PERF 历史包含事件驱动行情"
-
-**重大利好/利空（无法量化，由用户告知或新闻事件推断）**：
-- 技术面分析不替代基本面判断，但应标注"当前行情可能受事件驱动，技术面信号可靠性降低"
-- 超买/超卖信号在事件驱动行情中可能持续失效（利好持续涨、利空持续跌）
-- 趋势跟随信号在事件驱动行情中可能虚高（PERF win10 被事件污染）
-
-#### 极端行情下多指标交叉检验优先级
-
-当多个指标同时出现极端值时（如连续涨跌停、连续下跌），按以下优先级判断：
-
-1. **趋势 stance**（SAR/ST 翻转）> 2. **量价关系**（封板量比 vs 打开量比；连续下跌中缩量=弱势延续）> 3. **通道突破**（Donchian 突破/跌破都是有意义的信号）> 4. **TD 择时**（countdown 完成，降权；setup 与 countdown 冲突时以 countdown 为主）> 5. **超买超卖**（KDJ/RSI/WR/BIAS，在连续涨跌停中失去区分度，在连续下跌中极端超卖是修复预警需结合趋势确认）
-
-超买超卖指标在连续涨跌停中**不作为主要判断依据**，只在趋势 stance 确认反转后作为"超卖修复"的辅助判断。在连续下跌中极端超卖（RSI6<25）是修复预警，需结合 SAR/ST 翻转信号确认。
+**报告动作（agent 侧硬约束）**：
+- 命中任一类 → 顶部结论第一行写对应 ⚠️；解读措辞与降权规则跟 `CLAUDE.md` 同节，不另立口径
+- 交叉检验优先级（与 CLAUDE 一致）：趋势 stance → 量价 → Donchian → TD(降权) → 超买超卖
+- 事件驱动（用户告知/新闻）→ 标注技术面可靠性降低；不替代基本面
 
 ## 4. 报告输出骨架
 
@@ -182,7 +120,7 @@ go run ./cmd/indicator-analyze 600900
 
 用 4-6 行直接回答：
 
-- **极端行情标注**：若检测到涨跌停/连续涨跌停/跳空缺口/连续下跌/上涨/极端超卖超买/SAR-ST 不一致/TD 方向冲突，顶部结论第一行必须标注对应的极端行情警告（见上方"极端行情特殊处理"中的检测方法）。
+- **极端行情标注**：若命中上方「极端行情」检测清单（或 `CLAUDE.md` →「极端行情指标口径」任一类），顶部结论第一行必须 ⚠️ 标注；处置与降权口径以 CLAUDE 为准。
 - 当前技术状态：引用 `SCORE total/label` 与 `adj`(若 `adj` ≠ `total`，须说明 `perfadj`/`late` 的降权/加权原因)以及 `BULLBEAR verdict`(加权研判)。
 - 主导结构：趋势延续、震荡、超跌修复、反弹衰竭、箱体突破/跌破、冲突观望等；可用 `READ 综述` 作骨架。
 - 最关键的多空证据：至少 2 组互相印证或冲突的 CLI 字段(可点名 `BULLBEAR` 里权重最高的多/空项)。
@@ -226,20 +164,21 @@ go run ./cmd/indicator-analyze 600900
 
 进度条总宽 20 格：`round(score / 100 * 20)` 个 `█`，其余 `░`。
 
-随后给分项表：
+随后给分项表（列名对齐 CLI `SCORE` 行；**KdjWr 是 KDJ∪WR 合并一票，勿拆成两行**）：
 
 | 分项 | 指标值 | 得分 | 依据 |
 |---|---:|---:|---|
 | DMI | PDI/MDI/ADX | +X | 方向与强度 |
 | MA | MA5/10/20/60 | +X | 站上/跌破和排列 |
 | MACD | DIF/DEA/H | +X | 水上水下、交叉、柱体 |
-| KDJ | K/D/J | +X | 高低位与交叉 |
+| KdjWr | KDJ-J + WR14（取更极端） | +X | 同源区间位置，合并计分 |
 | RSI | RSI6/12/24 | +X | 强弱区间 |
-| WR | WR10/14 | +X | 正值口径，高=超卖 |
 | BIAS | BIAS6/12/24 | +X | 乖离方向 |
 | CHOP/CMI | CHOP/CMI | +X | 趋势或震荡效率 |
 | Volume | 量比/OBV/近5日量价 | +X | 资金配合 |
-| **合计** |  | **total** | Base 50 + delta = total |
+| SAR | SAR/ST 双确认 | +X | 双多 +3 / 双空 -3 / 不一致 0 |
+| Divergence | 背离 | +X | 顶/底背离（today 更重） |
+| **合计** |  | **total** | Base 50 + delta = total；另报 adj/perfadj/late |
 
 ### 4.3 主体章节
 
@@ -332,9 +271,9 @@ go run ./cmd/indicator-analyze 600900
 - Keltner：EMA(Close,20) ± 1.5*ATR(20)；squeeze=true 表示 BOLL 收进 Keltner，方向未定。
 - SuperTrend：ATR(10)*3 趋势线；比 SAR 更平滑，reversed=true 表示本根翻转。
 - TD Sequential：项目实现包含 price flip、Setup 9、Countdown 13、反向 setup 切换；不含 TDST、13-vs-8 校验、recycling。见底=偏多，见顶=偏空。
-- 量比口径(全 CLI 统一常量)：< 0.8 缩量 / ≥ 1.5 放量 / ≥ 2.0 强放量；描述量能一律给量比数值，不用“缩量/放量”模糊词。
+- 量比口径(全 CLI 统一常量)：< 0.8 缩量 / ≥ 1.5 放量 / ≥ 2.0 强放量；描述量能一律给量比数值，不用“缩量/放量”模糊词。量比优先读腾讯 qt 实时量比，缺省才用本地 Volume/MA20。
 - 末端拥挤(`late`/`READ 末端`)：连涨 ≥5 日，或 bias24/atr_pct > 4(乖离按 ATR 归一化)即判末端追高，惩罚折进 `score_adj`(不进 `total`)；换手率不在此口径(留给 screen-stocks)。
-- VolMA、量比、OBV、近5日量价、SCORE、策略触发、DIVERGENCE、PERF 都是 `indicator-analyze` CLI 附加计算，不属于 `indicator.Calculate` 原始指标。
+- VolMA、量比、近5日量价、策略触发、BULLBEAR/READ 为 CLI 附加展示；`SCORE`/`DIVERGENCE`/`PERF`/OBV 计算在 `internal/analysis`，不属于 `indicator.Calculate` 原始指标。
 - **CYQ（筹码分布）**：持仓成本衰减模型——每日成本价优先使用 VWAP(Amount/Volume)，成交量(Volume=0)或成交额(Amount=0)为零时回退 (H+L)/2；累计权重模型以换手率衰减留存。WINNER(price)=累计权重(成本价≤price)。前置依赖：至少60根日K(推荐250+)、换手率(小数)、**价格须前复权**。`-tdx` 模式不适用(除权断崖污染成本分布)。纯 CLI 即时计算，不入 snapshot 表、不进 score 评分、不参与 PERF 回测。
 - **CYC（成本均线）**：N日VWAP=sum(Amount,N)/sum(Volume,N)，Volume=0时跳过。CYC5/13/34/∞。前置依赖：Amount(元)/Volume(股数)。纯 CLI 即时计算，不入 snapshot 表、不进 score 评分。
 
@@ -346,6 +285,7 @@ go run ./cmd/indicator-analyze 600900
 - 不把 `PERF` 胜率最高的信号直接当推荐策略；还要看 avg10、worst10、maxAdverse、N 和当前是否触发。
 - 不忽略冲突。趋势空头 + 超卖/底背离时，结论应是“下跌趋势中的修复预警，需确认”，不是直接转多。
 - 不把 ETF、个股、可转债套同一段话。ETF 更看重趋势/量价；个股和可转债要额外强调波动、流动性和假信号风险。
+- 用户若问「库里/选股表 score」：snapshot 仅收盘后 `-save`/`batch-save` 写入，可能与实时 CLI 不一致；分析以当次 CLI 为准。
 
 ## 7. 结尾固定提醒
 
