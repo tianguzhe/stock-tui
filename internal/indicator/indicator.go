@@ -412,6 +412,9 @@ func fillBOLL(candles []Candle, results []Result) {
 			diff := candles[j].Close - mid
 			variance += diff * diff
 		}
+		if variance < 0 {
+			variance = 0 // 防浮点累加偏差
+		}
 		std := math.Sqrt(variance / count)
 		upper := mid + 2*std
 		lower := mid - 2*std

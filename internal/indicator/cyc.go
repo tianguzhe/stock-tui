@@ -84,18 +84,16 @@ func cycWindow(candles []Candle, i int, cumAmount, cumVolume []float64, n int) f
 	start := i
 	count := 0
 	for j := i; j >= 0; j-- {
-		if candles[j].Volume <= 0 || candles[j].Amount <= 0 {
-			continue
+		if candles[j].Volume > 0 && candles[j].Amount > 0 {
+			count++
+			if count == n {
+				start = j
+				break
+			}
 		}
-		count++
-		if count == n {
-			start = j
-			break
-		}
-		if j == 0 {
-			start = 0
-			break
-		}
+	}
+	if count < n {
+		start = 0 // 窗口不满时从头开始,使用全部有效数据
 	}
 
 	amt := cumAmount[i]

@@ -1,5 +1,7 @@
 package indicator
 
+import "math"
+
 // CYQ (筹码分布) 衍生指标: WINNER / ASR / CYQK / 高控盘锁定法则
 //
 // 核心模型: 持仓成本衰减模型(holding decay)。
@@ -11,7 +13,9 @@ package indicator
 //   - 换手率须与 K 线对应日,单位:小数(0.0646 = 6.46%)
 //   - 价格须为前复权(否则除权跳空让成本分布错位)
 
-import "math"
+// minCYQBars 是 CYQ 有意义的最低日K根数。少于 60 根时权重集中于近期几日,
+// WINNER/ASR/PRY1 参考价值大幅降低,WeightSum 显著低于 1 即此信号。
+const minCYQBars = 60
 
 // CYQResult 单日 CYQ 指标
 type CYQResult struct {
@@ -50,11 +54,12 @@ type CYQResult struct {
 //   - candles: 日K序列,需含 High/Low/Close/Volume(股数)/Amount(元)
 //     Volume=0 时日度成本价回退为 (H+L)/2; 否则使用 VWAP = Amount/Volume
 //   - turnovers: 换手率序列(小数,如 0.0646),长度须与 candles 一致
-//   - freeFloatShares: 最新流通股本(股数),用于成交量单位校验,暂未用于计算
 //
 // 返回:
 //   - 每根日K对应的 CYQResult,只有最后一日指标有意义(前 N 日未满历史窗口)
-func CalcCYQ(candles []Candle, turnovers []float64, freeFloatShares float64) []CYQResult {
+//     当 len(candles) < minCYQBars 时结果仍数学有效但参考价值大幅降低:
+//     WeightSum 显著低于 1 即此信号。
+func CalcCYQ(candles []Candle, turnovers []float64) []CYQResult {
 	n := minInt(len(candles), len(turnovers))
 	results := make([]CYQResult, n)
 	if n == 0 {

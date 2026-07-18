@@ -122,7 +122,7 @@ func TestCalcCYQWithOpen(t *testing.T) {
 	// CYQK_Length=(1.0 - 1.0)*100 = 0
 	// 这个场景所有价格都在两个成本之上,全获利。
 	// 要制造 WINNER 非 1 的场景必须让 target < 大成本。
-	cyq := CalcCYQ(candles, []float64{0.5, 0.5}, 1000)
+	cyq := CalcCYQ(candles, []float64{0.5, 0.5})
 	last := cyq[1]
 	assertNear(t, "WinnerClose(50)", last.WinnerClose, 1.0, 1e-4)
 	assertNear(t, "WinnerOpen(40)", last.WinnerOpen, 1.0, 1e-4)
@@ -140,7 +140,7 @@ func TestCalcCYQPartialProfit(t *testing.T) {
 		{Open: 15, High: 15, Low: 5, Close: 10, Volume: 100, Amount: 1000},  // avgPrice=10
 		{Open: 35, High: 35, Low: 25, Close: 20, Volume: 100, Amount: 3000}, // avgPrice=30
 	}
-	cyq := CalcCYQ(candles, []float64{0.5, 0.5}, 1000)
+	cyq := CalcCYQ(candles, []float64{0.5, 0.5})
 	last := cyq[1]
 
 	// avgPrices=[10,30], w=[0.3333, 0.6667]
@@ -167,7 +167,7 @@ func TestCalcCYQVolumeZeroFallback(t *testing.T) {
 		{Open: 30, High: 32, Low: 28, Close: 20, Volume: 0, Amount: 0}, // avgPrice=(32+28)/2=30
 	}
 	// 不应 panic,且结果合理
-	cyq := CalcCYQ(candles, []float64{0.5, 0.5}, 1000)
+	cyq := CalcCYQ(candles, []float64{0.5, 0.5})
 	if len(cyq) != 2 {
 		t.Fatalf("len=%d, want 2", len(cyq))
 	}
@@ -178,11 +178,11 @@ func TestCalcCYQVolumeZeroFallback(t *testing.T) {
 
 // TestCalcCYQEmptyInput 空输入返回空切片,不 panic。
 func TestCalcCYQEmptyInput(t *testing.T) {
-	cyq := CalcCYQ(nil, nil, 0)
+	cyq := CalcCYQ(nil, nil)
 	if len(cyq) != 0 {
 		t.Fatalf("len=%d, want 0", len(cyq))
 	}
-	cyq = CalcCYQ([]Candle{}, []float64{}, 0)
+	cyq = CalcCYQ([]Candle{}, []float64{})
 	if len(cyq) != 0 {
 		t.Fatalf("len=%d, want 0", len(cyq))
 	}
@@ -193,7 +193,7 @@ func TestCalcCYQSingleDay(t *testing.T) {
 	candles := []Candle{
 		{Open: 10, High: 15, Low: 5, Close: 12, Volume: 100, Amount: 1000},
 	}
-	cyq := CalcCYQ(candles, []float64{0.5}, 1000)
+	cyq := CalcCYQ(candles, []float64{0.5})
 	if len(cyq) != 1 {
 		t.Fatalf("len=%d, want 1", len(cyq))
 	}
@@ -221,7 +221,7 @@ func TestCalcCYQASR(t *testing.T) {
 	// wUp=WINNER(22): 成本10<=22+成本20<=22 = 1.0
 	// wDn=WINNER(18): 成本10<=18, 成本20>18 → 0.3333
 	// ASR=(1.0-0.3333)*100 = 66.67
-	cyq := CalcCYQ(candles, []float64{0.5, 0.5}, 1000)
+	cyq := CalcCYQ(candles, []float64{0.5, 0.5})
 	assertNear(t, "ASR", cyq[1].ASR, 66.67, 1e-1)
 }
 
@@ -293,7 +293,7 @@ func TestCYQVolumeLessBigKline(t *testing.T) {
 
 	// 要三根 K 线,因为 candles 的前 N-1 根也参与计算,但只有最后根有意义。
 	// cycle: cyq[0] 混入未满历史,cyq[1] 同理。直接用 cyq[len-1]。
-	cyq := CalcCYQ(candles, []float64{0.01, 0.01}, 1000)
+	cyq := CalcCYQ(candles, []float64{0.01, 0.01})
 	last := cyq[len(cyq)-1]
 	if !last.VolumeLessBigKline {
 		t.Fatalf("VolumeLessBigKline=false, want true (Length=%.2f > 18, turn=1%%)", last.CYQK_Length)
@@ -314,7 +314,7 @@ func TestCYQRatio90v3(t *testing.T) {
 	// avgPrices=[3, 20]
 	// last WinnerClose(95): 3<=95(0.4975) + 20<=95(0.5025) → 1.0 > 0.90 ✅
 	// turnPct = 0.01*100 = 1% < 3% ✅
-	cyq := CalcCYQ(candles, []float64{0.01, 0.01}, 1000)
+	cyq := CalcCYQ(candles, []float64{0.01, 0.01})
 	last := cyq[len(cyq)-1]
 	if !last.Ratio90v3 {
 		t.Fatalf("Ratio90v3=false, want true (WinnerClose=%.2f > 0.90, turn=1%%)", last.WinnerClose)
@@ -334,7 +334,7 @@ func TestCYQIsLowPosition(t *testing.T) {
 		t.Fatalf("PRY1=%v, want < 40", v)
 	}
 	turns := []float64{0.5, 0.5}
-	cyq := CalcCYQ(candles, turns, 1000)
+	cyq := CalcCYQ(candles, turns)
 	if !cyq[1].IsLowPosition {
 		t.Fatalf("IsLowPosition=false, want true (PRY1=%.1f < 40)", v)
 	}
@@ -374,7 +374,7 @@ func TestCalcCYQAllZeroTurnover(t *testing.T) {
 		{Open: 10, High: 20, Low: 5, Close: 15, Volume: 100, Amount: 1000},
 		{Open: 20, High: 30, Low: 15, Close: 25, Volume: 100, Amount: 2000},
 	}
-	cyq := CalcCYQ(candles, []float64{0, 0}, 1000)
+	cyq := CalcCYQ(candles, []float64{0, 0})
 	assertNear(t, "WinnerClose zero turn", cyq[1].WinnerClose, 0, 1e-9)
 	assertNear(t, "WeightSum zero turn", cyq[1].WeightSum, 0, 1e-9)
 }
@@ -386,7 +386,7 @@ func TestCalcCYQLengthMismatch(t *testing.T) {
 		{Open: 20, High: 25, Low: 15, Close: 22, Volume: 100, Amount: 2000},
 	}
 	// turnovers 更短
-	cyq := CalcCYQ(candles, []float64{0.5}, 1000)
+	cyq := CalcCYQ(candles, []float64{0.5})
 	if len(cyq) != 1 {
 		t.Fatalf("len=%d, want 1 (min of len(candles)=2, len(turns)=1)", len(cyq))
 	}
@@ -398,7 +398,7 @@ func TestCalcCYQAmountZeroVolumeNonZero(t *testing.T) {
 		{Open: 10, High: 10, Low: 10, Close: 10, Volume: 100, Amount: 0}, // Amount=0 → 走 (H+L)/2=10
 		{Open: 20, High: 20, Low: 20, Close: 20, Volume: 100, Amount: 0}, // Amount=0 → avgPrice=20
 	}
-	cyq := CalcCYQ(candles, []float64{0.5, 0.5}, 1000)
+	cyq := CalcCYQ(candles, []float64{0.5, 0.5})
 	last := cyq[1]
 	// avgPrices=[10, 20], w=[0.3333, 0.6667]
 	// close=20 → WINNER=1.0
@@ -410,7 +410,7 @@ func TestCalcCYQNoAmountNoVolume(t *testing.T) {
 	candles := []Candle{
 		{Open: 10, High: 12, Low: 8, Close: 10, Volume: 0, Amount: 0},
 	}
-	cyq := CalcCYQ(candles, []float64{0.5}, 1000)
+	cyq := CalcCYQ(candles, []float64{0.5})
 	if len(cyq) != 1 {
 		t.Fatalf("len=%d, want 1", len(cyq))
 	}

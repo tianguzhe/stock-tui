@@ -384,7 +384,7 @@ func printAnalysis(data seriesData) store.Snapshot {
 		score.BIAS, score.CHOPCMI, score.Volume, score.SAR, score.Divergence, scoreAdj, perfAdj, latePen, score.Label)
 	// CYQ 筹码指标(换手率数据不足时跳过)
 	if n := len(data.Turnovers); n == len(candles) && n > 0 {
-		cyq := indicator.CalcCYQ(candles, data.Turnovers, 0)
+		cyq := indicator.CalcCYQ(candles, data.Turnovers)
 		if len(cyq) > 0 {
 			lastC := cyq[len(cyq)-1]
 			cyqLabel := "中性"
