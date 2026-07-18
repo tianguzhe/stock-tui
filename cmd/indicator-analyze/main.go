@@ -1,18 +1,14 @@
 package main
 
 import (
-	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
-	"math"
 	"net/http"
 	"os"
-	"sort"
-	"strconv"
-	"strings"
 	"time"
 
+	"stock-tui/internal/analysis"
 	"stock-tui/internal/api"
 	"stock-tui/internal/indicator"
 	"stock-tui/internal/market"
@@ -22,28 +18,6 @@ import (
 var httpClient = &http.Client{Timeout: 15 * time.Second}
 
 const defaultBars = 800
-
-type quoteData struct {
-	Qfqday [][]json.RawMessage          `json:"qfqday"`
-	Day    [][]json.RawMessage          `json:"day"`
-	Qt     map[string][]json.RawMessage `json:"qt"`
-}
-
-type klineResponse struct {
-	Data map[string]quoteData `json:"data"`
-}
-
-type seriesData struct {
-	Code       string
-	Name       string
-	Dates      []string
-	Candles    []indicator.Candle
-	Turnovers  []float64 // 每日换手率(小数,0.0646=6.46%),用于 CYQ 筹码计算
-	Amplitudes []float64 // 每日振幅 % = (高-低)/昨收 × 100
-	VolRatioRT float64   // 量比(实时,来自API)
-	InsideVol  float64   // 内盘(手,主动卖)
-	OutsideVol float64   // 外盘(手,主动买)
-}
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
@@ -83,18 +57,18 @@ func run(args []string) error {
 	// 因此默认（含纯分析模式与 -save）统一走 HTTP 前复权（fetchDailyKline 请求腾讯 qfq），
 	// 与 snapshot 落库口径一致。-tdx 仅作显式开启不复权口径的选项：保留 tdx 精确 Amount +
 	// 本地换手率（cyq/cyc 的 VWAP 口径），但调用方须自负除权断崖污染指标的风险。
-	var data seriesData
+	var data api.KlineData
 	var err error
 	if *useTDX {
 		data, err = fetchViaTDX(code, *bars)
 		if err != nil {
-			data, err = fetchDailyKline(code, *bars)
+			data, err = api.FetchDailyKline(httpClient, code, *bars)
 			if err != nil {
 				return fmt.Errorf("tdx 和 HTTP 都失败: %w", err)
 			}
 		}
 	} else {
-		data, err = fetchDailyKline(code, *bars)
+		data, err = api.FetchDailyKline(httpClient, code, *bars)
 		if err != nil {
 			return fmt.Errorf("HTTP 获取失败: %w", err)
 		}
@@ -130,7 +104,7 @@ func run(args []string) error {
 
 // saveSnapshot upserts the instrument (name/market from the fetched series) and
 // the analysis snapshot into the SQLite store at store.DefaultPath().
-func saveSnapshot(data seriesData, snap store.Snapshot) error {
+func saveSnapshot(data api.KlineData, snap store.Snapshot) error {
 	st, err := store.Open(store.DefaultPath())
 	if err != nil {
 		return err
@@ -143,274 +117,7 @@ func saveSnapshot(data seriesData, snap store.Snapshot) error {
 	return st.SaveSnapshot(snap)
 }
 
-func fetchDailyKline(code string, bars int) (seriesData, error) {
-	data, err := fetchTencentKline(code, bars)
-	if err == nil {
-		// proxy 已带 row[7] 换手率;仅当全 0/缺失时才东财/TDX 兜底
-		if !api.TurnoverUseful(data.Turnovers) {
-			turnovers := fetchEMTurnovers(code, len(data.Candles), data.Dates)
-			if turnovers == nil {
-				turnovers = fetchTDXTurnoverFallback(code, data.Candles)
-			}
-			if turnovers != nil {
-				data.Turnovers = turnovers
-			}
-		}
-		return data, nil
-	}
-	// 腾讯失败→自动切换到东财日K(前复权fqt=1),含 Amount(元)+换手+振幅
-	fmt.Fprintf(os.Stderr, "info: 腾讯日K失败(%v),切换到东财日K\n", err)
-	return fetchEMKline(code, bars)
-}
-
-// fetchTencentKline 从腾讯 proxy 拉前复权日K。
-// 字段单位换算见 api.ParseProxyDailyBars(万元→元、换手%→小数、振幅本地算)。
-
-func fetchTencentKline(code string, bars int) (seriesData, error) {
-	url := fmt.Sprintf(
-		"https://proxy.finance.qq.com/ifzqgtimg/appstock/app/newfqkline/get?_var=kline_dayqfq&param=%s,day,,,%d,qfq",
-		code, bars,
-	)
-	req, err := http.NewRequest(http.MethodGet, url, nil)
-	if err != nil {
-		return seriesData{}, err
-	}
-	req.Header.Set("User-Agent", "Mozilla/5.0")
-
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		return seriesData{}, fmt.Errorf("fetch %s: %w", code, err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return seriesData{}, fmt.Errorf("fetch %s: HTTP %s", code, resp.Status)
-	}
-
-	rawBody, err := io.ReadAll(io.LimitReader(resp.Body, 10<<20))
-	if err != nil {
-		return seriesData{}, err
-	}
-
-	body := api.StripJSONP(rawBody)
-
-	var parsed klineResponse
-	if err := json.Unmarshal(body, &parsed); err != nil {
-		return seriesData{}, err
-	}
-
-	raw, ok := parsed.Data[code]
-	if !ok {
-		return seriesData{}, fmt.Errorf("no klines for %s", code)
-	}
-
-	rows := raw.Qfqday
-	if len(rows) == 0 {
-		rows = raw.Day
-	}
-	if len(rows) == 0 {
-		return seriesData{}, fmt.Errorf("no klines for %s", code)
-	}
-
-	name := code
-	var volRatioRT, insideVol, outsideVol float64
-	if q, ok := raw.Qt[code]; ok && len(q) > 1 {
-		name = rawString(q[1])
-		// proxy.qq.com qt: [7]内盘手 [8]外盘手 [43]实时振幅 [46]量比
-		if len(q) > 46 {
-			volRatioRT = rawFloat(q[46])
-		}
-		if len(q) > 8 {
-			insideVol = rawFloat(q[7])
-			outsideVol = rawFloat(q[8])
-		}
-	}
-
-	parsedBars, err := api.ParseProxyDailyBars(rows)
-	if err != nil {
-		return seriesData{}, err
-	}
-	dates := make([]string, len(parsedBars))
-	candles := make([]indicator.Candle, len(parsedBars))
-	amplitudes := make([]float64, len(parsedBars))
-	turnovers := make([]float64, len(parsedBars))
-	for i, b := range parsedBars {
-		dates[i] = b.Date
-		candles[i] = indicator.Candle{
-			Open: b.Open, Close: b.Close, High: b.High, Low: b.Low,
-			Volume: b.Volume, Amount: b.Amount,
-		}
-		amplitudes[i] = b.Amplitude
-		turnovers[i] = b.Turnover
-	}
-
-	return seriesData{
-		Code: code, Name: name, Dates: dates, Candles: candles,
-		Turnovers: turnovers, Amplitudes: amplitudes,
-		VolRatioRT: volRatioRT, InsideVol: insideVol, OutsideVol: outsideVol,
-	}, nil
-}
-
-// fetchEMKline 从东财拉取前复权日K,用作腾讯日K的 HTTP fallback。
-// fields2=f51..f61,f116: 日期,开,收,高,低,量(手),额(元),振幅%,涨跌幅%,涨跌额,换手率%,代码。
-// 与腾讯 proxy 的差异: 东财 Amount 已是元(无需×10000)、振幅在 f58 直给、换手 f61 直给;
-// 无 qt 内外盘/实时量比。价格前复权(fqt=1)口径与腾讯 qfq 一致。
-
-func fetchEMKline(code string, bars int) (seriesData, error) {
-	// 映射 code → EM secid
-	prefix := ""
-	if len(code) >= 2 {
-		switch code[:2] {
-		case "sh":
-			prefix = "1"
-		case "sz", "bj":
-			prefix = "0"
-		}
-	}
-	if prefix == "" {
-		return seriesData{}, fmt.Errorf("unsupported code: %s", code)
-	}
-	secid := prefix + "." + code[2:]
-
-	url := fmt.Sprintf(
-		"https://push2his.eastmoney.com/api/qt/stock/kline/get?secid=%s&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f116&klt=101&fqt=1&end=20500101&lmt=%d",
-		secid, bars,
-	)
-
-	body, err := api.FetchEMWithRetry(httpClient, url)
-	if err != nil {
-		return seriesData{}, fmt.Errorf("东财日K %s: %w", code, err)
-	}
-
-	var emResp struct {
-		Data struct {
-			Klines []string `json:"klines"`
-		} `json:"data"`
-	}
-	if err := json.Unmarshal(body, &emResp); err != nil {
-		return seriesData{}, fmt.Errorf("东财JSON解析失败: %w", err)
-	}
-	if len(emResp.Data.Klines) == 0 {
-		return seriesData{}, fmt.Errorf("东财no klines for %s", code)
-	}
-
-	// 东财 kline 格式: "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f116"
-	// f51=日期, f52=开, f53=收, f54=高, f55=低, f56=量(手), f57=额(元),
-	// f58=振幅%, f59=涨跌幅%, f60=涨跌额, f61=换手率%, f116=代码
-	dates := make([]string, 0, len(emResp.Data.Klines))
-	candles := make([]indicator.Candle, 0, len(emResp.Data.Klines))
-	turnovers := make([]float64, 0, len(emResp.Data.Klines))
-	amplitudes := make([]float64, 0, len(emResp.Data.Klines))
-	name := code
-
-	for _, ks := range emResp.Data.Klines {
-		parts := strings.Split(ks, ",")
-		if len(parts) < 12 {
-			continue
-		}
-		date := parts[0] // f51
-		open := parseFloat(parts[1])
-		close := parseFloat(parts[2])
-		high := parseFloat(parts[3])
-		low := parseFloat(parts[4])
-		vol := parseFloat(parts[5]) * 100       // f56 手→股
-		amount := parseFloat(parts[6])          // f57 元
-		amp := parseFloat(parts[7])             // f58 振幅 %
-		turnover := parseFloat(parts[10]) / 100 // f61 %→小数(用于CYQ)
-
-		dates = append(dates, date)
-		candles = append(candles, indicator.Candle{
-			Open: open, Close: close, High: high, Low: low,
-			Volume: vol, Amount: amount,
-		})
-		turnovers = append(turnovers, turnover)
-		amplitudes = append(amplitudes, amp)
-	}
-
-	if len(candles) == 0 {
-		return seriesData{}, fmt.Errorf("东财no valid klines for %s", code)
-	}
-
-	return seriesData{Code: code, Name: name, Dates: dates, Candles: candles, Turnovers: turnovers, Amplitudes: amplitudes}, nil
-}
-
-// fetchEMTurnovers 从东财历史 K 线接口拉换手率,对齐到 Tencent 日期序列
-// 使用 api.FetchEMWithRetry 统一反限流和重试;全部失败/无数据时返回 nil
-
-func fetchEMTurnovers(code string, count int, tencentDates []string) []float64 {
-	// 映射 code → EM secid
-	prefix := ""
-	if len(code) >= 2 {
-		switch code[:2] {
-		case "sh":
-			prefix = "1"
-		case "sz", "bj":
-			prefix = "0"
-		}
-	}
-	if prefix == "" {
-		return nil
-	}
-	secid := prefix + "." + code[2:]
-
-	url := fmt.Sprintf(
-		"https://push2his.eastmoney.com/api/qt/stock/kline/get?secid=%s&fields1=f1,f2,f3&fields2=f51,f61&klt=101&fqt=1&end=20500101&lmt=%d",
-		secid, count)
-
-	body, err := api.FetchEMWithRetry(httpClient, url)
-	if err != nil {
-		return nil
-	}
-
-	var emResp struct {
-		Data struct {
-			Klines []string `json:"klines"`
-		} `json:"data"`
-	}
-	if err := json.Unmarshal(body, &emResp); err != nil {
-		return nil
-	}
-
-	// 按日期对齐:先建 map[date]turnover
-	turnMap := make(map[string]float64, len(emResp.Data.Klines))
-	for _, ks := range emResp.Data.Klines {
-		// fields2=f51,f61 返回格式: "2026-07-09,4.47" (日期,换手率%)
-		commaPos := -1
-		for j := 0; j < len(ks); j++ {
-			if ks[j] == ',' {
-				commaPos = j
-				break
-			}
-		}
-		if commaPos < 0 || commaPos >= len(ks)-1 {
-			continue
-		}
-		datePart := ks[:commaPos]
-		turnPart := ks[commaPos+1:]
-		turnMap[datePart] = parseFloat(turnPart)
-	}
-
-	// 对齐到 tencentDates,找不到的日填 0
-	turns := make([]float64, len(tencentDates))
-	hasData := false
-	for i, d := range tencentDates {
-		if v, ok := turnMap[d]; ok {
-			turns[i] = v / 100 // 东财 f61 是 %,转小数
-			hasData = true
-		}
-	}
-	if !hasData {
-		return nil
-	}
-	return turns
-}
-
-func parseFloat(s string) float64 {
-	var f float64
-	fmt.Sscanf(s, "%f", &f)
-	return f
-}
-
-func printAnalysis(data seriesData) store.Snapshot {
+func printAnalysis(data api.KlineData) store.Snapshot {
 	candles := data.Candles
 	dates := data.Dates
 	results := indicator.Calculate(candles)
@@ -418,37 +125,37 @@ func printAnalysis(data seriesData) store.Snapshot {
 	n := len(candles)
 	last := results[n-1]
 	lastCandle := candles[n-1]
-	closes := closeSeries(candles)
-	ma5, ma10, ma20, ma60 := meanTail(closes, 5), meanTail(closes, 10), meanTail(closes, 20), meanTail(closes, 60)
-	volumes := volumeSeries(candles)
-	lowAll, highAll := rangeLowHigh(candles, 0, n)
-	low20, high20 := rangeLowHigh(candles, n-20, n)
-	low60, high60 := rangeLowHigh(candles, n-60, n)
-	low120, high120 := rangeLowHigh(candles, n-120, n)
-	volMA20 := meanTail(volumes, 20)
+	closes := analysis.CloseSeries(candles)
+	ma5, ma10, ma20, ma60 := analysis.MeanTail(closes, 5), analysis.MeanTail(closes, 10), analysis.MeanTail(closes, 20), analysis.MeanTail(closes, 60)
+	volumes := analysis.VolumeSeries(candles)
+	lowAll, highAll := analysis.RangeLowHigh(candles, 0, n)
+	low20, high20 := analysis.RangeLowHigh(candles, n-20, n)
+	low60, high60 := analysis.RangeLowHigh(candles, n-60, n)
+	low120, high120 := analysis.RangeLowHigh(candles, n-120, n)
+	volMA20 := analysis.MeanTail(volumes, 20)
 	// 量比: 优先用 API 实时数据,回退本地计算(Volume/MA20)
 	volRatio := data.VolRatioRT
 	if volRatio <= 0 {
-		volRatio = ratio(lastCandle.Volume, volMA20)
+		volRatio = analysis.Ratio(lastCandle.Volume, volMA20)
 	}
-	obv := obvSeries(candles)
-	upCnt, upAvgVol, downCnt, downAvgVol := recentVolumeHealth(candles, 5)
-	score := scoreResult(candles, results, obv, upAvgVol, downAvgVol, volRatio)
-	div := divergence(candles, results, n-1)
+	obv := analysis.OBVSeries(candles)
+	upCnt, upAvgVol, downCnt, downAvgVol := analysis.RecentVolumeHealth(candles, 5)
+	score := analysis.ScoreResult(candles, results, obv, upAvgVol, downAvgVol, volRatio)
+	div := analysis.Divergence(candles, results, n-1)
 	// PERF stats must exist before scoring: applyPerfAdaptive reweighs the
 	// overbought/divergence penalties by this stock's own signal history.
-	perfs := performance(candles, dates, results, tds, obv)
-	scoreAdj, perfAdj := applyPerfAdaptive(score, perfs)
+	perfs := analysis.Performance(candles, dates, results, tds, obv)
+	scoreAdj, perfAdj := analysis.ApplyPerfAdaptive(score, perfs)
 	// Late-stage crowding penalty folds into score_adj (the adaptive sidecar),
 	// not score_total — keeping the fixed scale historically comparable while the
 	// single-stock CLI view still reflects end-of-move overheating.
-	latePen, _, _ := lateStagePenalty(candles, results)
-	scoreAdj = clampInt(scoreAdj+latePen, 0, 100)
+	latePen, _, _ := analysis.LateStagePenalty(candles, results)
+	scoreAdj = analysis.ClampInt(scoreAdj+latePen, 0, 100)
 
 	change, changePct := 0.0, 0.0
 	if n > 1 {
 		change = lastCandle.Close - candles[n-2].Close
-		changePct = ratio(change, candles[n-2].Close) * 100
+		changePct = analysis.Ratio(change, candles[n-2].Close) * 100
 	}
 
 	fmt.Printf("%s %s  %s..%s (%d根)  close=%.3f change=%+.3f pct=%+.2f%% high=%.3f low=%.3f volume=%.0f\n",
@@ -458,10 +165,10 @@ func printAnalysis(data seriesData) store.Snapshot {
 	}
 	fmt.Printf("MA5=%.3f MA10=%.3f MA20=%.3f MA60=%.3f | allRange %.3f..%.3f pos=%.0f%% | range20 %.3f..%.3f pos=%.0f%% | range60 %.3f..%.3f pos=%.0f%% | range120 %.3f..%.3f pos=%.0f%%\n",
 		ma5, ma10, ma20, ma60,
-		lowAll, highAll, position(lastCandle.Close, lowAll, highAll),
-		low20, high20, position(lastCandle.Close, low20, high20),
-		low60, high60, position(lastCandle.Close, low60, high60),
-		low120, high120, position(lastCandle.Close, low120, high120))
+		lowAll, highAll, analysis.Position(lastCandle.Close, lowAll, highAll),
+		low20, high20, analysis.Position(lastCandle.Close, low20, high20),
+		low60, high60, analysis.Position(lastCandle.Close, low60, high60),
+		low120, high120, analysis.Position(lastCandle.Close, low120, high120))
 	fmt.Printf("KDJ K=%.2f D=%.2f J=%.2f | MACD DIF=%.4f DEA=%.4f H=%.4f\n",
 		last.KDJ.K, last.KDJ.D, last.KDJ.J, last.MACD.DIF, last.MACD.DEA, last.MACD.Histogram)
 	fmt.Printf("RSI %.2f/%.2f/%.2f | WR %.2f/%.2f | BIAS %.2f/%.2f/%.2f\n",
@@ -470,10 +177,10 @@ func printAnalysis(data seriesData) store.Snapshot {
 	stochBull, stochBear := false, false
 	if n >= 2 {
 		prevStoch := results[n-2].StochRSI
-		stochBull, stochBear = stochStagnation(last.RSI.RSI6, last.StochRSI.K, last.StochRSI.D, prevStoch.K, prevStoch.D)
+		stochBull, stochBear = analysis.StochStagnation(last.RSI.RSI6, last.StochRSI.K, last.StochRSI.D, prevStoch.K, prevStoch.D)
 	}
 	fmt.Printf("STOCHRSI K=%.1f D=%.1f | RSI6=%.1f 钝化=%s 择时=%s\n",
-		last.StochRSI.K, last.StochRSI.D, last.RSI.RSI6, stagnationZone(last.RSI.RSI6), stochTimingText(stochBull, stochBear))
+		last.StochRSI.K, last.StochRSI.D, last.RSI.RSI6, analysis.StagnationZone(last.RSI.RSI6), analysis.StochTimingText(stochBull, stochBear))
 	fmt.Printf("DMI PDI=%.2f MDI=%.2f ADX=%.2f ADXR=%.2f | CMI=%.2f | CHOP=%.2f\n",
 		last.DMI.PDI, last.DMI.MDI, last.DMI.ADX, last.DMI.ADXR, last.CMI, last.CHOP)
 	fmt.Printf("RISK ATR14=%.3f ATR%%=%.2f | BOLL mid=%.3f upper=%.3f lower=%.3f %%B=%.1f bandwidth=%.2f%% | Donchian20 %.3f..%.3f Donchian55 %.3f..%.3f | MFI14=%.1f\n",
@@ -486,11 +193,11 @@ func printAnalysis(data seriesData) store.Snapshot {
 	fmt.Printf("SUPERTREND value=%.3f trend=%s reversed=%t\n",
 		last.SuperTrend.Value, longShort(last.SuperTrend.Long), last.SuperTrend.Reversed)
 	fmt.Printf("DONCHIAN_BREAK bull20=%t bear20=%t bull55=%t bear55=%t (今日Close vs 前一根Donchian上下沿)\n",
-		donchianBreak(candles, results, 20, true), donchianBreak(candles, results, 20, false),
-		donchianBreak(candles, results, 55, true), donchianBreak(candles, results, 55, false))
+		analysis.DonchianBreak(candles, results, 20, true), analysis.DonchianBreak(candles, results, 20, false),
+		analysis.DonchianBreak(candles, results, 55, true), analysis.DonchianBreak(candles, results, 55, false))
 	fmt.Printf("VolMA5=%.0f VolMA10=%.0f VolMA20=%.0f median20=%.0f | 今日量=%.0f 量比=%.2f | OBV=%s | 近5日量价: upDays=%d avgUpVol=%.0f downDays=%d avgDownVol=%.0f\n",
-		meanTail(volumes, 5), meanTail(volumes, 10), volMA20, medianTail(volumes, 20),
-		lastCandle.Volume, volRatio, obvTrend(obv), upCnt, upAvgVol, downCnt, downAvgVol)
+		analysis.MeanTail(volumes, 5), analysis.MeanTail(volumes, 10), volMA20, analysis.MedianTail(volumes, 20),
+		lastCandle.Volume, volRatio, analysis.OBVTrend(obv), upCnt, upAvgVol, downCnt, downAvgVol)
 	fmt.Printf("SCORE total=%d delta=%+d dmi=%+d ma=%+d macd=%+d kdjwr=%+d rsi=%+d bias=%+d chopcmi=%+d volume=%+d sar=%+d div=%+d adj=%d perfadj=%+d late=%+d label=%s\n",
 		score.Total, score.Delta, score.DMI, score.MA, score.MACD, score.KdjWr, score.RSI,
 		score.BIAS, score.CHOPCMI, score.Volume, score.SAR, score.Divergence, scoreAdj, perfAdj, latePen, score.Label)
@@ -633,14 +340,14 @@ func printAnalysis(data seriesData) store.Snapshot {
 		DivBear:      div.Bear,
 		DivBearToday: div.BearToday,
 
-		TDSetup:     fmt.Sprintf("%s/%d", tdSignalText(lastTD.SetupSignal), lastTD.SetupCount),
-		TDCountdown: fmt.Sprintf("%s/%d", tdSignalText(lastTD.CountdownSignal), lastTD.CountdownCount),
+		TDSetup:     fmt.Sprintf("%s/%d", analysis.TDSignalText(lastTD.SetupSignal), lastTD.SetupCount),
+		TDCountdown: fmt.Sprintf("%s/%d", analysis.TDSignalText(lastTD.CountdownSignal), lastTD.CountdownCount),
 
-		Streak: streakValue(candles),
+		Streak: analysis.StreakValue(candles),
 
-		Ret20:  nDayReturn(candles, 20),
-		Ret60:  nDayReturn(candles, 60),
-		Ret120: nDayReturn(candles, 120),
+		Ret20:  analysis.NDayReturn(candles, 20),
+		Ret60:  analysis.NDayReturn(candles, 60),
+		Ret120: analysis.NDayReturn(candles, 120),
 
 		PerfTrendFollowBullWin10: perfTrendFollowBullWin10,
 		PerfOverboughtBearWin10:  perfOverboughtBearWin10,
@@ -651,8 +358,8 @@ func printAnalysis(data seriesData) store.Snapshot {
 		PerfTrendFollowBullAvg10: perfTrendFollowBullAvg10,
 
 		KeltnerSqueeze:   last.Keltner.Squeeze,
-		DonchBreak20Bull: donchianBreak(candles, results, 20, true),
-		DonchBreak55Bull: donchianBreak(candles, results, 55, true),
+		DonchBreak20Bull: analysis.DonchianBreak(candles, results, 20, true),
+		DonchBreak55Bull: analysis.DonchianBreak(candles, results, 55, true),
 
 		SARValue:        last.SAR.Value,
 		SuperTrendValue: last.SuperTrend.Value,
@@ -666,676 +373,7 @@ func printAnalysis(data seriesData) store.Snapshot {
 	return snap
 }
 
-// nDayReturn computes (close[last] - close[last-n]) / close[last-n] * 100.
-// Returns 0 if there are fewer than n+1 bars or the base price is zero.
-func nDayReturn(candles []indicator.Candle, n int) float64 {
-	last := len(candles) - 1
-	base := last - n
-	if base < 0 || candles[base].Close == 0 {
-		return 0
-	}
-	return (candles[last].Close - candles[base].Close) / candles[base].Close * 100
-}
-
-type scoreState struct {
-	Total      int
-	Delta      int
-	DMI        int
-	MA         int
-	MACD       int
-	KdjWr      int // merged KDJ+WR (same source, pick the more extreme signal)
-	RSI        int
-	BIAS       int
-	CHOPCMI    int
-	Volume     int
-	SAR        int // SAR/SuperTrend dual confirmation
-	Divergence int // bull/bear divergence signal
-	Label      string
-	Signals    signalState
-}
-
-type signalState struct {
-	TrendBullScore  int
-	TrendBearScore  int
-	OversoldScore   int
-	OverboughtScore int
-	BreakBullScore  int
-	BreakBearScore  int
-	RevertBullScore int
-	RevertBearScore int
-	TrendBull       bool
-	TrendBear       bool
-	Oversold        bool
-	Overbought      bool
-	BreakBull       bool
-	BreakBear       bool
-	RevertBull      bool
-	RevertBear      bool
-	StochStagBull   bool // StochRSI %K up-cross inside an oversold-pinned RSI zone
-	StochStagBear   bool // StochRSI %K down-cross inside an overbought-pinned RSI zone
-}
-
-// Volume-ratio (量比) thresholds, unified across scoring, signals, and display
-// so one volRatio reads the same everywhere (CLAUDE.md 量能口径): 缩量 < volQuiet,
-// 放量 ≥ volSurge, 强放量 ≥ volStrong.
-const (
-	volQuiet  = 0.8
-	volSurge  = 1.5
-	volStrong = 2.0
-)
-
-func scoreResult(candles []indicator.Candle, results []indicator.Result, obv []float64, avgUpVol, avgDownVol, volRatio float64) scoreState {
-	n := len(candles)
-	last := results[n-1]
-	prev := last
-	if n > 1 {
-		prev = results[n-2]
-	}
-
-	score := scoreState{Signals: evalSignals(candles, results, obv, n-1)}
-	dmiDiff := last.DMI.PDI - last.DMI.MDI
-	switch {
-	case dmiDiff > 15 && last.DMI.ADX > 25:
-		score.DMI = 12
-	case dmiDiff > 8 && last.DMI.ADX > 20:
-		score.DMI = 8
-	case dmiDiff > 0:
-		score.DMI = 3
-	case dmiDiff < -15 && last.DMI.ADX > 25:
-		score.DMI = -12
-	case dmiDiff < -8 && last.DMI.ADX > 20:
-		score.DMI = -8
-	case dmiDiff < 0:
-		score.DMI = -3
-	}
-
-	ma5, ma10, ma20, ma60 := closeMA(candles, n-1, 5), closeMA(candles, n-1, 10), closeMA(candles, n-1, 20), closeMA(candles, n-1, 60)
-	switch countTrue(candles[n-1].Close > ma5, candles[n-1].Close > ma10, candles[n-1].Close > ma20, candles[n-1].Close > ma60) {
-	case 4:
-		score.MA = 10
-	case 3:
-		score.MA = 6
-	case 2:
-		score.MA = 2
-	case 1:
-		score.MA = -4
-	default:
-		score.MA = -10
-	}
-	if ma5 > ma10 && ma10 > ma20 && ma20 > ma60 {
-		score.MA += 2
-	} else if ma5 < ma10 && ma10 < ma20 && ma20 < ma60 {
-		score.MA -= 2
-	}
-
-	macdGold := last.MACD.DIF >= last.MACD.DEA
-	switch {
-	case last.MACD.DIF > 0 && macdGold && last.MACD.Histogram > prev.MACD.Histogram:
-		score.MACD = 8
-	case last.MACD.DIF > 0 && macdGold:
-		score.MACD = 5
-	case last.MACD.DIF > 0:
-		score.MACD = 2
-	case last.MACD.DIF < 0 && macdGold:
-		score.MACD = -2
-	case last.MACD.DIF < 0 && last.MACD.Histogram < prev.MACD.Histogram:
-		score.MACD = -8
-	case last.MACD.DIF < 0:
-		score.MACD = -5
-	}
-
-	// KDJ + WR merged: both measure close position within N-day high-low range.
-	// Take the more extreme signal to avoid double-counting same-source indicators.
-	kdjGold := last.KDJ.K >= last.KDJ.D
-	kdjSignal := 0
-	switch {
-	case last.KDJ.K < 20 && kdjGold:
-		kdjSignal = 7
-	case last.KDJ.K < 20:
-		kdjSignal = 1
-	case last.KDJ.K <= 80 && kdjGold:
-		kdjSignal = 3
-	case last.KDJ.K <= 80:
-		kdjSignal = -3
-	case kdjGold:
-		kdjSignal = -2
-	default:
-		kdjSignal = -7
-	}
-	wrSignal := 0
-	switch {
-	case last.WR.WR14 > 90:
-		wrSignal = 4
-	case last.WR.WR14 >= 80:
-		wrSignal = 2
-	case last.WR.WR14 >= 60:
-		wrSignal = 1
-	case last.WR.WR14 >= 40:
-		wrSignal = 0
-	case last.WR.WR14 >= 20:
-		wrSignal = -1
-	case last.WR.WR14 >= 10:
-		wrSignal = -2
-	default:
-		wrSignal = -4
-	}
-	if abs(kdjSignal) >= abs(wrSignal) {
-		score.KdjWr = kdjSignal
-	} else {
-		score.KdjWr = wrSignal
-	}
-
-	switch {
-	case last.RSI.RSI6 < 20:
-		score.RSI = 5
-	case last.RSI.RSI6 <= 30:
-		score.RSI = 3
-	case last.RSI.RSI6 <= 45:
-		score.RSI = 1
-	case last.RSI.RSI6 <= 55:
-		score.RSI = 0
-	case last.RSI.RSI6 <= 70:
-		score.RSI = -1
-	case last.RSI.RSI6 <= 80:
-		score.RSI = -3
-	default:
-		score.RSI = -5
-	}
-
-	switch {
-	case last.BIAS.BIAS24 < -15:
-		score.BIAS = 3
-	case last.BIAS.BIAS24 <= -10:
-		score.BIAS = 2
-	case last.BIAS.BIAS24 <= -5:
-		score.BIAS = 1
-	case last.BIAS.BIAS24 <= 5:
-		score.BIAS = 0
-	case last.BIAS.BIAS24 <= 10:
-		score.BIAS = -1
-	case last.BIAS.BIAS24 <= 15:
-		score.BIAS = -2
-	default:
-		score.BIAS = -3
-	}
-
-	// CHOPCMI: trend-efficiency confirmation. CLAUDE.md「CMI/CHOP 仅印证」means it
-	// confirms *that* a trend is efficient, never the *direction* — CHOP and CMI
-	// are direction-agnostic (CMI uses abs()), so a steady 30-bar downtrend yields
-	// the same CMI=95 as its mirror uptrend. The strength magnitude stands (strong
-	// trend efficiency → bigger |score|), but the SIGN follows DMI direction
-	// (dmiDiff = PDI - MDI, computed above) so a bear trend confirms bearish, not
-	// bullish. The choppy case (CHOP high / CMI low) stays negative: choppy markets
-	// drag any directional strategy regardless of stance.
-	switch {
-	case last.CHOP < 30 && last.CMI > 70:
-		score.CHOPCMI = 3
-		if dmiDiff < 0 {
-			score.CHOPCMI = -3
-		}
-	case last.CHOP < 38.2 && last.CMI > 60:
-		score.CHOPCMI = 2
-		if dmiDiff < 0 {
-			score.CHOPCMI = -2
-		}
-	case last.CHOP > 70 && last.CMI < 30:
-		score.CHOPCMI = -3
-	case last.CHOP > 61.8 && last.CMI < 40:
-		score.CHOPCMI = -2
-	}
-
-	priceUp, priceDown := false, false
-	if n > 1 {
-		priceUp = candles[n-1].Close > candles[n-2].Close
-		priceDown = candles[n-1].Close < candles[n-2].Close
-	}
-	switch {
-	case volRatio > volStrong && priceUp:
-		score.Volume += 3
-	case volRatio > volStrong && priceDown:
-		score.Volume -= 3
-	case volRatio >= volSurge && priceUp:
-		score.Volume += 2
-	case volRatio >= volSurge && priceDown:
-		score.Volume -= 2
-	case volRatio < volQuiet && priceUp:
-		score.Volume -= 2
-	case volRatio < volQuiet && priceDown:
-		score.Volume++
-	}
-	if len(obv) >= 6 {
-		if obv[n-1] > obv[n-6] {
-			score.Volume++
-		} else if obv[n-1] < obv[n-6] {
-			score.Volume--
-		}
-	}
-	if avgUpVol > avgDownVol {
-		score.Volume++
-	} else if avgUpVol < avgDownVol {
-		score.Volume--
-	}
-	score.Volume = clampInt(score.Volume, -5, 5)
-
-	// SAR/SuperTrend dual confirmation: trend-following stance.
-	switch {
-	case last.SAR.Long && last.SuperTrend.Long:
-		score.SAR = 3
-	case !last.SAR.Long && !last.SuperTrend.Long:
-		score.SAR = -3
-	}
-
-	// Divergence signal: bear divergence penalizes, bull divergence rewards.
-	if n >= 20 {
-		div := divergence(candles, results, n-1)
-		if div.BearToday {
-			score.Divergence = -3
-		} else if div.Bear {
-			score.Divergence = -1
-		}
-		if div.BullToday {
-			score.Divergence = 2
-		} else if div.Bull {
-			score.Divergence = 1
-		}
-	}
-
-	score.Delta = score.DMI + score.MA + score.MACD + score.KdjWr + score.RSI + score.BIAS + score.CHOPCMI + score.Volume + score.SAR + score.Divergence
-	score.Total = clampInt(50+score.Delta, 0, 100)
-	score.Label = scoreLabel(score.Total)
-	return score
-}
-
-// applyPerfAdaptive recomputes the total score with per-stock PERF-history
-// weighting (CLAUDE.md 方法论: 不用同一把尺子量所有股). Overbought-family
-// penalties (negative KdjWr/RSI/BIAS) are only adjusted when the composite
-// Overbought signal fired — that is exactly the signal the "超买反转" PERF
-// stat backtests, and gating there avoids mis-weighting e.g. a mid-range KDJ
-// dead cross. Penalties are halved when the signal is historically
-// ineffective (win10 < 35%) and amplified ×1.5 when effective (win10 > 55%);
-// the bear-divergence penalty is adjusted the same way against the "顶背离"
-// stat (<40% / >55%). Bull rewards are never touched. Requires n ≥ 10
-// samples. Integer division truncates toward zero (-7/2 = -3, -1/2 = 0).
-//
-// The adjusted total goes to the score_adj sidecar column; score_total keeps
-// the original scale so history stays comparable.
-func applyPerfAdaptive(score scoreState, perfs []perfStat) (adjTotal, perfAdj int) {
-	obWin, obN := perfWin10(perfs, "超买反转")
-	divWin, divN := perfWin10(perfs, "顶背离")
-
-	adj := 0
-	if score.Signals.Overbought {
-		for _, v := range []int{score.KdjWr, score.RSI, score.BIAS} {
-			adj += perfScale(v, obWin, obN, 35, 55) - v
-		}
-	}
-	if score.Divergence < 0 {
-		adj += perfScale(score.Divergence, divWin, divN, 40, 55) - score.Divergence
-	}
-	return clampInt(50+score.Delta+adj, 0, 100), adj
-}
-
-// perfWin10 returns the forward-10-day win rate (%) and trigger count for the
-// named PERF stat, or (0, 0) when it is absent or never triggered.
-func perfWin10(perfs []perfStat, name string) (float64, int) {
-	for _, p := range perfs {
-		if p.Name == name && p.Triggers > 0 {
-			return float64(p.Win10) / float64(p.Triggers) * 100, p.Triggers
-		}
-	}
-	return 0, 0
-}
-
-// perfScale reweighs a negative penalty by this stock's own historical win
-// rate (CLAUDE.md PERF 自适应): halved when the signal was historically
-// ineffective (win < weakBelow), amplified ×1.5 when effective (win >
-// strongAbove). Non-negative values and thin samples (n < 10) pass through
-// unchanged. Integer division truncates toward zero (-7/2 = -3, -1/2 = 0).
-func perfScale(v int, win float64, n int, weakBelow, strongAbove float64) int {
-	if v >= 0 || n < 10 {
-		return v
-	}
-	if win < weakBelow {
-		return v / 2
-	}
-	if win > strongAbove {
-		return v * 3 / 2
-	}
-	return v
-}
-
-func abs(x int) int {
-	if x < 0 {
-		return -x
-	}
-	return x
-}
-
-// lateStagePenalty scores end-of-move overheating from candle-only inputs, so it
-// is identical on -save and plain runs (turnover, which the CLI lacks here, is
-// left to screen-stocks). 口径对齐 screen-stocks `_late_stage_risk`: a positive
-// BIAS24 stretched > 4 daily ATRs (volatility-normalized 乖离) and/or an up-run
-// of ≥5 closes mark a crowded, reversal-prone tail. Returns a small non-positive
-// penalty (≥ -5) plus the raw streak/biasAtr for display. Only the UP side is
-// penalized — oversold (negative bias / down-run) returns 0.
-func lateStagePenalty(candles []indicator.Candle, results []indicator.Result) (penalty, streak int, biasAtr float64) {
-	last := results[len(results)-1]
-	streak = streakValue(candles)
-	if last.ATR.Pct > 0 {
-		biasAtr = last.BIAS.BIAS24 / last.ATR.Pct
-	}
-	if biasAtr > 4 {
-		penalty -= 2
-		if biasAtr > 6 {
-			penalty--
-		}
-	}
-	if streak >= 5 {
-		penalty -= 2
-		if streak >= 7 {
-			penalty--
-		}
-	}
-	if penalty < -5 {
-		penalty = -5
-	}
-	return penalty, streak, biasAtr
-}
-
-func evalSignals(candles []indicator.Candle, results []indicator.Result, obv []float64, i int) signalState {
-	if i < 60 {
-		return signalState{}
-	}
-	r, prev := results[i], results[i-1]
-	ma5, ma20, ma60 := closeMA(candles, i, 5), closeMA(candles, i, 20), closeMA(candles, i, 60)
-	vr := ratio(candles[i].Volume, volumeMA(candles, i, 20))
-	fiveAgo := maxInt(0, i-5)
-	priceUp5 := candles[i].Close > candles[fiveAgo].Close
-	priceDown5 := candles[i].Close < candles[fiveAgo].Close
-	obvUp := obv[i] > obv[fiveAgo]
-	obvDown := obv[i] < obv[fiveAgo]
-	crossUp20 := candles[i-1].Close <= closeMA(candles, i-1, 20) && candles[i].Close > ma20
-	crossDown20 := candles[i-1].Close >= closeMA(candles, i-1, 20) && candles[i].Close < ma20
-	crossUp60 := candles[i-1].Close <= closeMA(candles, i-1, 60) && candles[i].Close > ma60
-	crossDown60 := candles[i-1].Close >= closeMA(candles, i-1, 60) && candles[i].Close < ma60
-
-	s := signalState{
-		// Trend votes are 3 axis-aligned dimensions (CLAUDE.md「指标分工」: DMI
-		// strength + DMI/MACD direction + MA 排列). CHOP is same-axis with ADX
-		// trend strength — dropped here; its trend-efficiency value is already
-		// carried by the separate CHOPCMI score component, so it must not double-count.
-		TrendBullScore: countTrue(r.DMI.ADX > 25, r.MACD.DIF > 0 && r.DMI.PDI > r.DMI.MDI, candles[i].Close > ma5 && candles[i].Close > ma20 && ma5 > ma20),
-		TrendBearScore: countTrue(r.DMI.ADX > 25, r.MACD.DIF < 0 && r.DMI.MDI > r.DMI.PDI, candles[i].Close < ma5 && candles[i].Close < ma20 && ma5 < ma20),
-		// Oversold/Overbought votes are 3 axis-aligned dimensions (RSI magnitude +
-		// same-source WR/KDJ range position, merged + BIAS). WR and KDJ are both
-		// close-position-in-N-day-range — same source (CLAUDE.md), so they share ONE
-		// vote; either tripping counts, KDJ keeps its turning confirmation.
-		OversoldScore:   countTrue(r.RSI.RSI6 < 30, r.WR.WR14 > 80 || (r.KDJ.K < 20 && (r.KDJ.K > r.KDJ.D || r.KDJ.J > prev.KDJ.J)), r.BIAS.BIAS24 < -10),
-		OverboughtScore: countTrue(r.RSI.RSI6 > 70, r.WR.WR14 < 20 || (r.KDJ.K > 80 && (r.KDJ.K < r.KDJ.D || r.KDJ.J < prev.KDJ.J)), r.BIAS.BIAS24 > 10),
-		BreakBullScore:  countTrue(crossUp20 || crossUp60, vr > volSurge, obvUp),
-		BreakBearScore:  countTrue(crossDown20 || crossDown60, vr > volSurge, obvDown),
-		RevertBullScore: countTrue(r.BIAS.BIAS24 < -10, r.CHOP > 45, priceDown5 && obvUp),
-		RevertBearScore: countTrue(r.BIAS.BIAS24 > 10, r.CHOP > 45, priceUp5 && obvDown),
-	}
-	s.TrendBull = s.TrendBullScore >= 3
-	s.TrendBear = s.TrendBearScore >= 3
-	s.Oversold = s.OversoldScore >= 3
-	s.Overbought = s.OverboughtScore >= 3
-	s.BreakBull = s.BreakBullScore >= 2
-	s.BreakBear = s.BreakBearScore >= 2
-	s.RevertBull = s.RevertBullScore >= 2
-	s.RevertBear = s.RevertBearScore >= 2
-	s.StochStagBull, s.StochStagBear = stochStagnation(r.RSI.RSI6, r.StochRSI.K, r.StochRSI.D, prev.StochRSI.K, prev.StochRSI.D)
-	return s
-}
-
-// stochStagnation flags a StochRSI %K/%D crossover that occurs while RSI6 is
-// pinned in an extreme zone ("钝化") — the timing signal RSI alone can't give
-// because it has lost resolution at the top/bottom. It is a sidecar timing cue,
-// deliberately kept OUT of the score (same momentum dimension as RSI/KDJ — see
-// CLAUDE.md「指标分工」: avoid double-counting one axis as independent votes).
-func stochStagnation(rsi6, kNow, dNow, kPrev, dPrev float64) (bull, bear bool) {
-	crossDown := kPrev >= dPrev && kNow < dNow
-	crossUp := kPrev <= dPrev && kNow > dNow
-	bear = rsi6 > 75 && crossDown && kPrev > 80 // high-zone 钝化 + %K rolling over from overbought
-	bull = rsi6 < 25 && crossUp && kPrev < 20   // low-zone 钝化 + %K turning up from oversold
-	return
-}
-
-// stagnationZone labels RSI6's 钝化 state for display.
-func stagnationZone(rsi6 float64) string {
-	switch {
-	case rsi6 > 75:
-		return "高位"
-	case rsi6 < 25:
-		return "低位"
-	default:
-		return "正常"
-	}
-}
-
-// stochTimingText renders the stagnation-timing cue for the current bar.
-func stochTimingText(bull, bear bool) string {
-	switch {
-	case bear:
-		return "今日空头转向"
-	case bull:
-		return "今日多头转向"
-	default:
-		return "-"
-	}
-}
-
-type divergenceState struct {
-	Ready      bool
-	BullScore  int
-	BearScore  int
-	Bull       bool
-	Bear       bool
-	BullToday  bool
-	BearToday  bool
-	LowIdx     int
-	RefLowIdx  int
-	HighIdx    int
-	RefHighIdx int
-}
-
-// divergence detects momentum divergence by comparing today's RSI6 against the
-// RSI6 peak/trough within the recent lookback window rather than comparing two
-// price extremes. This avoids cross-trend comparisons: a lower RSI at a higher
-// price only means divergence when momentum genuinely peaked inside the same move.
-//
-// Bear: RSI already peaked inside the window while price is still up → weakening.
-// Bull: RSI already troughed inside the window while price is still down → strengthening.
-func divergence(candles []indicator.Candle, results []indicator.Result, i int) divergenceState {
-	const lookback = 20
-	const minGap = 3 // ignore the last few bars to reduce single-day noise
-	if i < lookback {
-		return divergenceState{}
-	}
-
-	refStart := i - lookback
-	refEnd := i - minGap
-
-	// Find the RSI6 peak and trough in [refStart, refEnd].
-	rsiPeakIdx, rsiTroughIdx := refStart, refStart
-	for j := refStart + 1; j <= refEnd; j++ {
-		if results[j].RSI.RSI6 > results[rsiPeakIdx].RSI.RSI6 {
-			rsiPeakIdx = j
-		}
-		if results[j].RSI.RSI6 < results[rsiTroughIdx].RSI.RSI6 {
-			rsiTroughIdx = j
-		}
-	}
-
-	d := divergenceState{
-		Ready:   true,
-		HighIdx: i, RefHighIdx: rsiPeakIdx,
-		LowIdx: i, RefLowIdx: rsiTroughIdx,
-	}
-
-	rsiNow := results[i].RSI.RSI6
-	difNow := results[i].MACD.DIF
-
-	// Bear divergence: RSI already peaked, but price is still at or above the peak
-	// day's close. Confirm we are in high territory (RSI > 60) and MACD positive.
-	if rsiNow > 60 &&
-		rsiNow < results[rsiPeakIdx].RSI.RSI6 &&
-		candles[i].Close >= candles[rsiPeakIdx].Close &&
-		difNow > 0 {
-		d.BearScore = 1
-		d.Bear = true
-		d.BearToday = true
-	}
-
-	// Bull divergence: RSI already troughed, but price is still at or below the
-	// trough day's close. Confirm low territory (RSI < 40) and MACD negative.
-	if rsiNow < 40 &&
-		rsiNow > results[rsiTroughIdx].RSI.RSI6 &&
-		candles[i].Close <= candles[rsiTroughIdx].Close &&
-		difNow < 0 {
-		d.BullScore = 1
-		d.Bull = true
-		d.BullToday = true
-	}
-
-	return d
-}
-
-type perfStat struct {
-	Name       string
-	Direction  string
-	Triggers   int
-	Win5       int
-	Win10      int
-	Sum5       float64
-	Sum10      float64
-	Best10     float64
-	Worst10    float64
-	MaxAdverse float64
-	LastDate   string
-}
-
-// performance backtests each signal's forward 5/10-day returns. Signals are
-// counted on the RISING EDGE only (off→on transition): consecutive trigger
-// days re-sample the same overlapping forward window and would inflate N
-// without adding independent information (overlapping-returns problem), which
-// previously made win-rate samples look 3-5x larger than they really were.
-// The TD countdown==13 trigger is inherently a one-shot event and needs no
-// edge detection.
-func performance(candles []indicator.Candle, dates []string, results []indicator.Result, tds []indicator.TD, obv []float64) []perfStat {
-	perfs := []perfStat{
-		newPerf("趋势跟随多头", "多头"), newPerf("趋势跟随空头", "空头"),
-		newPerf("超卖反转", "多头"), newPerf("超买反转", "空头"),
-		newPerf("量价突破多头", "多头"), newPerf("量价突破空头", "空头"),
-		newPerf("均值回归多头", "多头"), newPerf("均值回归空头", "空头"),
-		newPerf("底背离", "多头"), newPerf("顶背离", "空头"),
-		newPerf("TD见底Countdown", "多头"), newPerf("TD见顶Countdown", "空头"),
-		newPerf("StochRSI钝化多头", "多头"), newPerf("StochRSI钝化空头", "空头"),
-	}
-	if len(candles) <= 90 {
-		return perfs
-	}
-	prev := evalSignals(candles, results, obv, 79)
-	prevDiv := divergence(candles, results, 79)
-	for i := 80; i+10 < len(candles); i++ {
-		s := evalSignals(candles, results, obv, i)
-		d := divergence(candles, results, i)
-		if s.TrendBull && !prev.TrendBull {
-			recordPerf(&perfs[0], candles, dates, i)
-		}
-		if s.TrendBear && !prev.TrendBear {
-			recordPerf(&perfs[1], candles, dates, i)
-		}
-		if s.Oversold && !prev.Oversold {
-			recordPerf(&perfs[2], candles, dates, i)
-		}
-		if s.Overbought && !prev.Overbought {
-			recordPerf(&perfs[3], candles, dates, i)
-		}
-		if s.BreakBull && !prev.BreakBull {
-			recordPerf(&perfs[4], candles, dates, i)
-		}
-		if s.BreakBear && !prev.BreakBear {
-			recordPerf(&perfs[5], candles, dates, i)
-		}
-		if s.RevertBull && !prev.RevertBull {
-			recordPerf(&perfs[6], candles, dates, i)
-		}
-		if s.RevertBear && !prev.RevertBear {
-			recordPerf(&perfs[7], candles, dates, i)
-		}
-		if d.BullToday && !prevDiv.BullToday {
-			recordPerf(&perfs[8], candles, dates, i)
-		}
-		if d.BearToday && !prevDiv.BearToday {
-			recordPerf(&perfs[9], candles, dates, i)
-		}
-		if tds[i].CountdownCount == 13 {
-			if tds[i].CountdownSignal == indicator.TDBuy {
-				recordPerf(&perfs[10], candles, dates, i)
-			} else if tds[i].CountdownSignal == indicator.TDSell {
-				recordPerf(&perfs[11], candles, dates, i)
-			}
-		}
-		if s.StochStagBull && !prev.StochStagBull {
-			recordPerf(&perfs[12], candles, dates, i)
-		}
-		if s.StochStagBear && !prev.StochStagBear {
-			recordPerf(&perfs[13], candles, dates, i)
-		}
-		prev, prevDiv = s, d
-	}
-	return perfs
-}
-
-func newPerf(name, direction string) perfStat {
-	return perfStat{Name: name, Direction: direction, Best10: math.Inf(-1), Worst10: math.Inf(1)}
-}
-
-func recordPerf(p *perfStat, candles []indicator.Candle, dates []string, i int) {
-	entry := candles[i].Close
-	ret5 := (candles[i+5].Close/entry - 1) * 100
-	ret10 := (candles[i+10].Close/entry - 1) * 100
-	adverse := 0.0
-	if p.Direction == "空头" {
-		ret5, ret10 = -ret5, -ret10
-		for j := i + 1; j <= i+10; j++ {
-			move := -(candles[j].High/entry - 1) * 100
-			if move < adverse {
-				adverse = move
-			}
-		}
-	} else {
-		for j := i + 1; j <= i+10; j++ {
-			move := (candles[j].Low/entry - 1) * 100
-			if move < adverse {
-				adverse = move
-			}
-		}
-	}
-	p.Triggers++
-	if ret5 > 0 {
-		p.Win5++
-	}
-	if ret10 > 0 {
-		p.Win10++
-	}
-	p.Sum5 += ret5
-	p.Sum10 += ret10
-	if ret10 > p.Best10 {
-		p.Best10 = ret10
-	}
-	if ret10 < p.Worst10 {
-		p.Worst10 = ret10
-	}
-	if adverse < p.MaxAdverse {
-		p.MaxAdverse = adverse
-	}
-	p.LastDate = dates[i]
-}
-
-func printDivergence(d divergenceState, dates []string, candles []indicator.Candle, results []indicator.Result) {
+func printDivergence(d analysis.DivergenceState, dates []string, candles []indicator.Candle, results []indicator.Result) {
 	if !d.Ready {
 		fmt.Println("DIVERGENCE N/A (样本不足: 需要至少20根日K)")
 		return
@@ -1355,43 +393,18 @@ func printTD(td indicator.TD) {
 		tdPerf = "(perfected)"
 	}
 	fmt.Printf("TD_NOW setup=%s/%d%s countdown=%s/%d\n",
-		tdSignalText(td.SetupSignal), td.SetupCount, tdPerf, tdSignalText(td.CountdownSignal), td.CountdownCount)
+		analysis.TDSignalText(td.SetupSignal), td.SetupCount, tdPerf, analysis.TDSignalText(td.CountdownSignal), td.CountdownCount)
 }
 
 func printRecentExtremes(candles []indicator.Candle, dates []string, results []indicator.Result) {
-	hiIdx, loIdx := windowExtremes(candles, len(candles)-1, 20)
+	hiIdx, loIdx := analysis.WindowExtremes(candles, len(candles)-1, 20)
 	fmt.Printf("近20日 高点=%s %.3f(DIF=%.4f RSI6=%.1f) 低点=%s %.3f(DIF=%.4f RSI6=%.1f)\n",
 		dates[hiIdx], candles[hiIdx].High, results[hiIdx].MACD.DIF, results[hiIdx].RSI.RSI6,
 		dates[loIdx], candles[loIdx].Low, results[loIdx].MACD.DIF, results[loIdx].RSI.RSI6)
 }
 
-// streakValue returns the current consecutive-close run length, signed:
-// positive for an up run, negative for a down run, 0 when flat or none.
-func streakValue(candles []indicator.Candle) int {
-	streak, direction := 0, 0
-	for i := len(candles) - 1; i > 0; i-- {
-		current := 0
-		if candles[i].Close > candles[i-1].Close {
-			current = 1
-		} else if candles[i].Close < candles[i-1].Close {
-			current = -1
-		}
-		if current == 0 {
-			break
-		}
-		if streak == 0 {
-			direction = current
-		}
-		if current != direction {
-			break
-		}
-		streak++
-	}
-	return streak * direction
-}
-
 func printStreak(candles []indicator.Candle) {
-	sv := streakValue(candles)
+	sv := analysis.StreakValue(candles)
 	if sv > 0 {
 		fmt.Printf("连续上涨 %d 日\n", sv)
 	} else if sv < 0 {
@@ -1435,7 +448,7 @@ func perfNote(orig, adj int) string {
 	switch {
 	case adj == orig:
 		return ""
-	case abs(adj) < abs(orig):
+	case analysis.AbsInt(adj) < analysis.AbsInt(orig):
 		return "(本股历史无效·降权)"
 	default:
 		return "(本股历史有效·加权)"
@@ -1493,7 +506,7 @@ func strongestSwingVote(last indicator.Result) (string, int) {
 	}
 	best, bestLabel := 0, ""
 	for _, c := range cands {
-		if abs(c.w) > abs(best) {
+		if analysis.AbsInt(c.w) > analysis.AbsInt(best) {
 			best, bestLabel = c.w, c.label
 		}
 	}
@@ -1507,24 +520,24 @@ func strongestSwingVote(last indicator.Result) (string, int) {
 // its most extreme member (RSI/WR/KDJ-J/BIAS), and the composite score is NOT
 // fed back as a vote. Overbought and top-divergence bear votes are reweighted by
 // this stock's own PERF history (perfScale), matching score_adj's methodology.
-func evalBullBear(candles []indicator.Candle, results []indicator.Result, tds []indicator.TD, obv []float64, div divergenceState, perfs []perfStat, volRatio float64) bullBearVerdict {
+func evalBullBear(candles []indicator.Candle, results []indicator.Result, tds []indicator.TD, obv []float64, div analysis.DivergenceState, perfs []analysis.PerfStat, volRatio float64) bullBearVerdict {
 	n := len(candles)
 	last := results[n-1]
 	lastTD := tds[n-1]
 	var v bullBearVerdict
 
-	obWin, obN := perfWin10(perfs, "超买反转")
-	divWin, divN := perfWin10(perfs, "顶背离")
+	obWin, obN := analysis.PerfWin10(perfs, "超买反转")
+	divWin, divN := analysis.PerfWin10(perfs, "顶背离")
 
 	// 趋势维度:DMI 方向强度 + SAR/ST 双确认 + MA 排列,合并一票(三者一致才满权)。
-	ma5, ma10, ma20, ma60 := closeMA(candles, n-1, 5), closeMA(candles, n-1, 10), closeMA(candles, n-1, 20), closeMA(candles, n-1, 60)
+	ma5, ma10, ma20, ma60 := analysis.CloseMA(candles, n-1, 5), analysis.CloseMA(candles, n-1, 10), analysis.CloseMA(candles, n-1, 20), analysis.CloseMA(candles, n-1, 60)
 	adx := last.DMI.ADX
 	maBull := ma5 > ma10 && ma10 > ma20 && ma20 > ma60
 	maBear := ma5 < ma10 && ma10 < ma20 && ma20 < ma60
 	sarStBull := last.SAR.Long && last.SuperTrend.Long
 	sarStBear := !last.SAR.Long && !last.SuperTrend.Long
-	bullConfirm := countTrue(adx > 25 && last.DMI.PDI > last.DMI.MDI, sarStBull, maBull)
-	bearConfirm := countTrue(adx > 25 && last.DMI.MDI > last.DMI.PDI, sarStBear, maBear)
+	bullConfirm := analysis.CountTrue(adx > 25 && last.DMI.PDI > last.DMI.MDI, sarStBull, maBull)
+	bearConfirm := analysis.CountTrue(adx > 25 && last.DMI.MDI > last.DMI.PDI, sarStBear, maBear)
 	switch {
 	case bullConfirm > bearConfirm:
 		v.addBull(fmt.Sprintf("趋势多头(ADX%.1f,确认%d/3)", adx, bullConfirm), bullConfirm)
@@ -1542,7 +555,7 @@ func evalBullBear(candles []indicator.Candle, results []indicator.Result, tds []
 
 	// 超买超卖维度:RSI/WR/KDJ-J/BIAS 同源,只取最极端的一项计一票;看空侧按 PERF 调权。
 	if label, w := strongestSwingVote(last); w < 0 {
-		adj := perfScale(w, obWin, obN, 35, 55)
+		adj := analysis.PerfScale(w, obWin, obN, 35, 55)
 		v.addBear(label+perfNote(w, adj), -adj)
 	} else if w > 0 {
 		v.addBull(label, w)
@@ -1564,10 +577,10 @@ func evalBullBear(candles []indicator.Candle, results []indicator.Result, tds []
 	priceUp := n > 1 && candles[n-1].Close > candles[n-2].Close
 	priceDown := n > 1 && candles[n-1].Close < candles[n-2].Close
 	switch {
-	case volRatio > volSurge && priceUp:
+	case volRatio > analysis.VolSurge && priceUp:
 		moneyW += 2
 		moneyParts = append(moneyParts, fmt.Sprintf("放量上涨(量比%.2f)", volRatio))
-	case volRatio > volSurge && priceDown:
+	case volRatio > analysis.VolSurge && priceDown:
 		moneyW -= 2
 		moneyParts = append(moneyParts, fmt.Sprintf("放量下跌(量比%.2f)", volRatio))
 	}
@@ -1602,7 +615,7 @@ func evalBullBear(candles []indicator.Candle, results []indicator.Result, tds []
 			w = -1
 			label = "顶背离(非当日)"
 		}
-		adj := perfScale(w, divWin, divN, 40, 55)
+		adj := analysis.PerfScale(w, divWin, divN, 40, 55)
 		v.addBear(label+perfNote(w, adj), -adj)
 	}
 	if div.Bull {
@@ -1629,7 +642,7 @@ func evalBullBear(candles []indicator.Candle, results []indicator.Result, tds []
 // printBullBear renders the weighted verdict. The composite score is shown as
 // context only (score=), never as a vote — it is the sum of the very dimensions
 // already counted above, so feeding it back would double-count everything.
-func printBullBear(v bullBearVerdict, score scoreState) {
+func printBullBear(v bullBearVerdict, score analysis.ScoreState) {
 	fmt.Printf("BULLBEAR bull=[%s] bear=[%s] bullW=%d bearW=%d verdict=%s score=%d\n",
 		bbItemsText(v.Bulls), bbItemsText(v.Bears), v.BullScore, v.BearScore, v.Verdict, score.Total)
 }
@@ -1649,7 +662,7 @@ func bbItemsText(items []bbItem) string {
 // printReading emits a per-dimension natural-language reading of the indicators
 // (CLAUDE.md 分析输出口径: 量能一律用量比数值). It only synthesizes values already
 // computed upstream — nothing here is persisted or recomputed independently.
-func printReading(candles []indicator.Candle, results []indicator.Result, tds []indicator.TD, obv []float64, score scoreState, div divergenceState, perfs []perfStat, volRatio float64, v bullBearVerdict) {
+func printReading(candles []indicator.Candle, results []indicator.Result, tds []indicator.TD, obv []float64, score analysis.ScoreState, div analysis.DivergenceState, perfs []analysis.PerfStat, volRatio float64, v bullBearVerdict) {
 	n := len(candles)
 	last := results[n-1]
 	lastTD := tds[n-1]
@@ -1694,10 +707,10 @@ func printReading(candles []indicator.Candle, results []indicator.Result, tds []
 
 	money := "量价中性"
 	switch {
-	case volRatio > volSurge:
-		money = fmt.Sprintf("量比%.2f(>%.1f)放量,需看价配合", volRatio, volSurge)
-	case volRatio < volQuiet:
-		money = fmt.Sprintf("量比%.2f(<%.1f)清淡", volRatio, volQuiet)
+	case volRatio > analysis.VolSurge:
+		money = fmt.Sprintf("量比%.2f(>%.1f)放量,需看价配合", volRatio, analysis.VolSurge)
+	case volRatio < analysis.VolQuiet:
+		money = fmt.Sprintf("量比%.2f(<%.1f)清淡", volRatio, analysis.VolQuiet)
 	}
 	mfiTag := ""
 	switch {
@@ -1707,14 +720,14 @@ func printReading(candles []indicator.Candle, results []indicator.Result, tds []
 		mfiTag = ",MFI<20资金偏冷"
 	}
 	fmt.Printf("READ 资金: 量比=%.2f OBV=%s MFI=%.1f → %s%s\n",
-		volRatio, obvTrend(obv), last.MFI, money, mfiTag)
+		volRatio, analysis.OBVTrend(obv), last.MFI, money, mfiTag)
 
 	var timing []string
 	if lastTD.SetupCount > 0 {
-		timing = append(timing, fmt.Sprintf("TD-setup %s/%d", tdSignalText(lastTD.SetupSignal), lastTD.SetupCount))
+		timing = append(timing, fmt.Sprintf("TD-setup %s/%d", analysis.TDSignalText(lastTD.SetupSignal), lastTD.SetupCount))
 	}
 	if lastTD.CountdownCount > 0 {
-		timing = append(timing, fmt.Sprintf("TD-countdown %s/%d", tdSignalText(lastTD.CountdownSignal), lastTD.CountdownCount))
+		timing = append(timing, fmt.Sprintf("TD-countdown %s/%d", analysis.TDSignalText(lastTD.CountdownSignal), lastTD.CountdownCount))
 	}
 	if div.Bear {
 		t := "顶背离"
@@ -1736,7 +749,7 @@ func printReading(candles []indicator.Candle, results []indicator.Result, tds []
 	}
 	fmt.Printf("READ 择时: %s\n", timingText)
 
-	latePen, streak, biasAtr := lateStagePenalty(candles, results)
+	latePen, streak, biasAtr := analysis.LateStagePenalty(candles, results)
 	lateText := "无明显末端拥挤"
 	if latePen < 0 {
 		lateText = fmt.Sprintf("末端追高风险(score_adj %+d)", latePen)
@@ -1751,12 +764,12 @@ func printReading(candles []indicator.Candle, results []indicator.Result, tds []
 
 	var caveats []string
 	if score.Signals.Overbought {
-		if w, nn := perfWin10(perfs, "超买反转"); nn >= 10 && w < 35 {
+		if w, nn := analysis.PerfWin10(perfs, "超买反转"); nn >= 10 && w < 35 {
 			caveats = append(caveats, fmt.Sprintf("超买本股win10=%.0f%%(<35%%),已降权", w))
 		}
 	}
 	if div.Bear {
-		if w, nn := perfWin10(perfs, "顶背离"); nn >= 10 && w < 40 {
+		if w, nn := analysis.PerfWin10(perfs, "顶背离"); nn >= 10 && w < 40 {
 			caveats = append(caveats, fmt.Sprintf("顶背离本股win10=%.0f%%(<40%%),已降权", w))
 		}
 	}
@@ -1779,7 +792,7 @@ func joinComma(ss []string) string {
 	return s
 }
 
-func printPerf(perfs []perfStat) {
+func printPerf(perfs []analysis.PerfStat) {
 	fmt.Println("历史信号性能(仅用信号当日及以前判断, 统计未来5/10日; N<5统计意义弱):")
 	for _, p := range perfs {
 		if p.Triggers == 0 {
@@ -1795,15 +808,15 @@ func printPerf(perfs []perfStat) {
 }
 
 func printRecentRows(candles []indicator.Candle, dates []string, results []indicator.Result, tds []indicator.TD) {
-	start := maxInt(0, len(candles)-15)
+	start := analysis.MaxInt(0, len(candles)-15)
 	for i := start; i < len(candles); i++ {
 		row := results[i]
 		volumeTag := "平"
-		if vm := volumeMA(candles, i, 20); vm > 0 {
+		if vm := analysis.VolumeMA(candles, i, 20); vm > 0 {
 			ratio := candles[i].Volume / vm
-			if ratio > volSurge {
+			if ratio > analysis.VolSurge {
 				volumeTag = "放量"
-			} else if ratio < volQuiet {
+			} else if ratio < analysis.VolQuiet {
 				volumeTag = "缩量"
 			}
 		}
@@ -1823,223 +836,7 @@ func printRecentRows(candles []indicator.Candle, dates []string, results []indic
 		fmt.Printf("%s c=%.3f %s Vol=%.0f(%s) J=%.1f MH=%.4f RSI6=%.1f MFI=%.1f ATR%%=%.2f PDI=%.1f MDI=%.1f ADX=%.1f CHOP=%.1f TD=%s SAR=%s\n",
 			dates[i], candles[i].Close, priceDir, candles[i].Volume, volumeTag, row.KDJ.J,
 			row.MACD.Histogram, row.RSI.RSI6, row.MFI, row.ATR.Pct, row.DMI.PDI,
-			row.DMI.MDI, row.DMI.ADX, row.CHOP, tdShort(tds[i]), sarTag)
-	}
-}
-
-func rawString(raw json.RawMessage) string {
-	var s string
-	if err := json.Unmarshal(raw, &s); err != nil {
-		return ""
-	}
-	return s
-}
-
-func rawFloat(raw json.RawMessage) float64 {
-	s := rawString(raw)
-	value, err := strconv.ParseFloat(s, 64)
-	if err != nil && s != "" && s != "0" && s != "0.00" {
-		fmt.Fprintf(os.Stderr, "warn: rawFloat: %q -> 0\n", s)
-	}
-	return value
-}
-
-func closeSeries(candles []indicator.Candle) []float64 {
-	values := make([]float64, len(candles))
-	for i, candle := range candles {
-		values[i] = candle.Close
-	}
-	return values
-}
-
-func volumeSeries(candles []indicator.Candle) []float64 {
-	values := make([]float64, len(candles))
-	for i, candle := range candles {
-		values[i] = candle.Volume
-	}
-	return values
-}
-
-func obvSeries(candles []indicator.Candle) []float64 {
-	obv := make([]float64, len(candles))
-	if len(candles) == 0 {
-		return obv
-	}
-	obv[0] = candles[0].Volume
-	for i := 1; i < len(candles); i++ {
-		switch {
-		case candles[i].Close > candles[i-1].Close:
-			obv[i] = obv[i-1] + candles[i].Volume
-		case candles[i].Close < candles[i-1].Close:
-			obv[i] = obv[i-1] - candles[i].Volume
-		default:
-			obv[i] = obv[i-1]
-		}
-	}
-	return obv
-}
-
-func rangeLowHigh(candles []indicator.Candle, start, end int) (float64, float64) {
-	if start < 0 {
-		start = 0
-	}
-	if end > len(candles) {
-		end = len(candles)
-	}
-	if start >= end {
-		// Empty range — return last candle's values to avoid Inf→NaN.
-		if len(candles) > 0 {
-			last := candles[len(candles)-1]
-			return last.Low, last.High
-		}
-		return 0, 0
-	}
-	low, high := math.Inf(1), math.Inf(-1)
-	for i := start; i < end; i++ {
-		if candles[i].Low < low {
-			low = candles[i].Low
-		}
-		if candles[i].High > high {
-			high = candles[i].High
-		}
-	}
-	return low, high
-}
-
-func windowExtremes(candles []indicator.Candle, end, period int) (int, int) {
-	start := maxInt(0, end-period+1)
-	hiIdx, loIdx := start, start
-	for i := start + 1; i <= end; i++ {
-		if candles[i].High > candles[hiIdx].High {
-			hiIdx = i
-		}
-		if candles[i].Low < candles[loIdx].Low {
-			loIdx = i
-		}
-	}
-	return hiIdx, loIdx
-}
-
-func meanTail(values []float64, count int) float64 {
-	if len(values) == 0 {
-		return 0
-	}
-	start := maxInt(0, len(values)-count)
-	total := 0.0
-	for _, value := range values[start:] {
-		total += value
-	}
-	return total / float64(len(values)-start)
-}
-
-func medianTail(values []float64, count int) float64 {
-	start := maxInt(0, len(values)-count)
-	cp := append([]float64(nil), values[start:]...)
-	sort.Float64s(cp)
-	if len(cp) == 0 {
-		return 0
-	}
-	mid := len(cp) / 2
-	if len(cp)%2 == 1 {
-		return cp[mid]
-	}
-	return (cp[mid-1] + cp[mid]) / 2
-}
-
-func closeMA(candles []indicator.Candle, end, period int) float64 {
-	start := maxInt(0, end-period+1)
-	total := 0.0
-	for i := start; i <= end; i++ {
-		total += candles[i].Close
-	}
-	return total / float64(end-start+1)
-}
-
-func volumeMA(candles []indicator.Candle, end, period int) float64 {
-	start := maxInt(0, end-period+1)
-	total := 0.0
-	for i := start; i <= end; i++ {
-		total += candles[i].Volume
-	}
-	return total / float64(end-start+1)
-}
-
-func recentVolumeHealth(candles []indicator.Candle, days int) (int, float64, int, float64) {
-	upTotal, downTotal := 0.0, 0.0
-	upCnt, downCnt := 0, 0
-	start := maxInt(1, len(candles)-days)
-	for i := start; i < len(candles); i++ {
-		if candles[i].Close > candles[i-1].Close {
-			upTotal += candles[i].Volume
-			upCnt++
-		} else if candles[i].Close < candles[i-1].Close {
-			downTotal += candles[i].Volume
-			downCnt++
-		}
-	}
-	return upCnt, ratio(upTotal, float64(upCnt)), downCnt, ratio(downTotal, float64(downCnt))
-}
-
-func donchianBreak(candles []indicator.Candle, results []indicator.Result, period int, bullish bool) bool {
-	if len(candles) < 2 {
-		return false
-	}
-	close := candles[len(candles)-1].Close
-	prev := results[len(results)-2].Donchian
-	if period == 55 {
-		if bullish {
-			return close > prev.Upper55
-		}
-		return close < prev.Lower55
-	}
-	if bullish {
-		return close > prev.Upper20
-	}
-	return close < prev.Lower20
-}
-
-func obvTrend(obv []float64) string {
-	if len(obv) < 6 {
-		return "样本不足"
-	}
-	if obv[len(obv)-1] > obv[len(obv)-6] {
-		return "上升(净流入)"
-	}
-	if obv[len(obv)-1] < obv[len(obv)-6] {
-		return "下降(净流出)"
-	}
-	return "持平"
-}
-
-func tdSignalText(signal indicator.TDSignal) string {
-	switch signal {
-	case indicator.TDBuy:
-		return "见底"
-	case indicator.TDSell:
-		return "见顶"
-	default:
-		return "-"
-	}
-}
-
-func tdShort(td indicator.TD) string {
-	dir := func(signal indicator.TDSignal) string {
-		if signal == indicator.TDSell {
-			return "顶"
-		}
-		return "底"
-	}
-	switch {
-	case td.CountdownCount > 0:
-		return fmt.Sprintf("C%s%d", dir(td.CountdownSignal), td.CountdownCount)
-	case td.SetupCount > 0:
-		text := fmt.Sprintf("S%s%d", dir(td.SetupSignal), td.SetupCount)
-		if td.SetupCount == 9 && td.SetupPerfected {
-			text += "*"
-		}
-		return text
-	default:
-		return "-"
+			row.DMI.MDI, row.DMI.ADX, row.CHOP, analysis.TDShort(tds[i]), sarTag)
 	}
 }
 
@@ -2055,64 +852,4 @@ func ynMark(v bool) string {
 		return "是"
 	}
 	return "否"
-}
-
-func scoreLabel(score int) string {
-	switch {
-	case score >= 85:
-		return "技术极强"
-	case score >= 70:
-		return "技术偏强"
-	case score >= 55:
-		return "技术略偏强"
-	case score >= 45:
-		return "技术中性/方向不明"
-	case score >= 31:
-		return "技术略偏弱"
-	case score >= 16:
-		return "技术偏弱"
-	default:
-		return "技术极弱"
-	}
-}
-
-func countTrue(values ...bool) int {
-	count := 0
-	for _, value := range values {
-		if value {
-			count++
-		}
-	}
-	return count
-}
-
-func position(value, low, high float64) float64 {
-	if high <= low {
-		return 50
-	}
-	return (value - low) / (high - low) * 100
-}
-
-func ratio(numerator, denominator float64) float64 {
-	if denominator == 0 {
-		return 0
-	}
-	return numerator / denominator
-}
-
-func clampInt(value, low, high int) int {
-	if value < low {
-		return low
-	}
-	if value > high {
-		return high
-	}
-	return value
-}
-
-func maxInt(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
 }

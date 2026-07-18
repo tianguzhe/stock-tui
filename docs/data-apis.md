@@ -103,14 +103,16 @@ GET https://proxy.finance.qq.com/ifzqgtimg/appstock/app/newfqkline/get?_var=klin
 
 > 腾讯失败时自动切换东财 `push2his` 全日 K fallback（Amount 单位为**元**、换手 f61、振幅 f58；无 qt 内外盘/实时量比）。
 
-#### 历史 / 精简对照（非当前主源）
+#### ⚠️ 已弃用（2026-07 起）— 历史 / 精简对照
+
+> **此接口已弃用**。当前代码全部走 proxy `newfqkline`；保留此 URL 仅作对照。
 
 ```
 GET https://ifzq.gtimg.cn/appstock/app/fqkline/get?param=sh600580,day,,,320,qfq
 ```
 
-- 旧接口仅 6 列：`[日期, 开, 收, 高, 低, 量]`，无振幅/精确成交额。
-- 当前代码已切到 proxy；保留此 URL 仅作对照。
+- 旧接口仅 6 列：`[日期, 开, 收, 高, 低, 量]`，无振幅/精确成交额/换手率。
+- 新代码不应使用此接口。
 
 ### 1.3 分时(分钟K)
 

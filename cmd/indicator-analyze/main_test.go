@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 
+	"stock-tui/internal/analysis"
 	"stock-tui/internal/indicator"
 )
 
@@ -53,103 +54,103 @@ func TestScoreLabelUsesTechnicalState(t *testing.T) {
 	}
 
 	for _, tc := range cases {
-		if got := scoreLabel(tc.score); got != tc.want {
-			t.Fatalf("scoreLabel(%d) = %q, want %q", tc.score, got, tc.want)
+		if got := analysis.ScoreLabel(tc.score); got != tc.want {
+			t.Fatalf("analysis.ScoreLabel(%d) = %q, want %q", tc.score, got, tc.want)
 		}
 	}
 }
 
-// perfStatOf builds a perfStat whose win10 rate is winPct over n triggers.
-func perfStatOf(name string, n int, winPct float64) perfStat {
-	return perfStat{Name: name, Triggers: n, Win10: int(winPct / 100 * float64(n))}
+// perfStatOf builds a analysis.PerfStat whose win10 rate is winPct over n triggers.
+func perfStatOf(name string, n int, winPct float64) analysis.PerfStat {
+	return analysis.PerfStat{Name: name, Triggers: n, Win10: int(winPct / 100 * float64(n))}
 }
 
 func TestApplyPerfAdaptive(t *testing.T) {
 	// Base: overbought-family penalties KdjWr=-7 RSI=-5 BIAS=-3, Delta/Total consistent.
-	base := func(overbought bool, divergence int) scoreState {
-		s := scoreState{
+	base := func(overbought bool, divergence int) analysis.ScoreState {
+		s := analysis.ScoreState{
 			KdjWr: -7, RSI: -5, BIAS: -3, Divergence: divergence,
-			Signals: signalState{Overbought: overbought},
+			Signals: analysis.SignalState{Overbought: overbought},
 		}
 		s.Delta = s.KdjWr + s.RSI + s.BIAS + s.Divergence
-		s.Total = clampInt(50+s.Delta, 0, 100)
+		s.Total = analysis.ClampInt(50+s.Delta, 0, 100)
 		return s
 	}
 
 	cases := []struct {
 		name      string
-		score     scoreState
-		perfs     []perfStat
+		score     analysis.ScoreState
+		perfs     []analysis.PerfStat
 		wantAdj   int
 		wantTotal int
 	}{
 		{
 			name:  "未触发复合超买不调整",
 			score: base(false, 0),
-			perfs: []perfStat{perfStatOf("超买反转", 50, 20)},
+			perfs: []analysis.PerfStat{perfStatOf("超买反转", 50, 20)},
 			// total = 50-15 = 35
 			wantAdj: 0, wantTotal: 35,
 		},
 		{
 			name:  "超买历史无效(win<35)惩罚减半向零截断",
 			score: base(true, 0),
-			perfs: []perfStat{perfStatOf("超买反转", 20, 30)},
+			perfs: []analysis.PerfStat{perfStatOf("超买反转", 20, 30)},
 			// -7→-3(+4) -5→-2(+3) -3→-1(+2) → adj=+9, total=35+9=44
 			wantAdj: 9, wantTotal: 44,
 		},
 		{
 			name:  "超买历史有效(win>55)惩罚x1.5",
 			score: base(true, 0),
-			perfs: []perfStat{perfStatOf("超买反转", 20, 60)},
+			perfs: []analysis.PerfStat{perfStatOf("超买反转", 20, 60)},
 			// -7→-10(-3) -5→-7(-2) -3→-4(-1) → adj=-6, total=35-6=29
 			wantAdj: -6, wantTotal: 29,
 		},
 		{
 			name:    "样本不足(n<10)不调整",
 			score:   base(true, 0),
-			perfs:   []perfStat{perfStatOf("超买反转", 9, 0)},
+			perfs:   []analysis.PerfStat{perfStatOf("超买反转", 9, 0)},
 			wantAdj: 0, wantTotal: 35,
 		},
 		{
 			name:    "中间胜率(35-55)不调整",
 			score:   base(true, 0),
-			perfs:   []perfStat{perfStatOf("超买反转", 20, 45)},
+			perfs:   []analysis.PerfStat{perfStatOf("超买反转", 20, 45)},
 			wantAdj: 0, wantTotal: 35,
 		},
 		{
 			name:  "顶背离历史无效(win<40)惩罚减半",
 			score: base(false, -3),
-			perfs: []perfStat{perfStatOf("顶背离", 100, 25)},
+			perfs: []analysis.PerfStat{perfStatOf("顶背离", 100, 25)},
 			// -3→-1(+2), total = 50-18+2 = 34
 			wantAdj: 2, wantTotal: 34,
 		},
 		{
 			name:  "顶背离历史有效(win>55)惩罚x1.5",
 			score: base(false, -3),
-			perfs: []perfStat{perfStatOf("顶背离", 100, 60)},
+			perfs: []analysis.PerfStat{perfStatOf("顶背离", 100, 60)},
 			// -3→-4(-1), total = 50-18-1 = 31
 			wantAdj: -1, wantTotal: 31,
 		},
 		{
 			name: "底背离奖励不动",
-			score: func() scoreState {
-				s := scoreState{Divergence: 2}
+			score: func() analysis.ScoreState {
+				s := analysis.ScoreState{Divergence: 2}
 				s.Delta = 2
 				s.Total = 52
 				return s
 			}(),
-			perfs:   []perfStat{perfStatOf("顶背离", 100, 25)},
+			perfs:   []analysis.PerfStat{perfStatOf("顶背离", 100, 25)},
 			wantAdj: 0, wantTotal: 52,
 		},
 		{
 			name: "小惩罚减半归零(-1/2=0)",
-			score: func() scoreState {
-				s := scoreState{RSI: -1, Signals: signalState{Overbought: true}}
+			score: func() analysis.ScoreState {
+				s := analysis.ScoreState{RSI: -1, Signals: analysis.SignalState{Overbought: true}}
 				s.Delta = -1
 				s.Total = 49
 				return s
 			}(),
-			perfs:   []perfStat{perfStatOf("超买反转", 20, 30)},
+			perfs:   []analysis.PerfStat{perfStatOf("超买反转", 20, 30)},
 			wantAdj: 1, wantTotal: 50,
 		},
 		{
@@ -162,9 +163,9 @@ func TestApplyPerfAdaptive(t *testing.T) {
 	}
 
 	for _, tc := range cases {
-		gotTotal, gotAdj := applyPerfAdaptive(tc.score, tc.perfs)
+		gotTotal, gotAdj := analysis.ApplyPerfAdaptive(tc.score, tc.perfs)
 		if gotAdj != tc.wantAdj || gotTotal != tc.wantTotal {
-			t.Errorf("%s: applyPerfAdaptive() = (total=%d, adj=%d), want (total=%d, adj=%d)",
+			t.Errorf("%s: analysis.ApplyPerfAdaptive() = (total=%d, adj=%d), want (total=%d, adj=%d)",
 				tc.name, gotTotal, gotAdj, tc.wantTotal, tc.wantAdj)
 		}
 	}
@@ -196,13 +197,13 @@ func TestPerformanceCountsRisingEdgesOnly(t *testing.T) {
 	}
 	results := indicator.Calculate(candles)
 	tds := indicator.TDSequential(candles)
-	obv := obvSeries(candles)
+	obv := analysis.OBVSeries(candles)
 
 	// Count trigger days and rising edges for TrendBull over the same window.
 	triggerDays, edges := 0, 0
-	prev := evalSignals(candles, results, obv, 79)
+	prev := analysis.EvalSignals(candles, results, obv, 79)
 	for i := 80; i+10 < n; i++ {
-		s := evalSignals(candles, results, obv, i)
+		s := analysis.EvalSignals(candles, results, obv, i)
 		if s.TrendBull {
 			triggerDays++
 			if !prev.TrendBull {
@@ -218,7 +219,7 @@ func TestPerformanceCountsRisingEdgesOnly(t *testing.T) {
 		t.Fatalf("synthetic series has no consecutive trigger runs (triggerDays=%d == edges=%d), test is vacuous", triggerDays, edges)
 	}
 
-	perfs := performance(candles, dates, results, tds, obv)
+	perfs := analysis.Performance(candles, dates, results, tds, obv)
 	if perfs[0].Triggers != edges {
 		t.Fatalf("趋势跟随多头 N = %d, want rising-edge count %d (per-day count would be %d)",
 			perfs[0].Triggers, edges, triggerDays)
@@ -226,9 +227,9 @@ func TestPerformanceCountsRisingEdgesOnly(t *testing.T) {
 }
 
 func TestPerformanceUsesSignalNames(t *testing.T) {
-	perfs := performance(nil, nil, nil, nil, nil)
+	perfs := analysis.Performance(nil, nil, nil, nil, nil)
 	if len(perfs) < 14 {
-		t.Fatalf("performance() returned %d rows, want at least 14", len(perfs))
+		t.Fatalf("analysis.Performance() returned %d rows, want at least 14", len(perfs))
 	}
 
 	if perfs[10].Name != "TD见底Countdown" {
@@ -265,32 +266,32 @@ func TestStochStagnation(t *testing.T) {
 		{"正常区双侧不触发", 50, 60, 40, 30, 45, false, false},
 	}
 	for _, tc := range cases {
-		gotBull, gotBear := stochStagnation(tc.rsi6, tc.kNow, tc.dNow, tc.kPrev, tc.dPrev)
+		gotBull, gotBear := analysis.StochStagnation(tc.rsi6, tc.kNow, tc.dNow, tc.kPrev, tc.dPrev)
 		if gotBull != tc.wantBull || gotBear != tc.wantBear {
-			t.Errorf("%s: stochStagnation() = (bull=%t, bear=%t), want (bull=%t, bear=%t)",
+			t.Errorf("%s: analysis.StochStagnation() = (bull=%t, bear=%t), want (bull=%t, bear=%t)",
 				tc.name, gotBull, gotBear, tc.wantBull, tc.wantBear)
 		}
 	}
 }
 
 func TestTDSignalTextUsesTechnicalState(t *testing.T) {
-	if got := tdSignalText(indicator.TDBuy); got != "见底" {
-		t.Fatalf("tdSignalText(TDBuy) = %q, want 见底", got)
+	if got := analysis.TDSignalText(indicator.TDBuy); got != "见底" {
+		t.Fatalf("analysis.TDSignalText(TDBuy) = %q, want 见底", got)
 	}
-	if got := tdSignalText(indicator.TDSell); got != "见顶" {
-		t.Fatalf("tdSignalText(TDSell) = %q, want 见顶", got)
+	if got := analysis.TDSignalText(indicator.TDSell); got != "见顶" {
+		t.Fatalf("analysis.TDSignalText(TDSell) = %q, want 见顶", got)
 	}
 }
 
 func TestTDShortUsesTechnicalDirection(t *testing.T) {
-	bottom := tdShort(indicator.TD{SetupSignal: indicator.TDBuy, SetupCount: 9, SetupPerfected: true})
+	bottom := analysis.TDShort(indicator.TD{SetupSignal: indicator.TDBuy, SetupCount: 9, SetupPerfected: true})
 	if bottom != "S底9*" {
-		t.Fatalf("tdShort(bottom setup) = %q, want S底9*", bottom)
+		t.Fatalf("analysis.TDShort(bottom setup) = %q, want S底9*", bottom)
 	}
 
-	top := tdShort(indicator.TD{CountdownSignal: indicator.TDSell, CountdownCount: 13})
+	top := analysis.TDShort(indicator.TD{CountdownSignal: indicator.TDSell, CountdownCount: 13})
 	if top != "C顶13" {
-		t.Fatalf("tdShort(top countdown) = %q, want C顶13", top)
+		t.Fatalf("analysis.TDShort(top countdown) = %q, want C顶13", top)
 	}
 }
 
@@ -320,7 +321,7 @@ func flatTDs(n int, last indicator.TD) []indicator.TD {
 
 func TestEvalBullBear(t *testing.T) {
 	const n = 61 // ≥ ma60 window + the look-back for OBV/price direction
-	mk := func(last indicator.Result, td indicator.TD, div divergenceState, perfs []perfStat, volRatio float64) bullBearVerdict {
+	mk := func(last indicator.Result, td indicator.TD, div analysis.DivergenceState, perfs []analysis.PerfStat, volRatio float64) bullBearVerdict {
 		return evalBullBear(flatCandles(n, 10), flatResults(n, last), flatTDs(n, td), make([]float64, n), div, perfs, volRatio)
 	}
 	// noTrend cancels the trend vote: SAR long + ST short is neither dual-long
@@ -338,7 +339,7 @@ func TestEvalBullBear(t *testing.T) {
 		last.KDJ.J = 110      // -2
 		// 旧实现会把 RSI/BIAS 各投一票再叠加"评分偏弱",至少 3 个 bear;
 		// 新实现同轴只取最极端一项,且不回灌 score → 恰好 1 个 bear。
-		v := mk(last, indicator.TD{}, divergenceState{}, []perfStat{perfStatOf("超买反转", 20, 20)}, 1.0)
+		v := mk(last, indicator.TD{}, analysis.DivergenceState{}, []analysis.PerfStat{perfStatOf("超买反转", 20, 20)}, 1.0)
 		if len(v.Bears) != 1 || len(v.Bulls) != 0 {
 			t.Fatalf("bulls=%d bears=%d, want 0/1; bears=%+v", len(v.Bulls), len(v.Bears), v.Bears)
 		}
@@ -353,7 +354,7 @@ func TestEvalBullBear(t *testing.T) {
 	t.Run("超买样本不足_不降权", func(t *testing.T) {
 		last := noTrend(indicator.Result{})
 		last.RSI.RSI6 = 85
-		v := mk(last, indicator.TD{}, divergenceState{}, []perfStat{perfStatOf("超买反转", 5, 0)}, 1.0)
+		v := mk(last, indicator.TD{}, analysis.DivergenceState{}, []analysis.PerfStat{perfStatOf("超买反转", 5, 0)}, 1.0)
 		if v.BearScore != 3 {
 			t.Errorf("BearScore=%d, want 3 (n<10 不调权)", v.BearScore)
 		}
@@ -371,7 +372,7 @@ func TestEvalBullBear(t *testing.T) {
 		last.SAR.Long, last.SuperTrend.Long = true, true                          // SAR/ST 双多 → 趋势确认 +1
 		last.MACD.DIF, last.MACD.DEA, last.MACD.Histogram = 1, 0, 1               // MACD 金叉 +2
 		td := indicator.TD{CountdownCount: 13, CountdownSignal: indicator.TDBuy}  // TD 见底 +3
-		v := mk(last, td, divergenceState{}, nil, 1.0)
+		v := mk(last, td, analysis.DivergenceState{}, nil, 1.0)
 		if v.BearScore != 0 || v.BullScore != 6 {
 			t.Fatalf("bullW=%d bearW=%d, want 6/0 (趋势1+MACD2+TD3); bulls=%+v", v.BullScore, v.BearScore, v.Bulls)
 		}
@@ -393,7 +394,7 @@ func TestCHOPCMISignFollowsDMIDirection(t *testing.T) {
 
 	mkCHOPCMI := func(last indicator.Result) int {
 		results := flatResults(n, last)
-		return scoreResult(candles, results, obv, 1, 1, 1.0).CHOPCMI
+		return analysis.ScoreResult(candles, results, obv, 1, 1, 1.0).CHOPCMI
 	}
 
 	strong := indicator.Result{CHOP: 15, CMI: 95} // CHOP<30 && CMI>70 → strong trend efficiency
@@ -440,11 +441,11 @@ func TestEvalSignalsSameSourceNoDoubleVote(t *testing.T) {
 	obv := make([]float64, n)
 	results := flatResults(n, indicator.Result{})
 
-	mk := func(mutate func(*indicator.Result)) signalState {
+	mk := func(mutate func(*indicator.Result)) analysis.SignalState {
 		last := results[i]
 		mutate(&last)
 		results[i] = last
-		return evalSignals(candles, results, obv, i)
+		return analysis.EvalSignals(candles, results, obv, i)
 	}
 
 	// #5: a downtrend with ADX>25, MACD dead cross, CHOP very low (trend strong).

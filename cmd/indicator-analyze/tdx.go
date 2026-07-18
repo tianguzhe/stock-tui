@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"stock-tui/internal/api"
 	"stock-tui/internal/indicator"
 
 	tdx "github.com/quantbeing/tdx"
@@ -15,7 +16,7 @@ import (
 // fetchViaTDX 通过通达信 TCP 协议获取历史日K,作为主力数据源。
 // 一次调用即返回 OHLCV + Amount + 换手率(通过流通股本本地算)。
 // 失败时调用方应回退到 HTTP 方案。
-func fetchViaTDX(code string, count int) (seriesData, error) {
+func fetchViaTDX(code string, count int) (api.KlineData, error) {
 	// 映射 sh600522 → (MarketSH, "600522")
 	var marketID model.Market
 	rawCode := code
@@ -26,7 +27,7 @@ func fetchViaTDX(code string, count int) (seriesData, error) {
 		marketID = model.MarketSZ
 		rawCode = code[2:]
 	} else {
-		return seriesData{}, fmt.Errorf("tdx: 未知前缀 %s", code)
+		return api.KlineData{}, fmt.Errorf("tdx: 未知前缀 %s", code)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -37,17 +38,17 @@ func fetchViaTDX(code string, count int) (seriesData, error) {
 		Timeout:     15 * time.Second,
 	})
 	if err != nil {
-		return seriesData{}, fmt.Errorf("tdx FromBestHost: %w", err)
+		return api.KlineData{}, fmt.Errorf("tdx FromBestHost: %w", err)
 	}
 	defer client.Close()
 
 	// 拉日K
 	bars, err := client.GetSecurityBars(ctx, marketID, rawCode, model.KlineDay, 0, count)
 	if err != nil {
-		return seriesData{}, fmt.Errorf("tdx GetSecurityBars: %w", err)
+		return api.KlineData{}, fmt.Errorf("tdx GetSecurityBars: %w", err)
 	}
 	if len(bars) == 0 {
-		return seriesData{}, fmt.Errorf("tdx: 无数据")
+		return api.KlineData{}, fmt.Errorf("tdx: 无数据")
 	}
 
 	// 拉流通股本(用于换手率),非致命
@@ -74,7 +75,7 @@ func fetchViaTDX(code string, count int) (seriesData, error) {
 		}
 	}
 
-	return seriesData{Code: code, Name: code, Dates: dates, Candles: candles, Turnovers: turnovers}, nil
+	return api.KlineData{Code: code, Name: code, Dates: dates, Candles: candles, Turnovers: turnovers}, nil
 }
 
 // fetchTDXTurnoverFallback 东财换手率失败时的 TDX 兜底: 只拉流通股本,

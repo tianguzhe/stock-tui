@@ -12,7 +12,8 @@
 - `docs/cyq-data-source-notes.md` — CYQ 筹码指标数据源注意事项
 
 ## 行情数据
-- `internal/api` 仅封装实时报价 `FetchStocks` 与分时 `FetchMinute`,**无日K**——日K走 tdx 协议或 HTTP 自拉。
+- `internal/api` 封装行情 API（实时报价 `FetchStocks`、分时 `FetchMinute`、**日K获取 `FetchDailyKline`**——proxy 前复权 + 东财 fallback + TDX 换手率兜底，共享层消除 cmd 间重复）。
+- `internal/analysis` 技术面评分引擎（`ScoreResult`/`EvalSignals`/`Divergence`/`Performance`/`ApplyPerfAdaptive`/`LateStagePenalty` + 共用工具函数），从 cmd 共有逻辑中抽取。
 - 接口文档见 `docs/data-apis.md`(腾讯/东财/新浪 OHLC 字段顺序、`sh`/`sz`/`bj` 前缀映射、换手率字段均已更新)。
 
 ### 数据源优先级与口径（2026-07 更新）
@@ -176,6 +177,9 @@
 2. `internal/store/store_test.go`：迁移测试 SELECT + round-trip 直查 SQL（`History()` 不含新列，不能靠它）+ 同日二次 save 覆盖用例
 3. Go screen：`internal/screener/screener.go` 的 snapshot SELECT(line 436+)与 `rows.Scan`(line 479)缺列会报错，+ `internal/screener/screener_test.go` 补对应字段断言
 4. 全量重跑 `-save` 后新列才有值；重跑前备份：`cp data/stock.db data/stock.db.bak-$(date +%Y%m%d-%H%M)`
+
+### ⚠️ 数据修复提醒（2026-07-17）
+2026-07-17 提交 `668d452` 修正了 Amount 单位换算（`row[8]` 万元→元 ×10000）。在此之前的 `-save` 数据 Amount 偏小约 10000 倍，影响 CYC VWAP 和 CYQ avgPrice。**必须全量重跑 `batch-save -P 4` 修复历史数据。**
 
 ## decision_log 表结构关键点
 - 字段名：`log_date`（非 `date`）、`outcome_pct`（结算涨跌幅）、`outcome_date`（结算日）、`correct`（是否正确）
