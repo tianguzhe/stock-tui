@@ -56,20 +56,61 @@ GET https://qt.gtimg.cn/q=sh600580,sz000001
 
 > 索引 38/39/45 为逆向工程结果（2026-06-04 实测），通过与东财 `f116`/`f168` 交叉验证确认。`parseStock` 中用安全越界检查读取，字段缺失时降级为 0。
 
-### 1.2 日K / 周K / 月K(前复权)
+### 1.2 日K / 周K / 月K(前复权) — 当前主源
+
+项目日K主路径（`cmd/indicator-analyze` / `cmd/stockdb batch-save`）使用 **proxy 扩展接口**：
 
 ```
-GET https://ifzq.gtimg.cn/appstock/app/fqkline/get?param=sh600580,day,,,320,qfq
+GET https://proxy.finance.qq.com/ifzqgtimg/appstock/app/newfqkline/get?_var=kline_dayqfq&param=sh600580,day,,,320,qfq
 ```
 
 - `param` = `代码,周期,起始日,结束日,数量,复权`。
 - 周期：`day` / `week` / `month`；起止日留空取最近 N 根。
 - 复权：`qfq` 前复权 / `hfq` 后复权 / 空 不复权。
+- **JSONP 响应**：前缀 `kline_dayqfq=`，解析时剥到首个 `{` 再 `json.Unmarshal`。
 - 返回 JSON：`data.sh600580.qfqday`(周K 为 `qfqweek`)。
-- ⚠️ **`qfqday` 可能缺失,需回退 `day` 键**:部分标的(实测如 ETF `sz159611`)即使请求 `qfq` 也不返回 `qfqday`,价格序列落在 `day`。原因是该标的无复权事件——对它 `qfq`/`hfq`/不复权三种请求返回的 `day` 数值完全相同,腾讯只给一条原始序列;有复权事件的标的(如 `sz000001`、`sz159915`)才返回 `qfqday`。`day` 与 `qfqday` **字段顺序一致**(`[日期,开,收,高,低,量]`),解析时 `qfqday` 为空则回退 `day` 即可。
-- **每根 K 字段顺序：`[日期, 开, 收, 高, 低, 量]`**(O,C,H,L)。
+- ⚠️ **`qfqday` 可能缺失,需回退 `day` 键**:部分标的(实测如 ETF `sz159611`)即使请求 `qfq` 也不返回 `qfqday`,价格序列落在 `day`。`day` 与 `qfqday` 字段顺序一致,解析时 `qfqday` 为空则回退 `day` 即可。
+- ⚠️ 注意是 **开、收、高、低**，收在高/低之前，与新浪不同。
 
-> ⚠️ 注意是 **开、收、高、低**，收在高/低之前，与新浪不同。
+**每根 K 字段顺序（proxy 扩展，2026-07 curl 实测：`sh600519`/`sz000001`/`sh601138`/`sz002916`）**：
+
+| 索引 | 含义 | 单位 | 注意事项 |
+|------|------|------|---------|
+| [0] | 日期 | `YYYY-MM-DD` | — |
+| [1] | 开盘 | 元 | — |
+| [2] | 收盘 | 元 | — |
+| [3] | 最高 | 元 | — |
+| [4] | 最低 | 元 | — |
+| [5] | 成交量 | **手** | **×100 转股数** |
+| [6] | 占位 | 恒为 `{}` | JSON object，无业务值，**勿当金额/振幅** |
+| [7] | **换手率** | **%** | 如 `0.47` = 0.47%；入 CYQ 时 `/100` 转小数。**不是振幅** |
+| [8] | **成交额** | **万元** | 入 `Candle.Amount` 时 **×10000 转元**；实测 `row[8]×1e4 ≈ Close×股数`（比值约 0.99–1.03） |
+| [9] | 空串 | — | 常为空，忽略 |
+
+> ⚠️ **振幅不在 K 行内**。本地用 `(High-Low)/昨收×100` 计算后落库 `snapshot.amplitude`；实时振幅在 `qt[43]`（仅当日）。
+
+> ⚠️ **金额单位坑**：`row[8]` 是**万元**不是元。若直接当元写入 `Amount`，CYC VWAP / CYQ avgPrice 会偏小约 10000 倍。
+
+**同响应 `qt[code]` 扩展字段**（实时盘口摘要，用于当日 snapshot；茅台 2026-07-17 实测 len=88）：
+
+| 索引 | 含义 | 单位 | 落库/用途 |
+|------|------|------|----------|
+| [1] | 简称 | — | Name |
+| [7] | 内盘 | 手 | `snapshot.inside_vol`（主动卖） |
+| [8] | 外盘 | 手 | `snapshot.outside_vol`（主动买） |
+| [43] | 振幅 | % | 当日实时振幅（历史振幅仍靠本地算） |
+| [46] | 量比 | 倍 | `vol_ratio` 优先；`<=0` 回退本地 `Volume/MA20` |
+
+> 腾讯失败时自动切换东财 `push2his` 全日 K fallback（Amount 单位为**元**、换手 f61、振幅 f58；无 qt 内外盘/实时量比）。
+
+#### 历史 / 精简对照（非当前主源）
+
+```
+GET https://ifzq.gtimg.cn/appstock/app/fqkline/get?param=sh600580,day,,,320,qfq
+```
+
+- 旧接口仅 6 列：`[日期, 开, 收, 高, 低, 量]`，无振幅/精确成交额。
+- 当前代码已切到 proxy；保留此 URL 仅作对照。
 
 ### 1.3 分时(分钟K)
 
@@ -77,9 +118,9 @@ GET https://ifzq.gtimg.cn/appstock/app/fqkline/get?param=sh600580,day,,,320,qfq
 GET https://ifzq.gtimg.cn/appstock/app/kline/mkline?param=sh600580,m1,,240
 ```
 
-- `m1` 为 1 分钟，`240` 为根数。项目 `minute.go` 在用。
+- `m1` 为 1 分钟，`240` 为根数。项目 `minute.go` 仍用 ifzq 路径。
 
-> ⚠️ 腾讯 K 线在 `ifzq.gtimg.cn/appstock/app/` 路径下。
+> ⚠️ 腾讯分时仍在 `ifzq.gtimg.cn/appstock/app/` 路径下。
 > `web.ifzq.gtimg.cn/appstuff/...` 路径会返回 `{"code":11,"msg":"No dispatch info found"}`，勿用。
 
 ---
@@ -169,7 +210,8 @@ GET https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketDa
 
 | 数据源 | K 线字段顺序 | 完整扩展字段 |
 |--------|-------------|------------|
-| 腾讯 `fqkline` | 日期, **开, 收, 高, 低**, 量 | 仅 OHLCV |
+| 腾讯 proxy `newfqkline`（当前主源） | 日期, **开, 收, 高, 低**, 量 | + [6]`{}` [7]换手率% [8]成交额(**万元**)；振幅本地算；qt 含量比/内外盘/实时振幅 |
+| 腾讯 `ifzq fqkline`（历史） | 日期, **开, 收, 高, 低**, 量 | 仅 OHLCV |
 | 东财 `kline`(推荐 `fields2=f51..f61`) | 日期, **开, 收, 高, 低**, 量, 额 | + f58振幅% f59涨跌幅% f60涨跌额 **f61换手率%** |
 | 新浪 `getKLineData` | 日期, **开, 高, 低, 收**, 量 | 仅 OHLCV |
 

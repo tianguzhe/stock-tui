@@ -16,7 +16,11 @@
 - 接口文档见 `docs/data-apis.md`(腾讯/东财/新浪 OHLC 字段顺序、`sh`/`sz`/`bj` 前缀映射、换手率字段均已更新)。
 
 ### 数据源优先级与口径（2026-07 更新）
-- **默认 / `-save`**：**HTTP 前复权主力**——腾讯 `qfq` OHLCV(`fields2=f51..f61`：f52-55 正常小数、f56 单位是**手**(×100 转股)、f61 换手率直给 %) + 东财 HTTP(换手率兜底 f61)。需带 `Referer` + 完整 UA + `DisableKeepAlives: true`，偶发 EOF 需重试。纯分析模式与 `-save` 统一走此口径,与 snapshot 落库对齐。
+- **默认 / `-save`**：**HTTP 前复权主力**——腾讯 **proxy `newfqkline` 前复权**为主（量单位**手**×100 转股；`row[7]`=**换手率%**→小数；`row[8]`=**成交额万元**→×10000 转元；`row[6]` 恒为 `{}` 无业务值；**振幅**不在 K 行，本地 `(H-L)/昨收×100`）。换手优先用 proxy `row[7]`，全 0 时才东财 f61 / TDX 流通股本兜底。**腾讯失败 → 东财全日 K fallback**（`push2his`，Amount 已是元 + 换手 + 振幅 f58）。东财请求需带 `Referer` + 完整 UA + 反限流重试；批量 worker 建议 `DisableKeepAlives: true`。字段布局与实测见 `docs/data-apis.md`。
+- **量比 `vol_ratio`**：优先腾讯 proxy qt 实时量比（`VolRatioRT`，qt 索引 46）；`<=0` 或缺 qt（东财 fallback）时回退本地 `Volume/MA20`。两套定义接近但**非同一指标**；score/screener 用落库 `vol_ratio`。阈值口径不变（0.8 / 1.5）。
+- **两套换手率（勿混）**：
+  - **序列换手**（CYQ 用）：proxy `row[7]` %→小数，或东财 f61 / TDX 流通股本兜底；按日对齐 K 线。
+  - **`snapshot.turnover_rate`**（落库展示）：来自 `api.FetchStocks` **实时报价**当日换手，不是 K 线序列最后一根。选股/日志读库用实时；筹码计算用序列。
 - **`-tdx` 显式启用通达信 TCP 协议**(`github.com/quantbeing/tdx` v0.1.3,`FromBestHost` 自动选服务器,tdx 失败回退 HTTP)：保留精确 Amount + 本地换手率(CYQ/CYC 的 VWAP 口径),**但价格不前复权**——库本身不提供复权(唯一相关 `GetXdxrInfo` 需调用方自算,项目未用)。除权分红在不复权序列制造断崖(sh512480 2026-07-03 不复权 2.70→1.33,前复权仅 -1.4%),污染 BOLL bandwidth/ATR/SAR/CYQ 获利盘/PRY1 与回测 PERF 样本,**仅在需精确 Amount + 本地换手率时显式使用**。
 - tdx 代码映射：`sh600522` → `model.MarketSH` + `"600522"`；`sz000001` → `model.MarketSZ` + `"000001"`。
 - tdx 日K `GetSecurityBars` 返回**按日期升序**,`bars[0]` 最旧,`bars[len-1]` 最新。

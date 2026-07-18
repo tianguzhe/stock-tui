@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -35,15 +34,15 @@ type klineResponse struct {
 }
 
 type seriesData struct {
-	Code           string
-	Name           string
-	Dates          []string
-	Candles        []indicator.Candle
-	Turnovers      []float64 // 每日换手率(小数,0.0646=6.46%),用于 CYQ 筹码计算
-	Amplitudes     []float64 // 每日振幅 % = (高-低)/昨收 × 100
-	VolRatioRT     float64   // 量比(实时,来自API)
-	InsideVol      float64   // 内盘(手,主动卖)
-	OutsideVol     float64   // 外盘(手,主动买)
+	Code       string
+	Name       string
+	Dates      []string
+	Candles    []indicator.Candle
+	Turnovers  []float64 // 每日换手率(小数,0.0646=6.46%),用于 CYQ 筹码计算
+	Amplitudes []float64 // 每日振幅 % = (高-低)/昨收 × 100
+	VolRatioRT float64   // 量比(实时,来自API)
+	InsideVol  float64   // 内盘(手,主动卖)
+	OutsideVol float64   // 外盘(手,主动买)
 }
 
 func main() {
@@ -147,21 +146,26 @@ func saveSnapshot(data seriesData, snap store.Snapshot) error {
 func fetchDailyKline(code string, bars int) (seriesData, error) {
 	data, err := fetchTencentKline(code, bars)
 	if err == nil {
-		// 腾讯成功:补拉换手率(用于 CYQ 筹码计算),非致命失败时静默跳过
-		turnovers := fetchEMTurnovers(code, len(data.Candles), data.Dates)
-		if turnovers == nil {
-			turnovers = fetchTDXTurnoverFallback(code, data.Candles)
+		// proxy 已带 row[7] 换手率;仅当全 0/缺失时才东财/TDX 兜底
+		if !api.TurnoverUseful(data.Turnovers) {
+			turnovers := fetchEMTurnovers(code, len(data.Candles), data.Dates)
+			if turnovers == nil {
+				turnovers = fetchTDXTurnoverFallback(code, data.Candles)
+			}
+			if turnovers != nil {
+				data.Turnovers = turnovers
+			}
 		}
-		data.Turnovers = turnovers
 		return data, nil
 	}
-	// 腾讯失败→自动切换到东财日K(前复权fqt=1),含精确成交额+换手率
+	// 腾讯失败→自动切换到东财日K(前复权fqt=1),含 Amount(元)+换手+振幅
 	fmt.Fprintf(os.Stderr, "info: 腾讯日K失败(%v),切换到东财日K\n", err)
 	return fetchEMKline(code, bars)
 }
 
-// fetchTencentKline 从腾讯拉取前复权日K(OHLCV+精确成交额+振幅),不含换手率。
-// 使用 proxy.finance.qq.com 接口,比 ifzq.gtimg.cn 多振幅(f58)和精确成交额(f57)。
+// fetchTencentKline 从腾讯 proxy 拉前复权日K。
+// 字段单位换算见 api.ParseProxyDailyBars(万元→元、换手%→小数、振幅本地算)。
+
 func fetchTencentKline(code string, bars int) (seriesData, error) {
 	url := fmt.Sprintf(
 		"https://proxy.finance.qq.com/ifzqgtimg/appstock/app/newfqkline/get?_var=kline_dayqfq&param=%s,day,,,%d,qfq",
@@ -187,12 +191,7 @@ func fetchTencentKline(code string, bars int) (seriesData, error) {
 		return seriesData{}, err
 	}
 
-	// proxy.finance.qq.com 返回 JSONP 格式: kline_dayqfq={...JSON...}
-	// 需要剥离前缀拿到纯 JSON
-	body := rawBody
-	if idx := bytes.IndexByte(rawBody, '{'); idx > 0 {
-		body = rawBody[idx:]
-	}
+	body := api.StripJSONP(rawBody)
 
 	var parsed klineResponse
 	if err := json.Unmarshal(body, &parsed); err != nil {
@@ -216,54 +215,46 @@ func fetchTencentKline(code string, bars int) (seriesData, error) {
 	var volRatioRT, insideVol, outsideVol float64
 	if q, ok := raw.Qt[code]; ok && len(q) > 1 {
 		name = rawString(q[1])
-		// proxy.qq.com qt 数组比 ifzq.gtimg.cn 多很多字段
+		// proxy.qq.com qt: [7]内盘手 [8]外盘手 [43]实时振幅 [46]量比
 		if len(q) > 46 {
-			volRatioRT = rawFloat(q[46]) // 量比(实时)
+			volRatioRT = rawFloat(q[46])
 		}
 		if len(q) > 8 {
-			insideVol = rawFloat(q[7])  // 内盘(手)
-			outsideVol = rawFloat(q[8]) // 外盘(手)
+			insideVol = rawFloat(q[7])
+			outsideVol = rawFloat(q[8])
 		}
 	}
 
-	dates := make([]string, len(rows))
-	candles := make([]indicator.Candle, len(rows))
-	amplitudes := make([]float64, len(rows))
-	for i, row := range rows {
-		if len(row) < 6 {
-			return seriesData{}, fmt.Errorf("row %d short", i)
-		}
-		dates[i] = rawString(row[0])
-		vol := rawFloat(row[5]) * 100 // 腾讯返回 手(×100=股)
-		amount := 0.0
-		if len(row) > 8 {
-			amount = rawFloat(row[8]) // proxy.qq.com 精确成交额(元)
-		}
-		if amount <= 0 {
-			amount = rawFloat(row[2]) * vol // 回退: Close × 股数
-		}
-		if len(row) > 7 {
-			amplitudes[i] = rawFloat(row[7]) // proxy.qq.com 振幅 %
-		}
+	parsedBars, err := api.ParseProxyDailyBars(rows)
+	if err != nil {
+		return seriesData{}, err
+	}
+	dates := make([]string, len(parsedBars))
+	candles := make([]indicator.Candle, len(parsedBars))
+	amplitudes := make([]float64, len(parsedBars))
+	turnovers := make([]float64, len(parsedBars))
+	for i, b := range parsedBars {
+		dates[i] = b.Date
 		candles[i] = indicator.Candle{
-			Open:   rawFloat(row[1]),
-			Close:  rawFloat(row[2]),
-			High:   rawFloat(row[3]),
-			Low:    rawFloat(row[4]),
-			Volume: vol,
-			Amount: amount,
+			Open: b.Open, Close: b.Close, High: b.High, Low: b.Low,
+			Volume: b.Volume, Amount: b.Amount,
 		}
+		amplitudes[i] = b.Amplitude
+		turnovers[i] = b.Turnover
 	}
 
 	return seriesData{
-		Code: code, Name: name, Dates: dates, Candles: candles, Amplitudes: amplitudes,
+		Code: code, Name: name, Dates: dates, Candles: candles,
+		Turnovers: turnovers, Amplitudes: amplitudes,
 		VolRatioRT: volRatioRT, InsideVol: insideVol, OutsideVol: outsideVol,
 	}, nil
 }
 
-// fetchEMKline 从东财拉取前复权日K(OHLCV+Amount+换手率),用作腾讯日K的HTTP fallback。
-// fields2=f51..f61,f116 返回12列:日期,开,收,高,低,量(手),额(元),振幅%,涨跌幅%,涨跌额,换手率%,代码
-// 前复权(fqt=1)口径与腾讯 qfq 一致。东财的 f57=成交额(元)比腾讯的 Close×Volume 估算更精确。
+// fetchEMKline 从东财拉取前复权日K,用作腾讯日K的 HTTP fallback。
+// fields2=f51..f61,f116: 日期,开,收,高,低,量(手),额(元),振幅%,涨跌幅%,涨跌额,换手率%,代码。
+// 与腾讯 proxy 的差异: 东财 Amount 已是元(无需×10000)、振幅在 f58 直给、换手 f61 直给;
+// 无 qt 内外盘/实时量比。价格前复权(fqt=1)口径与腾讯 qfq 一致。
+
 func fetchEMKline(code string, bars int) (seriesData, error) {
 	// 映射 code → EM secid
 	prefix := ""
@@ -308,6 +299,7 @@ func fetchEMKline(code string, bars int) (seriesData, error) {
 	dates := make([]string, 0, len(emResp.Data.Klines))
 	candles := make([]indicator.Candle, 0, len(emResp.Data.Klines))
 	turnovers := make([]float64, 0, len(emResp.Data.Klines))
+	amplitudes := make([]float64, 0, len(emResp.Data.Klines))
 	name := code
 
 	for _, ks := range emResp.Data.Klines {
@@ -320,8 +312,9 @@ func fetchEMKline(code string, bars int) (seriesData, error) {
 		close := parseFloat(parts[2])
 		high := parseFloat(parts[3])
 		low := parseFloat(parts[4])
-		vol := parseFloat(parts[5]) * 100 // f56 手→股
-		amount := parseFloat(parts[6])    // f57 元
+		vol := parseFloat(parts[5]) * 100       // f56 手→股
+		amount := parseFloat(parts[6])          // f57 元
+		amp := parseFloat(parts[7])             // f58 振幅 %
 		turnover := parseFloat(parts[10]) / 100 // f61 %→小数(用于CYQ)
 
 		dates = append(dates, date)
@@ -330,17 +323,19 @@ func fetchEMKline(code string, bars int) (seriesData, error) {
 			Volume: vol, Amount: amount,
 		})
 		turnovers = append(turnovers, turnover)
+		amplitudes = append(amplitudes, amp)
 	}
 
 	if len(candles) == 0 {
 		return seriesData{}, fmt.Errorf("东财no valid klines for %s", code)
 	}
 
-	return seriesData{Code: code, Name: name, Dates: dates, Candles: candles, Turnovers: turnovers}, nil
+	return seriesData{Code: code, Name: name, Dates: dates, Candles: candles, Turnovers: turnovers, Amplitudes: amplitudes}, nil
 }
 
 // fetchEMTurnovers 从东财历史 K 线接口拉换手率,对齐到 Tencent 日期序列
 // 使用 api.FetchEMWithRetry 统一反限流和重试;全部失败/无数据时返回 nil
+
 func fetchEMTurnovers(code string, count int, tencentDates []string) []float64 {
 	// 映射 code → EM secid
 	prefix := ""
@@ -503,6 +498,10 @@ func printAnalysis(data seriesData) store.Snapshot {
 	if n := len(data.Turnovers); n == len(candles) && n > 0 {
 		cyq := indicator.CalcCYQ(candles, data.Turnovers)
 		if len(cyq) > 0 {
+			if len(candles) < indicator.MinCYQBars {
+				fmt.Printf("SAMPLE_WARN CYQ 日K根数=%d (<%d), 筹码分布权重偏近期, WINNER/ASR/PRY1 参考价值降低\n",
+					len(candles), indicator.MinCYQBars)
+			}
 			lastC := cyq[len(cyq)-1]
 			cyqLabel := "中性"
 			switch {

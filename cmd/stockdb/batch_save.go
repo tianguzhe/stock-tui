@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -187,33 +186,39 @@ type klineResp struct {
 }
 
 type klineData struct {
-	Code           string
-	Name           string
-	Dates          []string
-	Candles        []indicator.Candle
-	Turnovers      []float64
-	Amplitudes     []float64 // 每日振幅 %
-	VolRatioRT     float64   // 量比(实时,用于覆盖本地计算)
-	InsideVol      float64   // 内盘(手)
-	OutsideVol     float64   // 外盘(手)
+	Code       string
+	Name       string
+	Dates      []string
+	Candles    []indicator.Candle
+	Turnovers  []float64
+	Amplitudes []float64 // 每日振幅 %
+	VolRatioRT float64   // 量比(实时,用于覆盖本地计算)
+	InsideVol  float64   // 内盘(手)
+	OutsideVol float64   // 外盘(手)
 }
 
 func fetchKline(client *http.Client, code string, bars int) (klineData, error) {
 	data, err := fetchTencentKline(client, code, bars)
 	if err == nil {
-		turnovers := fetchEMTurnover(client, code, len(data.Candles), data.Dates)
-		if turnovers == nil {
-			turnovers = fetchTDXTurnoverFallback(code, data.Candles)
+		// proxy 已带 row[7] 换手率;仅当全 0/缺失时才东财/TDX 兜底
+		if !api.TurnoverUseful(data.Turnovers) {
+			turnovers := fetchEMTurnover(client, code, len(data.Candles), data.Dates)
+			if turnovers == nil {
+				turnovers = fetchTDXTurnoverFallback(code, data.Candles)
+			}
+			if turnovers != nil {
+				data.Turnovers = turnovers
+			}
 		}
-		data.Turnovers = turnovers
 		return data, nil
 	}
 	fmt.Fprintf(os.Stderr, "info: 腾讯日K失败(%v),切换到东财日K\n", err)
 	return fetchEMKlineFallback(client, code, bars)
 }
 
-// fetchTencentKline 从腾讯拉取前复权日K(OHLCV+精确成交额+振幅),不含换手率。
-// 使用 proxy.finance.qq.com 接口,比 ifzq.gtimg.cn 多振幅和精确成交额。
+// fetchTencentKline 从腾讯 proxy 拉前复权日K。
+// 字段单位换算见 api.ParseProxyDailyBars(万元→元、换手%→小数、振幅本地算)。
+
 func fetchTencentKline(client *http.Client, code string, bars int) (klineData, error) {
 	url := fmt.Sprintf(
 		"https://proxy.finance.qq.com/ifzqgtimg/appstock/app/newfqkline/get?_var=kline_dayqfq&param=%s,day,,,%d,qfq",
@@ -239,11 +244,7 @@ func fetchTencentKline(client *http.Client, code string, bars int) (klineData, e
 		return klineData{}, err
 	}
 
-	// proxy.finance.qq.com 返回 JSONP 格式: kline_dayqfq={...JSON...}
-	body := rawBody
-	if idx := bytes.IndexByte(rawBody, '{'); idx > 0 {
-		body = rawBody[idx:]
-	}
+	body := api.StripJSONP(rawBody)
 
 	var parsed klineResp
 	if err := json.Unmarshal(body, &parsed); err != nil {
@@ -267,53 +268,45 @@ func fetchTencentKline(client *http.Client, code string, bars int) (klineData, e
 	var volRatioRT, insideVol, outsideVol float64
 	if q, ok := raw.Qt[code]; ok && len(q) > 1 {
 		json.Unmarshal(q[1], &name)
-		// proxy.qq.com qt 数组比 ifzq.gtimg.cn 多很多字段
+		// proxy.qq.com qt: [7]内盘手 [8]外盘手 [43]实时振幅 [46]量比
 		if len(q) > 46 {
-			volRatioRT = rawFloat(q[46]) // 量比(实时)
+			volRatioRT = rawFloat(q[46])
 		}
 		if len(q) > 8 {
-			insideVol = rawFloat(q[7])  // 内盘(手,主动卖)
-			outsideVol = rawFloat(q[8]) // 外盘(手,主动买)
+			insideVol = rawFloat(q[7])
+			outsideVol = rawFloat(q[8])
 		}
 	}
 
-	dates := make([]string, len(rows))
-	candles := make([]indicator.Candle, len(rows))
-	amplitudes := make([]float64, len(rows))
-	for i, row := range rows {
-		if len(row) < 6 {
-			return klineData{}, fmt.Errorf("row %d short", i)
-		}
-		dates[i] = rawString(row[0])
-		vol := rawFloat(row[5]) * 100 // 腾讯返回 手(×100=股)
-		amount := 0.0
-		if len(row) > 8 {
-			amount = rawFloat(row[8]) // proxy.qq.com 精确成交额(元)
-		}
-		if amount <= 0 {
-			amount = rawFloat(row[2]) * vol // 回退: Close × 股数
-		}
-		if len(row) > 7 {
-			amplitudes[i] = rawFloat(row[7]) // proxy.qq.com 振幅 %
-		}
+	parsedBars, err := api.ParseProxyDailyBars(rows)
+	if err != nil {
+		return klineData{}, err
+	}
+	dates := make([]string, len(parsedBars))
+	candles := make([]indicator.Candle, len(parsedBars))
+	amplitudes := make([]float64, len(parsedBars))
+	turnovers := make([]float64, len(parsedBars))
+	for i, b := range parsedBars {
+		dates[i] = b.Date
 		candles[i] = indicator.Candle{
-			Open:   rawFloat(row[1]),
-			Close:  rawFloat(row[2]),
-			High:   rawFloat(row[3]),
-			Low:    rawFloat(row[4]),
-			Volume: vol,
-			Amount: amount,
+			Open: b.Open, Close: b.Close, High: b.High, Low: b.Low,
+			Volume: b.Volume, Amount: b.Amount,
 		}
+		amplitudes[i] = b.Amplitude
+		turnovers[i] = b.Turnover
 	}
 
 	return klineData{
-		Code: code, Name: name, Dates: dates, Candles: candles, Amplitudes: amplitudes,
+		Code: code, Name: name, Dates: dates, Candles: candles,
+		Turnovers: turnovers, Amplitudes: amplitudes,
 		VolRatioRT: volRatioRT, InsideVol: insideVol, OutsideVol: outsideVol,
 	}, nil
 }
 
-// fetchEMKlineFallback 从东财拉取前复权日K(OHLCV+Amount+换手率),用作腾讯日K的HTTP fallback。
-// 东财 f57=成交额(元)比腾讯 Close×Volume 估算更精确,f61=换手率直给无需另拉。
+// fetchEMKlineFallback 从东财拉取前复权日K,用作腾讯日K的 HTTP fallback。
+// 东财 Amount(f57) 已是元(无需×10000)、振幅 f58 直给、换手 f61 直给;
+// 与腾讯 proxy 差异见 docs/data-apis.md,无 qt 内外盘/实时量比。
+
 func fetchEMKlineFallback(client *http.Client, code string, bars int) (klineData, error) {
 	prefix := ""
 	switch {
@@ -352,6 +345,7 @@ func fetchEMKlineFallback(client *http.Client, code string, bars int) (klineData
 	dates := make([]string, 0, len(emResp.Data.Klines))
 	candles := make([]indicator.Candle, 0, len(emResp.Data.Klines))
 	turnovers := make([]float64, 0, len(emResp.Data.Klines))
+	amplitudes := make([]float64, 0, len(emResp.Data.Klines))
 
 	for _, ks := range emResp.Data.Klines {
 		parts := strings.Split(ks, ",")
@@ -365,6 +359,7 @@ func fetchEMKlineFallback(client *http.Client, code string, bars int) (klineData
 		low := parseFloat(parts[4])
 		vol := parseFloat(parts[5]) * 100
 		amount := parseFloat(parts[6])
+		amp := parseFloat(parts[7]) // f58 振幅 %
 		turnover := parseFloat(parts[10]) / 100
 
 		dates = append(dates, date)
@@ -373,16 +368,18 @@ func fetchEMKlineFallback(client *http.Client, code string, bars int) (klineData
 			Volume: vol, Amount: amount,
 		})
 		turnovers = append(turnovers, turnover)
+		amplitudes = append(amplitudes, amp)
 	}
 
 	if len(candles) == 0 {
 		return klineData{}, fmt.Errorf("东财no valid klines for %s", code)
 	}
 
-	return klineData{Code: code, Name: code, Dates: dates, Candles: candles, Turnovers: turnovers}, nil
+	return klineData{Code: code, Name: code, Dates: dates, Candles: candles, Turnovers: turnovers, Amplitudes: amplitudes}, nil
 }
 
 // fetchEMTurnover 从东财拉换手率。失败返回 nil。
+
 func fetchEMTurnover(client *http.Client, code string, count int, tencentDates []string) []float64 {
 	prefix := ""
 	switch {

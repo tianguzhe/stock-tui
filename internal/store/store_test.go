@@ -122,9 +122,10 @@ func TestSaveSnapshotUpsertSameDay(t *testing.T) {
 	}
 }
 
-// TestSaveSnapshotNewColumnsRoundTripAndOverwrite verifies the avg10/squeeze/
-// donchian/score_adj columns persist and that a same-day re-save overwrites
-// them (a missing ON CONFLICT DO UPDATE entry would silently keep stale values).
+// TestSaveSnapshotNewColumnsRoundTripAndOverwrite verifies avg10/squeeze/
+// donchian/score_adj/sar/st/low/high/amplitude/inside_vol/outside_vol columns
+// persist and that a same-day re-save overwrites them (a missing ON CONFLICT
+// DO UPDATE entry would silently keep stale values).
 func TestSaveSnapshotNewColumnsRoundTripAndOverwrite(t *testing.T) {
 	s := openTemp(t)
 	if err := s.UpsertInstrument("sz002916", "深南电路", "sz", ""); err != nil {
@@ -142,26 +143,29 @@ func TestSaveSnapshotNewColumnsRoundTripAndOverwrite(t *testing.T) {
 		DonchBreak55Bull:         false,
 		SARValue:                 95.5,
 		SuperTrendValue:          93.2,
+		Amplitude:                7.3,
+		InsideVol:                1200,
+		OutsideVol:               3400,
 	}
 	if err := s.SaveSnapshot(snap); err != nil {
 		t.Fatalf("first save: %v", err)
 	}
 
-	read := func() (gotAvg sql.NullFloat64, squeeze, b20, b55, adj int, sarV, stV, low, high float64) {
+	read := func() (gotAvg sql.NullFloat64, squeeze, b20, b55, adj int, sarV, stV, low, high, amp, inVol, outVol float64) {
 		t.Helper()
 		err := s.db.QueryRow(
-			`SELECT perf_trend_follow_bull_avg10, keltner_squeeze, donch_break20_bull, donch_break55_bull, score_adj, sar_value, supertrend_value, low, high
+			`SELECT perf_trend_follow_bull_avg10, keltner_squeeze, donch_break20_bull, donch_break55_bull, score_adj, sar_value, supertrend_value, low, high, amplitude, inside_vol, outside_vol
 			 FROM snapshot WHERE code='sz002916' AND trade_date='2026-06-12'`,
-		).Scan(&gotAvg, &squeeze, &b20, &b55, &adj, &sarV, &stV, &low, &high)
+		).Scan(&gotAvg, &squeeze, &b20, &b55, &adj, &sarV, &stV, &low, &high, &amp, &inVol, &outVol)
 		if err != nil {
 			t.Fatalf("read new columns: %v", err)
 		}
 		return
 	}
 
-	gotAvg, squeeze, b20, b55, adj, sarV, stV, low, high := read()
-	if !gotAvg.Valid || gotAvg.Float64 != 6.5 || squeeze != 1 || b20 != 1 || b55 != 0 || adj != 66 || sarV != 95.5 || stV != 93.2 || low != 96.4 || high != 103.7 {
-		t.Fatalf("round-trip mismatch: avg10=%+v squeeze=%d b20=%d b55=%d adj=%d sar=%v st=%v low=%v high=%v", gotAvg, squeeze, b20, b55, adj, sarV, stV, low, high)
+	gotAvg, squeeze, b20, b55, adj, sarV, stV, low, high, amp, inVol, outVol := read()
+	if !gotAvg.Valid || gotAvg.Float64 != 6.5 || squeeze != 1 || b20 != 1 || b55 != 0 || adj != 66 || sarV != 95.5 || stV != 93.2 || low != 96.4 || high != 103.7 || amp != 7.3 || inVol != 1200 || outVol != 3400 {
+		t.Fatalf("round-trip mismatch: avg10=%+v squeeze=%d b20=%d b55=%d adj=%d sar=%v st=%v low=%v high=%v amp=%v in=%v out=%v", gotAvg, squeeze, b20, b55, adj, sarV, stV, low, high, amp, inVol, outVol)
 	}
 
 	// Same-day re-save with changed values must overwrite all new columns.
@@ -175,12 +179,15 @@ func TestSaveSnapshotNewColumnsRoundTripAndOverwrite(t *testing.T) {
 	snap.SuperTrendValue = 94.8
 	snap.Low = 88.0
 	snap.High = 99.9
+	snap.Amplitude = 4.1
+	snap.InsideVol = 800
+	snap.OutsideVol = 2100
 	if err := s.SaveSnapshot(snap); err != nil {
 		t.Fatalf("second save: %v", err)
 	}
-	gotAvg, squeeze, b20, b55, adj, sarV, stV, low, high = read()
-	if !gotAvg.Valid || gotAvg.Float64 != -1.2 || squeeze != 0 || b20 != 0 || b55 != 1 || adj != 48 || sarV != 97.1 || stV != 94.8 || low != 88.0 || high != 99.9 {
-		t.Fatalf("same-day overwrite mismatch: avg10=%+v squeeze=%d b20=%d b55=%d adj=%d sar=%v st=%v low=%v high=%v", gotAvg, squeeze, b20, b55, adj, sarV, stV, low, high)
+	gotAvg, squeeze, b20, b55, adj, sarV, stV, low, high, amp, inVol, outVol = read()
+	if !gotAvg.Valid || gotAvg.Float64 != -1.2 || squeeze != 0 || b20 != 0 || b55 != 1 || adj != 48 || sarV != 97.1 || stV != 94.8 || low != 88.0 || high != 99.9 || amp != 4.1 || inVol != 800 || outVol != 2100 {
+		t.Fatalf("same-day overwrite mismatch: avg10=%+v squeeze=%d b20=%d b55=%d adj=%d sar=%v st=%v low=%v high=%v amp=%v in=%v out=%v", gotAvg, squeeze, b20, b55, adj, sarV, stV, low, high, amp, inVol, outVol)
 	}
 }
 
@@ -220,7 +227,8 @@ ALTER TABLE snapshot_legacy RENAME TO snapshot;
 		+COALESCE(perf_trend_follow_bull_win10,0)+COALESCE(perf_overbought_bear_win10,0)+COALESCE(perf_div_bear_win10,0)
 		+COALESCE(perf_trend_follow_bull_n,0)+COALESCE(perf_overbought_bear_n,0)+COALESCE(perf_div_bear_n,0)
 		+COALESCE(perf_trend_follow_bull_avg10,0)+COALESCE(keltner_squeeze,0)+COALESCE(donch_break20_bull,0)+COALESCE(donch_break55_bull,0)+COALESCE(score_adj,0)
-		+COALESCE(sar_value,0)+COALESCE(supertrend_value,0) FROM snapshot LIMIT 1`,
+		+COALESCE(sar_value,0)+COALESCE(supertrend_value,0)
+		+COALESCE(amplitude,0)+COALESCE(inside_vol,0)+COALESCE(outside_vol,0) FROM snapshot LIMIT 1`,
 	).Scan(&dummy)
 	// A "no rows" error is fine; "no such column" would be an error.
 	if err != nil && err.Error() != "sql: no rows in result set" {

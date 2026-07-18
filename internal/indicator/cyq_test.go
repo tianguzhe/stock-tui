@@ -4,6 +4,13 @@ import (
 	"testing"
 )
 
+// TestMinCYQBars 锁定导出常量,防止被误改导致 CLI SAMPLE_WARN 阈值漂移。
+func TestMinCYQBars(t *testing.T) {
+	if MinCYQBars != 60 {
+		t.Fatalf("MinCYQBars=%d, want 60", MinCYQBars)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // costWeights — 持仓成本衰减模型
 // ---------------------------------------------------------------------------

@@ -13,9 +13,10 @@ import "math"
 //   - 换手率须与 K 线对应日,单位:小数(0.0646 = 6.46%)
 //   - 价格须为前复权(否则除权跳空让成本分布错位)
 
-// minCYQBars 是 CYQ 有意义的最低日K根数。少于 60 根时权重集中于近期几日,
-// WINNER/ASR/PRY1 参考价值大幅降低,WeightSum 显著低于 1 即此信号。
-const minCYQBars = 60
+// MinCYQBars 是 CYQ 有意义的最低日K根数。少于该值时权重集中于近期几日,
+// WINNER/ASR/PRY1 参考价值大幅降低(短样本问题是权重挤在近期,不能单靠
+// WeightSum 判断深度——归一化后 WeightSum 仍可接近 1)。
+const MinCYQBars = 60
 
 // CYQResult 单日 CYQ 指标
 type CYQResult struct {
@@ -45,7 +46,9 @@ type CYQResult struct {
 	IsLowPosition      bool // PRY1 < 40% (近一年低位)
 
 	// 诊断(仅用于调试/校验)
-	WeightSum float64 // 权重合计,应≈1(接近1表示历史深度足够)
+	// 归一化前的权重合计;短样本时权重挤在近期,WeightSum 仍可接近 1,
+	// 不能单独当作"历史深度足够"的信号(深度告警看 MinCYQBars)。
+	WeightSum float64
 }
 
 // CalcCYQ 计算全量 CYQ 衍生指标
@@ -57,8 +60,8 @@ type CYQResult struct {
 //
 // 返回:
 //   - 每根日K对应的 CYQResult,只有最后一日指标有意义(前 N 日未满历史窗口)
-//     当 len(candles) < minCYQBars 时结果仍数学有效但参考价值大幅降低:
-//     WeightSum 显著低于 1 即此信号。
+//     当 len(candles) < MinCYQBars 时结果仍数学有效但参考价值大幅降低:
+//     权重挤在近期,CLI 应对此发出 SAMPLE_WARN。
 func CalcCYQ(candles []Candle, turnovers []float64) []CYQResult {
 	n := minInt(len(candles), len(turnovers))
 	results := make([]CYQResult, n)
