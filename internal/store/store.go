@@ -64,6 +64,7 @@ type Snapshot struct {
 	RSI6, WR14, BIAS6, BIAS24      float64
 	PDI, MDI, ADX, ADXR, CMI, CHOP float64
 	ATRPct, BollPB, BollBW, MFI    float64
+	Amplitude                      float64 // 振幅 % = (高-低)/昨收 × 100
 	SARLong, SuperTrendLong        bool
 	VolRatio                       float64
 	OBVUp                          bool
@@ -79,6 +80,10 @@ type Snapshot struct {
 	TurnoverRate float64 // 换手率 %
 	MarketCap    float64 // 总市值 亿元
 	PE           float64 // 市盈率动态
+
+	// Real-time quote fields from proxy.finance.qq.com (qt array).
+	InsideVol  float64 // 内盘(手,主动卖)
+	OutsideVol float64 // 外盘(手,主动买)
 
 	// Raw N-day price returns (%) computed from K-line data during -save.
 	Ret20, Ret60, Ret120 float64
@@ -172,6 +177,7 @@ CREATE TABLE IF NOT EXISTS snapshot (
   rsi6 REAL, wr14 REAL, bias6 REAL, bias24 REAL,
   pdi REAL, mdi REAL, adx REAL, adxr REAL, cmi REAL, chop REAL,
   atr_pct REAL, boll_pb REAL, boll_bw REAL, mfi REAL,
+  amplitude REAL,
   sar_long INTEGER, supertrend_long INTEGER,
   vol_ratio REAL, obv_up INTEGER,
   score_total INTEGER, score_delta INTEGER, score_label TEXT,
@@ -182,6 +188,8 @@ CREATE TABLE IF NOT EXISTS snapshot (
   turnover_rate REAL DEFAULT 0,
   market_cap REAL DEFAULT 0,
   pe REAL DEFAULT 0,
+  inside_vol REAL,
+  outside_vol REAL,
   ret20 REAL,
   ret60 REAL,
   ret120 REAL,
@@ -262,6 +270,9 @@ CREATE INDEX IF NOT EXISTS idx_decision_log_pending ON decision_log(outcome_pct)
 		"score_adj INTEGER",
 		"sar_value REAL",
 		"supertrend_value REAL",
+		"amplitude REAL",
+		"inside_vol REAL",
+		"outside_vol REAL",
 	} {
 		if _, err := s.db.Exec("ALTER TABLE snapshot ADD COLUMN " + col); err != nil && !isDuplicateColumnErr(err) {
 			return err
@@ -550,12 +561,14 @@ INSERT INTO snapshot (
   rsi6, wr14, bias6, bias24,
   pdi, mdi, adx, adxr, cmi, chop,
   atr_pct, boll_pb, boll_bw, mfi,
+  amplitude,
   sar_long, supertrend_long, vol_ratio, obv_up,
   score_total, score_delta, score_label,
   sig_trend_bull, sig_overbought, sig_oversold,
   div_bull, div_bear, div_bear_today,
   td_setup, td_countdown, streak,
   turnover_rate, market_cap, pe,
+  inside_vol, outside_vol,
   ret20, ret60, ret120,
   perf_trend_follow_bull_win10, perf_overbought_bear_win10, perf_div_bear_win10,
   perf_trend_follow_bull_n, perf_overbought_bear_n, perf_div_bear_n,
@@ -570,9 +583,11 @@ INSERT INTO snapshot (
   ?, ?, ?, ?,
   ?, ?, ?, ?, ?, ?,
   ?, ?, ?, ?,
+  ?,
   ?, ?, ?, ?,
   ?, ?, ?,
   ?, ?, ?,
+  ?, ?,
   ?, ?, ?,
   ?, ?, ?,
   ?, ?, ?,
@@ -593,12 +608,14 @@ ON CONFLICT(code, trade_date) DO UPDATE SET
   rsi6=excluded.rsi6, wr14=excluded.wr14, bias6=excluded.bias6, bias24=excluded.bias24,
   pdi=excluded.pdi, mdi=excluded.mdi, adx=excluded.adx, adxr=excluded.adxr, cmi=excluded.cmi, chop=excluded.chop,
   atr_pct=excluded.atr_pct, boll_pb=excluded.boll_pb, boll_bw=excluded.boll_bw, mfi=excluded.mfi,
+  amplitude=excluded.amplitude,
   sar_long=excluded.sar_long, supertrend_long=excluded.supertrend_long, vol_ratio=excluded.vol_ratio, obv_up=excluded.obv_up,
   score_total=excluded.score_total, score_delta=excluded.score_delta, score_label=excluded.score_label,
   sig_trend_bull=excluded.sig_trend_bull, sig_overbought=excluded.sig_overbought, sig_oversold=excluded.sig_oversold,
   div_bull=excluded.div_bull, div_bear=excluded.div_bear, div_bear_today=excluded.div_bear_today,
   td_setup=excluded.td_setup, td_countdown=excluded.td_countdown, streak=excluded.streak,
   turnover_rate=excluded.turnover_rate, market_cap=excluded.market_cap, pe=excluded.pe,
+  inside_vol=excluded.inside_vol, outside_vol=excluded.outside_vol,
   ret20=excluded.ret20, ret60=excluded.ret60, ret120=excluded.ret120,
   perf_trend_follow_bull_win10=excluded.perf_trend_follow_bull_win10, perf_overbought_bear_win10=excluded.perf_overbought_bear_win10, perf_div_bear_win10=excluded.perf_div_bear_win10,
   perf_trend_follow_bull_n=excluded.perf_trend_follow_bull_n, perf_overbought_bear_n=excluded.perf_overbought_bear_n, perf_div_bear_n=excluded.perf_div_bear_n,
@@ -612,12 +629,14 @@ ON CONFLICT(code, trade_date) DO UPDATE SET
 		snap.RSI6, snap.WR14, snap.BIAS6, snap.BIAS24,
 		snap.PDI, snap.MDI, snap.ADX, snap.ADXR, snap.CMI, snap.CHOP,
 		snap.ATRPct, snap.BollPB, snap.BollBW, snap.MFI,
+		snap.Amplitude,
 		boolToInt(snap.SARLong), boolToInt(snap.SuperTrendLong), snap.VolRatio, boolToInt(snap.OBVUp),
 		snap.ScoreTotal, snap.ScoreDelta, snap.ScoreLabel,
 		boolToInt(snap.SigTrendBull), boolToInt(snap.SigOverbought), boolToInt(snap.SigOversold),
 		boolToInt(snap.DivBull), boolToInt(snap.DivBear), boolToInt(snap.DivBearToday),
 		snap.TDSetup, snap.TDCountdown, snap.Streak,
 		snap.TurnoverRate, snap.MarketCap, snap.PE,
+		snap.InsideVol, snap.OutsideVol,
 		snap.Ret20, snap.Ret60, snap.Ret120,
 		snap.PerfTrendFollowBullWin10, snap.PerfOverboughtBearWin10, snap.PerfDivBearWin10,
 		snap.PerfTrendFollowBullN, snap.PerfOverboughtBearN, snap.PerfDivBearN,

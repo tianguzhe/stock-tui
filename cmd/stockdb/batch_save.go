@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -186,11 +187,15 @@ type klineResp struct {
 }
 
 type klineData struct {
-	Code      string
-	Name      string
-	Dates     []string
-	Candles   []indicator.Candle
-	Turnovers []float64
+	Code           string
+	Name           string
+	Dates          []string
+	Candles        []indicator.Candle
+	Turnovers      []float64
+	Amplitudes     []float64 // 每日振幅 %
+	VolRatioRT     float64   // 量比(实时,用于覆盖本地计算)
+	InsideVol      float64   // 内盘(手)
+	OutsideVol     float64   // 外盘(手)
 }
 
 func fetchKline(client *http.Client, code string, bars int) (klineData, error) {
@@ -207,9 +212,13 @@ func fetchKline(client *http.Client, code string, bars int) (klineData, error) {
 	return fetchEMKlineFallback(client, code, bars)
 }
 
-// fetchTencentKline 从腾讯拉取前复权日K(OHLCV),不含换手率
+// fetchTencentKline 从腾讯拉取前复权日K(OHLCV+精确成交额+振幅),不含换手率。
+// 使用 proxy.finance.qq.com 接口,比 ifzq.gtimg.cn 多振幅和精确成交额。
 func fetchTencentKline(client *http.Client, code string, bars int) (klineData, error) {
-	url := fmt.Sprintf("https://ifzq.gtimg.cn/appstock/app/fqkline/get?param=%s,day,,,%d,qfq", code, bars)
+	url := fmt.Sprintf(
+		"https://proxy.finance.qq.com/ifzqgtimg/appstock/app/newfqkline/get?_var=kline_dayqfq&param=%s,day,,,%d,qfq",
+		code, bars,
+	)
 	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
 		return klineData{}, err
@@ -225,9 +234,15 @@ func fetchTencentKline(client *http.Client, code string, bars int) (klineData, e
 		return klineData{}, fmt.Errorf("fetch %s: HTTP %s", code, resp.Status)
 	}
 
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 10<<20))
+	rawBody, err := io.ReadAll(io.LimitReader(resp.Body, 10<<20))
 	if err != nil {
 		return klineData{}, err
+	}
+
+	// proxy.finance.qq.com 返回 JSONP 格式: kline_dayqfq={...JSON...}
+	body := rawBody
+	if idx := bytes.IndexByte(rawBody, '{'); idx > 0 {
+		body = rawBody[idx:]
 	}
 
 	var parsed klineResp
@@ -249,29 +264,52 @@ func fetchTencentKline(client *http.Client, code string, bars int) (klineData, e
 	}
 
 	name := code
+	var volRatioRT, insideVol, outsideVol float64
 	if q, ok := raw.Qt[code]; ok && len(q) > 1 {
 		json.Unmarshal(q[1], &name)
+		// proxy.qq.com qt 数组比 ifzq.gtimg.cn 多很多字段
+		if len(q) > 46 {
+			volRatioRT = rawFloat(q[46]) // 量比(实时)
+		}
+		if len(q) > 8 {
+			insideVol = rawFloat(q[7])  // 内盘(手,主动卖)
+			outsideVol = rawFloat(q[8]) // 外盘(手,主动买)
+		}
 	}
 
 	dates := make([]string, len(rows))
 	candles := make([]indicator.Candle, len(rows))
+	amplitudes := make([]float64, len(rows))
 	for i, row := range rows {
 		if len(row) < 6 {
 			return klineData{}, fmt.Errorf("row %d short", i)
 		}
 		dates[i] = rawString(row[0])
-		vol := rawFloat(row[5]) * 100 // 腾讯返回 手(÷100=股)
+		vol := rawFloat(row[5]) * 100 // 腾讯返回 手(×100=股)
+		amount := 0.0
+		if len(row) > 8 {
+			amount = rawFloat(row[8]) // proxy.qq.com 精确成交额(元)
+		}
+		if amount <= 0 {
+			amount = rawFloat(row[2]) * vol // 回退: Close × 股数
+		}
+		if len(row) > 7 {
+			amplitudes[i] = rawFloat(row[7]) // proxy.qq.com 振幅 %
+		}
 		candles[i] = indicator.Candle{
 			Open:   rawFloat(row[1]),
 			Close:  rawFloat(row[2]),
 			High:   rawFloat(row[3]),
 			Low:    rawFloat(row[4]),
 			Volume: vol,
-			Amount: rawFloat(row[2]) * vol, // Close × 股数 ≈ 成交额
+			Amount: amount,
 		}
 	}
 
-	return klineData{Code: code, Name: name, Dates: dates, Candles: candles}, nil
+	return klineData{
+		Code: code, Name: name, Dates: dates, Candles: candles, Amplitudes: amplitudes,
+		VolRatioRT: volRatioRT, InsideVol: insideVol, OutsideVol: outsideVol,
+	}, nil
 }
 
 // fetchEMKlineFallback 从东财拉取前复权日K(OHLCV+Amount+换手率),用作腾讯日K的HTTP fallback。
@@ -421,7 +459,11 @@ func buildSnapshot(data klineData) store.Snapshot {
 	ma5, ma10, ma20, ma60 := meanTailFn(closes, 5), meanTailFn(closes, 10), meanTailFn(closes, 20), meanTailFn(closes, 60)
 	volumes := volumeSeriesFn(candles)
 	volMA20 := meanTailFn(volumes, 20)
-	volRatio := ratioFn(lastCandle.Volume, volMA20)
+	// 量比: 优先用 API 实时数据,回退本地计算(Volume/MA20)
+	volRatio := data.VolRatioRT
+	if volRatio <= 0 {
+		volRatio = ratioFn(lastCandle.Volume, volMA20)
+	}
 	obv := obvSeriesFn(candles)
 	_, upAvgVol, _, downAvgVol := recentVolumeHealthFn(candles, 5)
 	score := scoreResultFn(candles, results, obv, upAvgVol, downAvgVol, volRatio)
@@ -461,7 +503,7 @@ func buildSnapshot(data klineData) store.Snapshot {
 		}
 	}
 
-	return store.Snapshot{
+	snap := store.Snapshot{
 		Code:      data.Code,
 		TradeDate: data.Dates[n-1],
 		Close:     lastCandle.Close,
@@ -512,6 +554,13 @@ func buildSnapshot(data klineData) store.Snapshot {
 		SARValue:                 last.SAR.Value,
 		SuperTrendValue:          last.SuperTrend.Value,
 	}
+	// 填充振幅和内外盘(如果 proxy.qq.com 提供了)
+	if len(data.Amplitudes) == n && n > 0 {
+		snap.Amplitude = data.Amplitudes[n-1]
+	}
+	snap.InsideVol = data.InsideVol
+	snap.OutsideVol = data.OutsideVol
+	return snap
 }
 
 // ===== 辅助函数 =====
