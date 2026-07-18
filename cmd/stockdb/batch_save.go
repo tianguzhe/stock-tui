@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"flag"
@@ -8,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -15,6 +17,9 @@ import (
 	"stock-tui/internal/indicator"
 	"stock-tui/internal/market"
 	"stock-tui/internal/store"
+
+	tdx "github.com/quantbeing/tdx"
+	"github.com/quantbeing/tdx/model"
 )
 
 // batchSaveCmd 从 instrument 表读取所有代码，并行拉取 K 线、计算指标，
@@ -189,6 +194,21 @@ type klineData struct {
 }
 
 func fetchKline(client *http.Client, code string, bars int) (klineData, error) {
+	data, err := fetchTencentKline(client, code, bars)
+	if err == nil {
+		turnovers := fetchEMTurnover(client, code, len(data.Candles), data.Dates)
+		if turnovers == nil {
+			turnovers = fetchTDXTurnoverFallback(code, data.Candles)
+		}
+		data.Turnovers = turnovers
+		return data, nil
+	}
+	fmt.Fprintf(os.Stderr, "info: 腾讯日K失败(%v),切换到东财日K\n", err)
+	return fetchEMKlineFallback(client, code, bars)
+}
+
+// fetchTencentKline 从腾讯拉取前复权日K(OHLCV),不含换手率
+func fetchTencentKline(client *http.Client, code string, bars int) (klineData, error) {
 	url := fmt.Sprintf("https://ifzq.gtimg.cn/appstock/app/fqkline/get?param=%s,day,,,%d,qfq", code, bars)
 	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
@@ -251,12 +271,77 @@ func fetchKline(client *http.Client, code string, bars int) (klineData, error) {
 		}
 	}
 
-	turnovers := fetchEMTurnover(client, code, len(candles), dates)
+	return klineData{Code: code, Name: name, Dates: dates, Candles: candles}, nil
+}
 
-	return klineData{
-		Code: code, Name: name, Dates: dates, Candles: candles,
-		Turnovers: turnovers,
-	}, nil
+// fetchEMKlineFallback 从东财拉取前复权日K(OHLCV+Amount+换手率),用作腾讯日K的HTTP fallback。
+// 东财 f57=成交额(元)比腾讯 Close×Volume 估算更精确,f61=换手率直给无需另拉。
+func fetchEMKlineFallback(client *http.Client, code string, bars int) (klineData, error) {
+	prefix := ""
+	switch {
+	case len(code) >= 2 && code[:2] == "sh":
+		prefix = "1"
+	case len(code) >= 2 && (code[:2] == "sz" || code[:2] == "bj"):
+		prefix = "0"
+	}
+	if prefix == "" {
+		return klineData{}, fmt.Errorf("unsupported code: %s", code)
+	}
+	secid := prefix + "." + code[2:]
+
+	url := fmt.Sprintf(
+		"https://push2his.eastmoney.com/api/qt/stock/kline/get?secid=%s&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f116&klt=101&fqt=1&end=20500101&lmt=%d",
+		secid, bars,
+	)
+
+	body, err := api.FetchEMWithRetry(client, url)
+	if err != nil {
+		return klineData{}, fmt.Errorf("东财日K %s: %w", code, err)
+	}
+
+	var emResp struct {
+		Data struct {
+			Klines []string `json:"klines"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &emResp); err != nil {
+		return klineData{}, fmt.Errorf("东财JSON解析失败: %w", err)
+	}
+	if len(emResp.Data.Klines) == 0 {
+		return klineData{}, fmt.Errorf("东财no klines for %s", code)
+	}
+
+	dates := make([]string, 0, len(emResp.Data.Klines))
+	candles := make([]indicator.Candle, 0, len(emResp.Data.Klines))
+	turnovers := make([]float64, 0, len(emResp.Data.Klines))
+
+	for _, ks := range emResp.Data.Klines {
+		parts := strings.Split(ks, ",")
+		if len(parts) < 12 {
+			continue
+		}
+		date := parts[0]
+		open := parseFloat(parts[1])
+		close := parseFloat(parts[2])
+		high := parseFloat(parts[3])
+		low := parseFloat(parts[4])
+		vol := parseFloat(parts[5]) * 100
+		amount := parseFloat(parts[6])
+		turnover := parseFloat(parts[10]) / 100
+
+		dates = append(dates, date)
+		candles = append(candles, indicator.Candle{
+			Open: open, Close: close, High: high, Low: low,
+			Volume: vol, Amount: amount,
+		})
+		turnovers = append(turnovers, turnover)
+	}
+
+	if len(candles) == 0 {
+		return klineData{}, fmt.Errorf("东财no valid klines for %s", code)
+	}
+
+	return klineData{Code: code, Name: code, Dates: dates, Candles: candles, Turnovers: turnovers}, nil
 }
 
 // fetchEMTurnover 从东财拉换手率。失败返回 nil。
@@ -277,31 +362,11 @@ func fetchEMTurnover(client *http.Client, code string, count int, tencentDates [
 		"https://push2his.eastmoney.com/api/qt/stock/kline/get?secid=%s&fields1=f1,f2,f3&fields2=f51,f61&klt=101&fqt=1&end=20500101&lmt=%d",
 		secid, count)
 
-	var resp *http.Response
-	var err error
-	for attempt := 0; attempt < 3; attempt++ {
-		req, _ := http.NewRequest(http.MethodGet, url, nil)
-		req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")
-		req.Header.Set("Referer", "https://data.eastmoney.com/")
-		req.Header.Set("Accept", "application/json, text/plain, */*")
-		resp, err = client.Do(req)
-		if err == nil {
-			defer resp.Body.Close()
-			break
-		}
-		if resp != nil {
-			resp.Body.Close()
-			resp = nil
-		}
-		if attempt < 2 {
-			time.Sleep(time.Duration(300*(attempt+1)) * time.Millisecond)
-		}
-	}
-	if err != nil || resp == nil {
+	body, err := api.FetchEMWithRetry(client, url)
+	if err != nil {
 		return nil
 	}
 
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
 	var emResp struct {
 		Data struct {
 			Klines []string `json:"klines"`
@@ -468,6 +533,48 @@ func parseFloat(s string) float64 {
 	var f float64
 	fmt.Sscanf(s, "%f", &f)
 	return f
+}
+
+// fetchTDXTurnoverFallback 东财换手率失败时的 TDX 兜底: 只拉流通股本,
+// 用 HTTP 源的 Volume 本地算 turnover = Vol / LiutongGuben。
+// 不拉日K(价格仍用 HTTP 前复权),仅建立 TCP 取 GetFinanceInfo。
+func fetchTDXTurnoverFallback(code string, candles []indicator.Candle) []float64 {
+	var marketID model.Market
+	rawCode := code
+	if strings.HasPrefix(code, "sh") {
+		marketID = model.MarketSH
+		rawCode = code[2:]
+	} else if strings.HasPrefix(code, "sz") || strings.HasPrefix(code, "bj") {
+		marketID = model.MarketSZ
+		rawCode = code[2:]
+	} else {
+		return nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	client, err := tdx.FromBestHost(ctx, tdx.Options{MaxAttempts: 3, Timeout: 15 * time.Second})
+	if err != nil {
+		return nil
+	}
+	defer client.Close()
+
+	fin, err := client.GetFinanceInfo(ctx, marketID, rawCode)
+	if err != nil {
+		return nil
+	}
+	if fin.LiutongGuben <= 0 {
+		return nil
+	}
+
+	turnovers := make([]float64, len(candles))
+	for i, c := range candles {
+		if c.Volume > 0 {
+			turnovers[i] = c.Volume / fin.LiutongGuben
+		}
+	}
+	return turnovers
 }
 
 func closeSeriesFn(candles []indicator.Candle) []float64 {

@@ -10,6 +10,7 @@ import (
 	"os"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"stock-tui/internal/api"
@@ -105,6 +106,16 @@ func run(args []string) error {
 		} else if err != nil {
 			fmt.Fprintf(os.Stderr, "warn: fundamentals fetch failed: %v\n", err)
 		}
+		// 补拉东财基本面(行业/总股本/流通股本/上市日期),非致命
+		if info, err := api.FetchStockInfo(code); err == nil {
+			fmt.Printf("INFO 代码=%s 简称=%s 行业=%s 总股本=%.0f 流通=%.0f 总市值=%.2f亿 流通市值=%.2f亿 上市=%s\n",
+				info.Code, info.Name, info.Industry,
+				info.TotalShares, info.FloatShares,
+				info.TotalMC/1e8, info.FloatMC/1e8,
+				info.ListedDate)
+		} else {
+			fmt.Fprintf(os.Stderr, "warn: stock info fetch failed: %v\n", err)
+		}
 		if err := saveSnapshot(data, snap); err != nil {
 			return fmt.Errorf("save snapshot: %w", err)
 		}
@@ -129,6 +140,23 @@ func saveSnapshot(data seriesData, snap store.Snapshot) error {
 }
 
 func fetchDailyKline(code string, bars int) (seriesData, error) {
+	data, err := fetchTencentKline(code, bars)
+	if err == nil {
+		// 腾讯成功:补拉换手率(用于 CYQ 筹码计算),非致命失败时静默跳过
+		turnovers := fetchEMTurnovers(code, len(data.Candles), data.Dates)
+		if turnovers == nil {
+			turnovers = fetchTDXTurnoverFallback(code, data.Candles)
+		}
+		data.Turnovers = turnovers
+		return data, nil
+	}
+	// 腾讯失败→自动切换到东财日K(前复权fqt=1),含精确成交额+换手率
+	fmt.Fprintf(os.Stderr, "info: 腾讯日K失败(%v),切换到东财日K\n", err)
+	return fetchEMKline(code, bars)
+}
+
+// fetchTencentKline 从腾讯拉取前复权日K(OHLCV),不含换手率
+func fetchTencentKline(code string, bars int) (seriesData, error) {
 	url := fmt.Sprintf("https://ifzq.gtimg.cn/appstock/app/fqkline/get?param=%s,day,,,%d,qfq", code, bars)
 	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
@@ -191,21 +219,89 @@ func fetchDailyKline(code string, bars int) (seriesData, error) {
 		}
 	}
 
-	// 从东财补拉换手率(用于 CYQ 筹码计算),非致命失败时静默跳过
-	turnovers := fetchEMTurnovers(code, len(candles), dates)
-	// 东财失败时回退 TDX: 只拉流通股本,用 HTTP 的 Volume 本地算换手率
-	if turnovers == nil {
-		turnovers = fetchTDXTurnoverFallback(code, candles)
+	return seriesData{Code: code, Name: name, Dates: dates, Candles: candles}, nil
+}
+
+// fetchEMKline 从东财拉取前复权日K(OHLCV+Amount+换手率),用作腾讯日K的HTTP fallback。
+// fields2=f51..f61,f116 返回12列:日期,开,收,高,低,量(手),额(元),振幅%,涨跌幅%,涨跌额,换手率%,代码
+// 前复权(fqt=1)口径与腾讯 qfq 一致。东财的 f57=成交额(元)比腾讯的 Close×Volume 估算更精确。
+func fetchEMKline(code string, bars int) (seriesData, error) {
+	// 映射 code → EM secid
+	prefix := ""
+	if len(code) >= 2 {
+		switch code[:2] {
+		case "sh":
+			prefix = "1"
+		case "sz", "bj":
+			prefix = "0"
+		}
+	}
+	if prefix == "" {
+		return seriesData{}, fmt.Errorf("unsupported code: %s", code)
+	}
+	secid := prefix + "." + code[2:]
+
+	url := fmt.Sprintf(
+		"https://push2his.eastmoney.com/api/qt/stock/kline/get?secid=%s&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f116&klt=101&fqt=1&end=20500101&lmt=%d",
+		secid, bars,
+	)
+
+	body, err := api.FetchEMWithRetry(httpClient, url)
+	if err != nil {
+		return seriesData{}, fmt.Errorf("东财日K %s: %w", code, err)
 	}
 
-	return seriesData{
-		Code: code, Name: name, Dates: dates, Candles: candles,
-		Turnovers: turnovers,
-	}, nil
+	var emResp struct {
+		Data struct {
+			Klines []string `json:"klines"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &emResp); err != nil {
+		return seriesData{}, fmt.Errorf("东财JSON解析失败: %w", err)
+	}
+	if len(emResp.Data.Klines) == 0 {
+		return seriesData{}, fmt.Errorf("东财no klines for %s", code)
+	}
+
+	// 东财 kline 格式: "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f116"
+	// f51=日期, f52=开, f53=收, f54=高, f55=低, f56=量(手), f57=额(元),
+	// f58=振幅%, f59=涨跌幅%, f60=涨跌额, f61=换手率%, f116=代码
+	dates := make([]string, 0, len(emResp.Data.Klines))
+	candles := make([]indicator.Candle, 0, len(emResp.Data.Klines))
+	turnovers := make([]float64, 0, len(emResp.Data.Klines))
+	name := code
+
+	for _, ks := range emResp.Data.Klines {
+		parts := strings.Split(ks, ",")
+		if len(parts) < 12 {
+			continue
+		}
+		date := parts[0] // f51
+		open := parseFloat(parts[1])
+		close := parseFloat(parts[2])
+		high := parseFloat(parts[3])
+		low := parseFloat(parts[4])
+		vol := parseFloat(parts[5]) * 100 // f56 手→股
+		amount := parseFloat(parts[6])    // f57 元
+		turnover := parseFloat(parts[10]) / 100 // f61 %→小数(用于CYQ)
+
+		dates = append(dates, date)
+		candles = append(candles, indicator.Candle{
+			Open: open, Close: close, High: high, Low: low,
+			Volume: vol, Amount: amount,
+		})
+		turnovers = append(turnovers, turnover)
+	}
+
+	if len(candles) == 0 {
+		return seriesData{}, fmt.Errorf("东财no valid klines for %s", code)
+	}
+
+	return seriesData{Code: code, Name: name, Dates: dates, Candles: candles, Turnovers: turnovers}, nil
 }
 
 // fetchEMTurnovers 从东财历史 K 线接口拉换手率,对齐到 Tencent 日期序列
-// 允许偶发 EOF(限流/重连),重试 2 次;全部失败/无数据时返回 nil
+// 使用 api.FetchEMWithRetry 统一反限流和重试;全部失败/无数据时返回 nil
 func fetchEMTurnovers(code string, count int, tencentDates []string) []float64 {
 	// 映射 code → EM secid
 	prefix := ""
@@ -226,33 +322,11 @@ func fetchEMTurnovers(code string, count int, tencentDates []string) []float64 {
 		"https://push2his.eastmoney.com/api/qt/stock/kline/get?secid=%s&fields1=f1,f2,f3&fields2=f51,f61&klt=101&fqt=1&end=20500101&lmt=%d",
 		secid, count)
 
-	var resp *http.Response
-	var err error
-	for attempt := 0; attempt < 3; attempt++ {
-		req, _ := http.NewRequest(http.MethodGet, url, nil)
-		req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")
-		req.Header.Set("Referer", "https://data.eastmoney.com/")
-		req.Header.Set("Accept", "application/json, text/plain, */*")
-		resp, err = httpClient.Do(req)
-		if err == nil {
-			defer resp.Body.Close()
-			break
-		}
-		// Go net/http may return a non-nil resp even on err — close it on this
-		// failing attempt so we never leak a keep-alive body across retries.
-		if resp != nil {
-			resp.Body.Close()
-			resp = nil
-		}
-		if attempt < 2 {
-			time.Sleep(time.Duration(300*(attempt+1)) * time.Millisecond)
-		}
-	}
-	if err != nil || resp == nil {
+	body, err := api.FetchEMWithRetry(httpClient, url)
+	if err != nil {
 		return nil
 	}
 
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
 	var emResp struct {
 		Data struct {
 			Klines []string `json:"klines"`
