@@ -48,7 +48,20 @@ type cookieJar struct {
 func (j *cookieJar) SetCookies(_ *url.URL, cookies []*http.Cookie) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
-	j.cookies = cookies
+	// 按 name 合并: 同名覆盖、新名追加, 避免预热请求发生重定向、多次 Set-Cookie 时
+	// 直接赋值丢掉先前批次的 cookie。
+	byName := make(map[string]int, len(j.cookies))
+	for i, c := range j.cookies {
+		byName[c.Name] = i
+	}
+	for _, c := range cookies {
+		if idx, ok := byName[c.Name]; ok {
+			j.cookies[idx] = c
+		} else {
+			byName[c.Name] = len(j.cookies)
+			j.cookies = append(j.cookies, c)
+		}
+	}
 }
 
 func (j *cookieJar) Cookies(u *url.URL) []*http.Cookie {
@@ -161,7 +174,7 @@ func pow3(n int) int {
 }
 
 // FetchEMWithRetry 东财请求重试封装(导出版): 指数退避 + 随机 jitter。
-// 重试间隔: 300ms→900ms→2700ms + jitter,3 次后仍失败则返回 error。
+// 共 3 次尝试, 两次重试间隔 300ms→900ms(+jitter); 仍失败则返回 error。
 // 供 cmd 内联的东财请求复用。
 func FetchEMWithRetry(client *http.Client, url string) ([]byte, error) {
 	return emFetchWithRetry(client, url)

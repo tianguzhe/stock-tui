@@ -28,23 +28,25 @@ type ProxyDailyBar struct {
 
 // ParseProxyDailyBars 解析 proxy newfqkline 的 qfqday/day 行序列。
 // rows 元素为 JSON 数组元素(字符串数字或 {} 对象)。
+// 坏行(短行/OHLC 非正)会被跳过而非中断整只解析——个别行异常不应毁掉全部有效数据;
+// 全部行都坏时返回 error, 由 FetchProxyKline 触发东财 fallback。
 func ParseProxyDailyBars(rows [][]json.RawMessage) ([]ProxyDailyBar, error) {
 	out := make([]ProxyDailyBar, 0, len(rows))
 	var prevClose float64
-	for i, row := range rows {
-		if len(row) < 6 {
-			return nil, fmt.Errorf("proxy kline row %d short: len=%d", i, len(row))
-		}
+	for _, row := range rows {
 		cells := make([]string, len(row))
 		for j, raw := range row {
 			cells[j] = rawJSONCell(raw)
 		}
 		bar, err := ParseProxyDailyBarCells(cells, prevClose)
 		if err != nil {
-			return nil, fmt.Errorf("proxy kline row %d: %w", i, err)
+			continue // 坏行跳过, 不污染指标也不误伤整只; prevClose 保持上一有效日
 		}
 		out = append(out, bar)
 		prevClose = bar.Close
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("no valid proxy kline rows (all %d bad)", len(rows))
 	}
 	return out, nil
 }
@@ -59,6 +61,11 @@ func ParseProxyDailyBarCells(cells []string, prevClose float64) (ProxyDailyBar, 
 	close := parseFloatCell(cells[2])
 	high := parseFloatCell(cells[3])
 	low := parseFloatCell(cells[4])
+	// OHLC 任一 <=0 视为坏行(解析失败或异常价): 返回 error, 由 ParseProxyDailyBars
+	// 跳过该行, 避免静默产生 0 价 K 线污染下游指标(全坏才触发东财 fallback)。
+	if open <= 0 || close <= 0 || high <= 0 || low <= 0 {
+		return ProxyDailyBar{}, fmt.Errorf("invalid OHLC: o=%v c=%v h=%v l=%v", open, close, high, low)
+	}
 	vol := parseFloatCell(cells[5]) * 100 // 手→股
 
 	amount := 0.0

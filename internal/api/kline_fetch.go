@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -65,7 +66,7 @@ func FetchDailyKline(client *http.Client, code string, bars int) (KlineData, err
 		}
 		return data, nil
 	}
-	fmt.Printf("info: 腾讯日K失败(%v),切换到东财日K\n", err)
+	fmt.Fprintf(os.Stderr, "info: 腾讯日K失败(%v),切换到东财日K\n", err)
 	return FetchEMKline(c, code, bars)
 }
 
@@ -166,8 +167,10 @@ func FetchEMKline(client *http.Client, code string, bars int) (KlineData, error)
 		return KlineData{}, err
 	}
 
+	// K 线接口每行固定 11 列(fields2=f51..f61); f116(总市值)是实时行情 stock/get
+	// 的字段, K 线接口会忽略它——切勿加入, 否则列数假设错位。
 	url := fmt.Sprintf(
-		"https://push2his.eastmoney.com/api/qt/stock/kline/get?secid=%s&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f116&klt=101&fqt=1&end=20500101&lmt=%d",
+		"https://push2his.eastmoney.com/api/qt/stock/kline/get?secid=%s&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61&klt=101&fqt=1&end=20500101&lmt=%d",
 		secid, bars,
 	)
 
@@ -184,29 +187,7 @@ func FetchEMKline(client *http.Client, code string, bars int) (KlineData, error)
 		return KlineData{}, fmt.Errorf("东财no klines for %s", code)
 	}
 
-	dates := make([]string, 0, len(emResp.Data.Klines))
-	candles := make([]indicator.Candle, 0, len(emResp.Data.Klines))
-	turnovers := make([]float64, 0, len(emResp.Data.Klines))
-	amplitudes := make([]float64, 0, len(emResp.Data.Klines))
-
-	for _, ks := range emResp.Data.Klines {
-		parts := strings.Split(ks, ",")
-		if len(parts) < 12 {
-			continue
-		}
-		dates = append(dates, parts[0])
-		candles = append(candles, indicator.Candle{
-			Open:   parseEMFloat(parts[1]),
-			Close:  parseEMFloat(parts[2]),
-			High:   parseEMFloat(parts[3]),
-			Low:    parseEMFloat(parts[4]),
-			Volume: parseEMFloat(parts[5]) * 100, // 手→股
-			Amount: parseEMFloat(parts[6]),       // 元
-		})
-		amplitudes = append(amplitudes, parseEMFloat(parts[7]))    // f58 振幅 %
-		turnovers = append(turnovers, parseEMFloat(parts[10])/100) // f61 %→小数
-	}
-
+	dates, candles, turnovers, amplitudes := parseEMKlines(emResp.Data.Klines)
 	if len(candles) == 0 {
 		return KlineData{}, fmt.Errorf("东财no valid klines for %s", code)
 	}
@@ -240,27 +221,7 @@ func FetchEMTurnover(client *http.Client, code string, count int, dates []string
 		return nil
 	}
 
-	turnMap := make(map[string]float64, len(emResp.Data.Klines))
-	for _, ks := range emResp.Data.Klines {
-		commaPos := strings.IndexByte(ks, ',')
-		if commaPos < 0 || commaPos >= len(ks)-1 {
-			continue
-		}
-		turnMap[ks[:commaPos]] = parseEMFloat(ks[commaPos+1:])
-	}
-
-	turns := make([]float64, len(dates))
-	hasData := false
-	for i, d := range dates {
-		if v, ok := turnMap[d]; ok {
-			turns[i] = v / 100 // 东财 f61 是 %,转小数
-			hasData = true
-		}
-	}
-	if !hasData {
-		return nil
-	}
-	return turns
+	return alignEMTurnovers(emResp.Data.Klines, dates)
 }
 
 // FetchTDXTurnover 东财换手率失败时的 TDX 兜底: 只拉流通股本,
@@ -337,6 +298,71 @@ func httpClientOrDefault(client *http.Client) *http.Client {
 		return client
 	}
 	return httpClient
+}
+
+// emTurnoverMinMatch 是东财换手率对齐 dates 的最低匹配率。
+// 低于此值说明东财返回与 K 线序列日期对不齐(数据残缺), 返回 nil 触发 TDX 兜底,
+// 避免用大量 0 换手的残缺序列冒充"有效"污染 CYQ。
+const emTurnoverMinMatch = 0.8
+
+// parseEMKlines 解析东财 push2his kline 的 klines 字符串数组。
+// 每行固定 11 列(fields2=f51..f61): 日期,开,收,高,低,量(手),额(元),振幅%,涨跌幅%,涨跌额,换手率%。
+// OHLC 任一 <=0 视为坏行(解析失败或异常价)跳过, 避免静默产生 0 价 K 线污染下游指标。
+func parseEMKlines(klines []string) (dates []string, candles []indicator.Candle, turnovers, amplitudes []float64) {
+	for _, ks := range klines {
+		parts := strings.Split(ks, ",")
+		if len(parts) < 11 {
+			continue
+		}
+		open := parseEMFloat(parts[1])
+		close := parseEMFloat(parts[2])
+		high := parseEMFloat(parts[3])
+		low := parseEMFloat(parts[4])
+		if open <= 0 || close <= 0 || high <= 0 || low <= 0 {
+			continue
+		}
+		dates = append(dates, parts[0])
+		candles = append(candles, indicator.Candle{
+			Open:   open,
+			Close:  close,
+			High:   high,
+			Low:    low,
+			Volume: parseEMFloat(parts[5]) * 100, // 手→股
+			Amount: parseEMFloat(parts[6]),       // 元
+		})
+		amplitudes = append(amplitudes, parseEMFloat(parts[7]))    // f58 振幅 %
+		turnovers = append(turnovers, parseEMFloat(parts[10])/100) // f61 %→小数
+	}
+	return dates, candles, turnovers, amplitudes
+}
+
+// alignEMTurnovers 把东财 klines(f51 日期, f61 换手%)按日期对齐到 dates 序列。
+// 匹配率低于 emTurnoverMinMatch 或 dates 为空时返回 nil(触发 TDX 兜底)。
+func alignEMTurnovers(klines []string, dates []string) []float64 {
+	if len(dates) == 0 {
+		return nil
+	}
+	turnMap := make(map[string]float64, len(klines))
+	for _, ks := range klines {
+		commaPos := strings.IndexByte(ks, ',')
+		if commaPos < 0 || commaPos >= len(ks)-1 {
+			continue
+		}
+		turnMap[ks[:commaPos]] = parseEMFloat(ks[commaPos+1:])
+	}
+
+	turns := make([]float64, len(dates))
+	matched := 0
+	for i, d := range dates {
+		if v, ok := turnMap[d]; ok {
+			turns[i] = v / 100 // 东财 f61 是 %,转小数
+			matched++
+		}
+	}
+	if float64(matched) < float64(len(dates))*emTurnoverMinMatch {
+		return nil
+	}
+	return turns
 }
 
 // parseEMFloat 解析东财 CSV 字段为 float64。

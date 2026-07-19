@@ -143,6 +143,39 @@ func TestParseProxyDailyBarsFromJSONRaw(t *testing.T) {
 	}
 }
 
+// ParseProxyDailyBars 跳过坏行(OHLC 非正)保留有效行, 全坏才返回 error(P1)。
+func TestParseProxyDailyBarsSkipsBadRows(t *testing.T) {
+	raw := []byte(`[
+		["2026-07-16","1252.00","1258.99","1267.97","1245.05","47611",{},"0.38","598757.09",""],
+		["2026-07-17","1269.01","0","1269.33","1238.98","58417",{},"0.47","732273.27",""],
+		["2026-07-18","1260.00","1265.00","1270.00","1255.00","50000",{},"0.40","600000.00",""]
+	]`)
+	var rows [][]json.RawMessage
+	if err := json.Unmarshal(raw, &rows); err != nil {
+		t.Fatal(err)
+	}
+	bars, err := ParseProxyDailyBars(rows)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(bars) != 2 { // 中间 close=0 坏行被跳过
+		t.Fatalf("len(bars)=%d, want 2 (bad row skipped)", len(bars))
+	}
+	if bars[0].Date != "2026-07-16" || bars[1].Date != "2026-07-18" {
+		t.Errorf("survived dates=%s,%s; want 2026-07-16,2026-07-18", bars[0].Date, bars[1].Date)
+	}
+
+	// 全坏 → error(触发东财 fallback)
+	allBad := []byte(`[["2026-07-17","0","0","0","0","100",{},"0.4","1.0",""]]`)
+	var badRows [][]json.RawMessage
+	if err := json.Unmarshal(allBad, &badRows); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ParseProxyDailyBars(badRows); err == nil {
+		t.Error("all-bad rows should return error")
+	}
+}
+
 func TestTurnoverUseful(t *testing.T) {
 	if TurnoverUseful(nil) {
 		t.Fatal("nil should be false")
@@ -165,5 +198,22 @@ func TestStripJSONP(t *testing.T) {
 	pure := []byte(`{"a":1}`)
 	if string(StripJSONP(pure)) != `{"a":1}` {
 		t.Fatal("pure JSON should pass through")
+	}
+}
+
+// OHLC 含非正值(解析失败/空/异常价)必须返回 error, 不静默产生 0 价 K 线污染指标(P1)。
+func TestParseProxyDailyBarCellsRejectsBadOHLC(t *testing.T) {
+	cases := []struct {
+		name  string
+		cells []string
+	}{
+		{"close_zero", []string{"2026-07-17", "100", "0", "110", "95", "1000", "", "1.5", "10.5", ""}},
+		{"open_empty", []string{"2026-07-17", "", "105", "110", "95", "1000", "", "1.5", "10.5", ""}},
+		{"high_garbage", []string{"2026-07-17", "100", "105", "abc", "95", "1000", "", "1.5", "10.5", ""}},
+	}
+	for _, tc := range cases {
+		if _, err := ParseProxyDailyBarCells(tc.cells, 100); err == nil {
+			t.Errorf("%s: expected error for bad OHLC, got nil", tc.name)
+		}
 	}
 }
