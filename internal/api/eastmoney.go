@@ -213,7 +213,7 @@ func FetchStockInfo(code string) (*StockInfo, error) {
 			F116 float64 `json:"f116"` // 总市值
 			F117 float64 `json:"f117"` // 流通市值
 			F127 string  `json:"f127"` // 行业
-			F189 string  `json:"f189"` // 上市日期
+			F189 float64 `json:"f189"` // 上市日期 YYYYMMDD(东财返回 int,不可用 string)
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(body, &payload); err != nil {
@@ -229,7 +229,7 @@ func FetchStockInfo(code string) (*StockInfo, error) {
 		TotalShares: payload.Data.F84,
 		FloatShares: payload.Data.F85,
 		Industry:    strings.TrimSpace(payload.Data.F127),
-		ListedDate:  payload.Data.F189,
+		ListedDate:  fmt.Sprintf("%.0f", payload.Data.F189),
 		TotalMC:     payload.Data.F116,
 		FloatMC:     payload.Data.F117,
 	}
