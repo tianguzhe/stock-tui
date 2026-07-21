@@ -269,12 +269,7 @@ func formatSignals(c *screener.Candidate, cost float64, shares int, capital floa
 	}
 
 	// TD countdown warning
-	cdwnTop := 0
-	if strings.Contains(c.TDCountdown, "顶") {
-		var n int
-		fmt.Sscanf(c.TDCountdown, "见顶/%d", &n)
-		cdwnTop = n
-	}
+	cdwnTop := screener.CdwnTopN(c.TDCountdown)
 	if cdwnTop > 0 {
 		parts = append(parts, fmt.Sprintf("⚠️C顶%d", cdwnTop))
 	}

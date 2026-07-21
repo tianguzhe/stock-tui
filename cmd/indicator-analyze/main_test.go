@@ -371,10 +371,10 @@ func TestEvalBullBear(t *testing.T) {
 		last.RSI.RSI6, last.WR.WR14, last.KDJ.J, last.BIAS.BIAS24 = 50, 50, 50, 0 // 中性摆动,无超买超卖票
 		last.SAR.Long, last.SuperTrend.Long = true, true                          // SAR/ST 双多 → 趋势确认 +1
 		last.MACD.DIF, last.MACD.DEA, last.MACD.Histogram = 1, 0, 1               // MACD 金叉 +2
-		td := indicator.TD{CountdownCount: 13, CountdownSignal: indicator.TDBuy}  // TD 见底 +3
+		td := indicator.TD{CountdownCount: 13, CountdownSignal: indicator.TDBuy}  // TD 见底 +1（学术证据不支持高权重）
 		v := mk(last, td, analysis.DivergenceState{}, nil, 1.0)
-		if v.BearScore != 0 || v.BullScore != 6 {
-			t.Fatalf("bullW=%d bearW=%d, want 6/0 (趋势1+MACD2+TD3); bulls=%+v", v.BullScore, v.BearScore, v.Bulls)
+		if v.BearScore != 0 || v.BullScore != 4 {
+			t.Fatalf("bullW=%d bearW=%d, want 4/0 (趋势1+MACD2+TD1); bulls=%+v", v.BullScore, v.BearScore, v.Bulls)
 		}
 		if v.Verdict != "偏多" {
 			t.Errorf("Verdict=%q, want 偏多", v.Verdict)

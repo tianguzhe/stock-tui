@@ -14,7 +14,7 @@ const (
 	MinRSCoverage = 90.0 // RS20 覆盖率阈值（%）
 )
 
-// Compiled once; used by cdwnTopN, tdSafe, tdTopCount.
+// Compiled once; used by CdwnTopN, tdSafe, tdTopCount.
 var (
 	reCdwnTopN = regexp.MustCompile(`顶/(\d+)`)
 	reTopSetup = regexp.MustCompile(`见顶/(\d+)`)
@@ -172,8 +172,8 @@ func perfOK(c *Candidate) bool {
 	return true
 }
 
-// cdwnTopN extracts countdown top sequence count from "见顶/N" format.
-func cdwnTopN(tdCountdown string) int {
+// CdwnTopN extracts countdown top sequence count from "见顶/N" format.
+func CdwnTopN(tdCountdown string) int {
 	matches := reCdwnTopN.FindStringSubmatch(tdCountdown)
 	if len(matches) > 1 {
 		n, _ := strconv.Atoi(matches[1])
@@ -193,7 +193,7 @@ func tdSafe(c *Candidate) bool {
 			}
 		}
 	}
-	n := cdwnTopN(c.TDCountdown)
+	n := CdwnTopN(c.TDCountdown)
 	if n > 0 {
 		return n <= 6
 	}
@@ -206,7 +206,7 @@ func tdTopCount(c *Candidate) int {
 		n, _ := strconv.Atoi(matches[1])
 		return n
 	}
-	return cdwnTopN(c.TDCountdown)
+	return CdwnTopN(c.TDCountdown)
 }
 
 // divBearState returns divergence bearish state: "ok" / "watch" / "exclude".
@@ -472,10 +472,10 @@ func LoadSnapshots(dbPath string) (date string, candidates []Candidate, rsCovera
 		       (SELECT COALESCE(SUM(obv_up), 0) FROM snapshot s2
 		        WHERE s2.code = s.code
 		          AND s2.trade_date IN (
-		            SELECT trade_date FROM snapshot
-		            WHERE trade_date <= s.trade_date
-		            GROUP BY trade_date
-		            ORDER BY trade_date DESC LIMIT 3
+		            SELECT s3.trade_date FROM snapshot s3
+		            WHERE s3.code = s.code
+		              AND s3.trade_date <= s.trade_date
+		            ORDER BY s3.trade_date DESC LIMIT 3
 		          )) AS obv_3day_sum,
 		       s.macd_hist, s.vol_ratio,
 		       s.td_setup, s.td_countdown,

@@ -350,7 +350,12 @@ func TestComputeTier(t *testing.T) {
 			want: TierNone,
 		},
 		{
-			name: "TD setup 见顶/8 - exclude",
+			name: "TD setup 见顶/6 alone — still passes to star tier",
+			mod:  func(c *Candidate) { c.TDSetup = "见顶/6" },
+			want: TierStar3,
+		},
+		{
+			name: "TD setup 见顶/8 blocked by tdSafe",
 			mod:  func(c *Candidate) { c.TDSetup = "见顶/8" },
 			want: TierNone,
 		},
@@ -647,9 +652,9 @@ func TestOBV3DayFilter(t *testing.T) {
 	}
 }
 
-// TestTDFunctions tests TD Sequential helper functions.
+// TestTDFunctions tests TD Sequential helper functions (CdwnTopN).
 func TestTDFunctions(t *testing.T) {
-	t.Run("cdwnTopN", func(t *testing.T) {
+	t.Run("CdwnTopN", func(t *testing.T) {
 		tests := []struct {
 			countdown string
 			want      int
@@ -660,47 +665,10 @@ func TestTDFunctions(t *testing.T) {
 			{"", 0},
 		}
 		for _, tt := range tests {
-			got := cdwnTopN(tt.countdown)
+			got := CdwnTopN(tt.countdown)
 			if got != tt.want {
-				t.Errorf("cdwnTopN(%q) = %d, want %d", tt.countdown, got, tt.want)
+				t.Errorf("CdwnTopN(%q) = %d, want %d", tt.countdown, got, tt.want)
 			}
-		}
-	})
-
-	t.Run("tdSafe", func(t *testing.T) {
-		tests := []struct {
-			name string
-			c    Candidate
-			want bool
-		}{
-			{
-				name: "setup 见顶/8 unsafe",
-				c:    Candidate{TDSetup: "见顶/8"},
-				want: false,
-			},
-			{
-				name: "setup 见顶/7 safe",
-				c:    Candidate{TDSetup: "见顶/7"},
-				want: true,
-			},
-			{
-				name: "countdown 见顶/6 safe",
-				c:    Candidate{TDCountdown: "见顶/6"},
-				want: true,
-			},
-			{
-				name: "countdown 见顶/7 unsafe",
-				c:    Candidate{TDCountdown: "见顶/7"},
-				want: false,
-			},
-		}
-		for _, tt := range tests {
-			t.Run(tt.name, func(t *testing.T) {
-				got := tdSafe(&tt.c)
-				if got != tt.want {
-					t.Errorf("tdSafe() = %v, want %v", got, tt.want)
-				}
-			})
 		}
 	})
 }

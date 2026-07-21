@@ -55,7 +55,7 @@
 - **动量/超买超卖**:`WR` 与 `KDJ` 同源(都基于 close 在 N 日 high-low 区间的位置),**勿当两个独立证据**;`RSI`(涨跌幅)、`BIAS`(乖离)口径不同可印证;`MACD` 相对独立(趋势性动量)。`StochRSI`(K/D)= RSI6 在 14 日窗口内的位置,RSI6 钝死极端值时判别力丧失、StochRSI 重新展开该区间——见下「极端行情指标口径 → 极端超卖/超买」段。
 - **波动/通道**:`ATR`/BOLL 带宽量波动幅度;`BOLL`(σ 带)、`Keltner`(ATR 带)、`Donchian`(极值带)是三类通道,BOLL vs Keltner 的对比正是 Squeeze 的意义。
 - **资金**:`MFI`(0–100 有界、超买超卖,位于 `internal/indicator`)与 OBV(累计、趋势)互补;量比看量能强度。**MFI 定性口径**：> 80 超买 / 70–80 偏高 / 20–30 偏低 / < 20 超卖。**OBV 不在指标包**:实现为 `internal/analysis` 的 `OBVSeries`(经典累加:收涨加量/收跌减量/平盘持平)+ `OBVTrend`(近6日趋势文字"上升(净流入)"/"下降(净流出)"/"持平"),进 score 信号位 `OBVUp`、CLI `evalBullBear`、PERF 与 `OBV=` 输出;screener 的 star 分层另要求 OBV 3 日持续净流入(单日沦为 watch)。**未落 snapshot**,故选股表/回测/journal 看不到 OBV 数值,仅 CLI/分析路径运行时算。
-- **择时**:`TDSequential` 是独立口径,可与趋势/动量交叉印证。
+- **择时**:`TDSequential` 是独立口径,可与趋势/动量交叉印证。**学术证据**(Levine & Pedersen 2017, Lo/Mamaysky/Wang 2000)显示 TD 9→13 计数体系无统计显著预测力——项目中**不计入 score_total、不进 screener coreTech 硬门槛**；仅作 CLI 展示、PERF 统计(按个股历史自证)、evalBullBear 择时维度 w=1 与 lateStageRisk 联合条件(需 tdTop≥5 且 divBear 才触发)的辅助参考。
 
 ### 极端行情指标口径
 
@@ -114,7 +114,7 @@
 1. 趋势 stance：优先 SAR/ST 翻转信号（但需理解连续涨停后 SAR 必然翻空的特殊性）；SAR/ST 不一致时以 ST 判断大 stance
 2. 量价关系：封板量比 vs 打开量比（封板惜售=强，打开放量=弱）；连续下跌中量比<0.8=缩量下跌（弱势延续）
 3. Donchian 通道突破：突破后是否站稳（连续涨停站稳=强趋势）；跌破 Donchian 20/55 日新低是有意义的空头信号
-4. TD Sequential：countdown 完成作参考但降权；setup 与 countdown 方向冲突时以 countdown 为主
+4. TD Sequential：仅作力竭预警的弱参考，**不计入核心评分和选股门槛**；countdown 完成不代表必然反转；setup 与 countdown 方向冲突时以 countdown 为主
 5. 超买超卖指标（KDJ/RSI/WR/BIAS）：在连续涨跌停中**失去区分度**，不作为主要判断依据；在连续下跌中极端超卖（RSI6<25）是修复预警，需结合趋势 stance 确认
 
 ## 分析输出口径

@@ -591,14 +591,10 @@ func evalBullBear(candles []indicator.Candle, results []indicator.Result, tds []
 		v.addBear("资金:"+joinComma(moneyParts), -moneyW)
 	}
 
-	// 择时维度:TD countdown 反转倒计时。
+	// 择时维度:TD countdown 反转倒计时(统一 w=1——学术证据显示
+	// TD Sequential 计数体系无统计显著预测力,完成 13 也不改变此结论)。
 	if lastTD.CountdownCount > 0 {
 		w := 1
-		if lastTD.CountdownCount >= 13 {
-			w = 3
-		} else if lastTD.CountdownCount >= 8 {
-			w = 2
-		}
 		switch lastTD.CountdownSignal {
 		case indicator.TDSell:
 			v.addBear(fmt.Sprintf("TD见顶countdown/%d", lastTD.CountdownCount), w)
