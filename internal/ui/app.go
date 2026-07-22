@@ -27,9 +27,11 @@ const (
 // ── 样式 ──────────────────────────────────────────────────────────────────────
 
 var (
-	red   = lipgloss.NewStyle().Foreground(lipgloss.Color("#f38ba8")) // Catppuccin Mocha red
-	green = lipgloss.NewStyle().Foreground(lipgloss.Color("#a6e3a1")) // Catppuccin Mocha green
-	dim   = lipgloss.NewStyle().Foreground(lipgloss.Color("#6c7086")) // Catppuccin Mocha overlay0 / dim gray
+	red         = lipgloss.NewStyle().Foreground(lipgloss.Color("#f38ba8")) // Catppuccin Mocha red
+	green       = lipgloss.NewStyle().Foreground(lipgloss.Color("#a6e3a1")) // Catppuccin Mocha green
+	dim         = lipgloss.NewStyle().Foreground(lipgloss.Color("#6c7086")) // Catppuccin Mocha overlay0 / dim gray
+	watchUp     = lipgloss.NewStyle().Foreground(lipgloss.Color("#89b4fa")) // Catppuccin Mocha blue — 观察中·涨
+	watchDown   = lipgloss.NewStyle().Foreground(lipgloss.Color("#7f849c")) // Catppuccin Mocha overlay2 — 观察中·跌
 
 	subtextStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#a6adc8")) // Catppuccin Mocha subtext0
 	mauveStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("#cba6f7")) // Catppuccin Mocha mauve
@@ -107,36 +109,42 @@ type minuteErrMsg struct {
 // ── Model ────────────────────────────────────────────────────────────────────
 
 type Model struct {
-	codes        []string
-	stocks       []api.Stock
-	selected     int
-	loading      bool
-	err          error
-	updated      time.Time
-	startedAt    time.Time
-	interval     time.Duration
-	autoRefresh  bool
-	width        int
-	height       int
-	minute       *api.MinuteResult
-	minuteCode   string
-	loadingChart bool
-	chartErr     error
-	bossMode     bool
-	simpleMode   bool
-	labelMode    string
+	codes         []string
+	watchingCodes map[string]bool // 观察中的代码集合（dim 样式）
+	stocks        []api.Stock
+	selected      int
+	loading       bool
+	err           error
+	updated       time.Time
+	startedAt     time.Time
+	interval      time.Duration
+	autoRefresh   bool
+	width         int
+	height        int
+	minute        *api.MinuteResult
+	minuteCode    string
+	loadingChart  bool
+	chartErr      error
+	bossMode      bool
+	simpleMode    bool
+	labelMode     string
 }
 
-func New(codes []string, interval time.Duration, bossMode, simpleMode bool) Model {
+func New(codes []string, watchingCodes []string, interval time.Duration, bossMode, simpleMode bool) Model {
+	wm := make(map[string]bool, len(watchingCodes))
+	for _, c := range watchingCodes {
+		wm[c] = true
+	}
 	return Model{
-		codes:       codes,
-		loading:     true,
-		interval:    interval,
-		autoRefresh: true,
-		bossMode:    bossMode,
-		simpleMode:  simpleMode,
-		labelMode:   "sys",
-		startedAt:   time.Now(),
+		codes:         codes,
+		watchingCodes: wm,
+		loading:       true,
+		interval:      interval,
+		autoRefresh:   true,
+		bossMode:      bossMode,
+		simpleMode:    simpleMode,
+		labelMode:     "sys",
+		startedAt:     time.Now(),
 	}
 }
 
@@ -391,40 +399,61 @@ func (m Model) renderSimpleHelp() string {
 	return strings.Join(parts, "  ")
 }
 
-// renderSimpleStockLines 把所有股票按终端宽度自动换行，输出多行（不含末尾换行）。
+// renderSimpleStockLines 把股票按持有/观察分组，每组按终端宽度自动换行（不含末尾换行）。
 func (m Model) renderSimpleStockLines() string {
 	if len(m.stocks) == 0 {
 		return ""
 	}
-	sep := "     " // item 间固定 5 空格
+	sep := "   " // item 间固定 3 空格
 	sepW := lipgloss.Width(sep)
 	budget := max(1, m.width-2) // 留 2 列边距
 
-	var lines []string
-	var line strings.Builder
-	used := 0
-	for i, stock := range m.stocks {
-		item := m.renderSimpleItem(stock, i)
-		iw := lipgloss.Width(item)
-		need := iw
-		if used > 0 {
-			need += sepW
+	// 按持有/观察分组
+	var holdings, watching []api.Stock
+	for _, s := range m.stocks {
+		if m.watchingCodes[s.Code] {
+			watching = append(watching, s)
+		} else {
+			holdings = append(holdings, s)
 		}
-		if used > 0 && used+need > budget {
+	}
+
+	renderGroup := func(stocks []api.Stock) string {
+		var lines []string
+		var line strings.Builder
+		used := 0
+		for i, stock := range stocks {
+			item := m.renderSimpleItem(stock, i)
+			iw := lipgloss.Width(item)
+			need := iw
+			if used > 0 {
+				need += sepW
+			}
+			if used > 0 && used+need > budget {
+				lines = append(lines, line.String())
+				line.Reset()
+				used = 0
+			}
+			if used > 0 {
+				line.WriteString(sep)
+			}
+			line.WriteString(item)
+			used += need
+		}
+		if line.Len() > 0 {
 			lines = append(lines, line.String())
-			line.Reset()
-			used = 0
 		}
-		if used > 0 {
-			line.WriteString(sep)
-		}
-		line.WriteString(item)
-		used += need
+		return strings.Join(lines, "\n")
 	}
-	if line.Len() > 0 {
-		lines = append(lines, line.String())
+
+	var groups []string
+	if len(holdings) > 0 {
+		groups = append(groups, renderGroup(holdings))
 	}
-	return strings.Join(lines, "\n")
+	if len(watching) > 0 {
+		groups = append(groups, renderGroup(watching))
+	}
+	return strings.Join(groups, "\n\n") // 持有与观察之间空一行
 }
 
 func (m Model) renderSimpleItem(stock api.Stock, idx int) string {
@@ -441,6 +470,13 @@ func (m Model) renderSimpleItem(stock api.Stock, idx int) string {
 	pct := fmt.Sprintf("%s%.*f%%", sign, p, stock.ChangePct)
 	// 整段（label + price + pct）按涨跌统一着色
 	value := label + " " + price + " " + pct
+	// 观察中的标的用蓝色系区分涨跌，持有标的用红绿
+	if m.watchingCodes[stock.Code] {
+		if stock.ChangePct < 0 {
+			return watchDown.Render(value)
+		}
+		return watchUp.Render(value)
+	}
 	style := red
 	if stock.ChangePct < 0 {
 		style = green

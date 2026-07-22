@@ -24,9 +24,10 @@ var defaultCodes = []string{
 }
 
 type appConfig struct {
-	codes      []string
-	bossMode   bool
-	simpleMode bool
+	codes         []string
+	watchingCodes []string
+	bossMode      bool
+	simpleMode    bool
 }
 
 func main() {
@@ -36,7 +37,7 @@ func main() {
 		os.Exit(2)
 	}
 
-	m := ui.New(cfg.codes, 5*time.Second, cfg.bossMode, cfg.simpleMode)
+	m := ui.New(cfg.codes, cfg.watchingCodes, 5*time.Second, cfg.bossMode, cfg.simpleMode)
 	// simple 模式伪装系统监控输出，需内联（非全屏）写入终端滚动区
 	// 表格 / boss 模式仍是全屏 TUI，必须保留 AltScreen
 	var opts []tea.ProgramOption
@@ -54,7 +55,8 @@ func parseConfig(args []string) (appConfig, error) {
 	fs := flag.NewFlagSet("stock-tui", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 
-	codeList := fs.String("c", "", "comma-separated stock codes")
+	codeList := fs.String("c", "", "comma-separated stock codes (holdings)")
+	watchList := fs.String("w", "", "comma-separated watching stock codes")
 	bossMode := fs.String("b", "boss", "boss mode")
 	simpleMode := fs.Bool("simple", false, "simple one-line mode (mutually exclusive with -b)")
 
@@ -81,12 +83,27 @@ func parseConfig(args []string) (appConfig, error) {
 		codes = market.NormalizeCodes(fs.Args())
 	}
 
+	var watching []string
+	if *watchList != "" {
+		watching = market.NormalizeCodes([]string{*watchList})
+		// 把观察中的代码也加入拉取列表，避免被遗漏
+		seen := make(map[string]bool, len(codes))
+		for _, c := range codes {
+			seen[c] = true
+		}
+		for _, c := range watching {
+			if !seen[c] {
+				codes = append(codes, c)
+			}
+		}
+	}
+
 	boss, err := parseBossMode(*bossMode)
 	if err != nil {
 		return appConfig{}, err
 	}
 
-	return appConfig{codes: codes, bossMode: boss, simpleMode: *simpleMode}, nil
+	return appConfig{codes: codes, watchingCodes: watching, bossMode: boss, simpleMode: *simpleMode}, nil
 }
 
 func parseBossMode(raw string) (bool, error) {

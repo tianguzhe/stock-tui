@@ -469,7 +469,7 @@ func TestRDoesNotStackTicks(t *testing.T) {
 	defer func() { tickObserver = nil }()
 
 	// 用 1 小时间隔：测试期间没有真 tick 触发
-	m := New([]string{"sh600519"}, time.Hour, false, true)
+	m := New([]string{"sh600519"}, nil, time.Hour, false, true)
 	_ = m.Init()
 
 	afterInit := scheduleCount
@@ -503,7 +503,7 @@ func TestTickSchedulerSelfSustains(t *testing.T) {
 	}
 	defer func() { tickObserver = nil }()
 
-	m := New([]string{"sh600519"}, time.Hour, false, true)
+	m := New([]string{"sh600519"}, nil, time.Hour, false, true)
 	_ = m.Init()
 	initial := scheduleCount
 
@@ -526,7 +526,7 @@ func TestRImmediateFetchOnReenable(t *testing.T) {
 	tickObserver = func(string) {}
 	defer func() { tickObserver = nil }()
 
-	m := New([]string{"sh600519"}, time.Hour, false, true)
+	m := New([]string{"sh600519"}, nil, time.Hour, false, true)
 	_ = m.Init()
 	m.autoRefresh = false
 
