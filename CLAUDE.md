@@ -10,6 +10,7 @@
 - `scripts/` — 每日更新/选股/日志生成/测试脚本
 - `docs/journal/` — 每日复盘日志
 - `docs/holdings-monitor/` — 持仓监控文档（含候选观察状态）
+- `docs/daily-decision.md` — 每日操作决策主文件（账户总览/止损红线/持仓决策矩阵/建仓闸门/执行记录），**纯手动维护、不在任何脚本自动化范围内**；持仓/成本/止损变动时需与 `docs/journal/` 当日 journal.md 同步更新，否则两处口径会不一致
 - `docs/cyq-data-source-notes.md` — CYQ 筹码指标数据源注意事项
 
 ## 行情数据
