@@ -287,6 +287,19 @@ func TestLateStageRisk(t *testing.T) {
 			want: true,
 		},
 		{
+			name: "TD top count >= 5 + divergence",
+			mod: func(c *Candidate) {
+				c.TDSetup = "见顶/8"
+				c.DivBear = true
+			},
+			want: true,
+		},
+		{
+			name: "TD top count >= 5 without divergence — not risky alone",
+			mod:  func(c *Candidate) { c.TDSetup = "见顶/8" },
+			want: false,
+		},
+		{
 			name: "normal - no risk",
 			mod:  func(c *Candidate) {},
 			want: false,
@@ -355,9 +368,13 @@ func TestComputeTier(t *testing.T) {
 			want: TierStar3,
 		},
 		{
-			name: "TD setup 见顶/8 blocked by tdSafe",
+			// TD Sequential is not a coreTech hard gate (CLAUDE.md) — 见顶/8 alone,
+			// without divBear, must not exclude. Its only screener role is the
+			// tdTop>=5 && divBear joint condition inside lateStageRisk (see
+			// TestLateStageRisk for that branch in isolation).
+			name: "TD setup 见顶/8 alone — still passes to star tier",
 			mod:  func(c *Candidate) { c.TDSetup = "见顶/8" },
-			want: TierNone,
+			want: TierStar3,
 		},
 		{
 			name: "large drop - exclude",

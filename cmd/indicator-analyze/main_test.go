@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"stock-tui/internal/analysis"
+	"stock-tui/internal/api"
 	"stock-tui/internal/indicator"
 )
 
@@ -29,6 +30,16 @@ func TestRunRejectsMalformedCodeBeforeNetwork(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "invalid code") {
 		t.Fatalf("run(malformed) error = %v, want invalid code", err)
+	}
+}
+
+func TestPrintAnalysisEmptyCandlesNoPanic(t *testing.T) {
+	snap := printAnalysis(api.KlineData{Code: "sh600000"})
+	if snap.Code != "sh600000" {
+		t.Fatalf("printAnalysis(empty).Code = %q, want sh600000", snap.Code)
+	}
+	if snap.TradeDate != "" {
+		t.Fatalf("printAnalysis(empty).TradeDate = %q, want empty", snap.TradeDate)
 	}
 }
 

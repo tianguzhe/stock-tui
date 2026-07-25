@@ -20,8 +20,9 @@ const MinCYQBars = 60
 
 // CYQResult 单日 CYQ 指标
 type CYQResult struct {
-	// WINNER 获利盘比例(0~100),表示以该价格卖出有多少百分比的筹码获利
-	WinnerClose float64 // WINNER(close)*100
+	// WINNER 获利盘比例(0~1 小数),表示以该价格卖出有多少比例的筹码获利。
+	// 显示为百分比时调用方自行 ×100(见 cmd/indicator-analyze 用法)。
+	WinnerClose float64
 	WinnerOpen  float64
 	WinnerHigh  float64
 	WinnerLow   float64
@@ -46,8 +47,11 @@ type CYQResult struct {
 	IsLowPosition      bool // PRY1 < 40% (近一年低位)
 
 	// 诊断(仅用于调试/校验)
-	// 归一化前的权重合计;短样本时权重挤在近期,WeightSum 仍可接近 1,
-	// 不能单独当作"历史深度足够"的信号(深度告警看 MinCYQBars)。
+	// 归一化前的权重合计 = 1 - Π(1-换手率),即窗口内换手能追溯到的今日持仓比例。
+	// 越接近 1 说明窗口内换手已基本"洗过"一轮存量筹码;短样本或低换手率时
+	// 会明显小于 1,提示窗口外还有相当比例的旧持仓成本未被捕捉。换手率高时
+	// 即使样本短也会很快接近 1,所以不能单独当作"历史深度足够"的信号
+	// (深度门槛看 MinCYQBars)。
 	WeightSum float64
 }
 
@@ -71,10 +75,7 @@ func CalcCYQ(candles []Candle, turnovers []float64) []CYQResult {
 
 	// 1) 计算每根日K的持仓成本权重
 	weights := costWeights(turnovers)
-	sumW := 0.0
-	for _, w := range weights {
-		sumW += w
-	}
+	sumW := rawWeightSum(turnovers)
 
 	// 2) 计算每根日K的平均价格(成本价)
 	//    优先 VWAP(Amount/Volume),volume=0 时回退 (H+L)/2
@@ -169,6 +170,18 @@ func costWeights(turns []float64) []float64 {
 		}
 	}
 	return w
+}
+
+// rawWeightSum 返回 costWeights 归一化前的权重合计: 1 - Π(1-换手率)。
+// 由 sum(w_raw[i]) = sum(R[i+1]-R[i]) 望远镜求和得出,R[i]=Π_{j>=i}(1-turn[j])、
+// R[n]=1,故 sum = R[n]-R[0] = 1-Π(1-turn[j])——与 costWeights 的衰减定义保持
+// 同一套 clamp 规则,避免和归一化权重各算各的、彼此不一致。
+func rawWeightSum(turns []float64) float64 {
+	remaining := 1.0
+	for _, t := range turns {
+		remaining *= 1 - clampF(t, 0, 1)
+	}
+	return 1 - remaining
 }
 
 // calcPRY1 计算近一年相对位置(0~100)

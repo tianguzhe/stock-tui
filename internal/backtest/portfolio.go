@@ -391,9 +391,11 @@ func (e *PortfolioEngine) calculateStats(trades []Trade, dailyEquity []float64) 
 		stats.MaxDrawdown = e.calculateMaxDrawdown(dailyEquity)
 	}
 
-	// 夏普比率（假设无风险利率为0）
+	// 夏普比率（假设无风险利率为0）；样本收益率全相同时 stdDev=0，避免 +Inf/NaN
 	if len(returns) > 1 {
-		stats.SharpeRatio = mean(returns) / stdDev(returns)
+		if sd := stdDev(returns); sd > 0 {
+			stats.SharpeRatio = mean(returns) / sd
+		}
 	}
 
 	// 卡尔玛比率

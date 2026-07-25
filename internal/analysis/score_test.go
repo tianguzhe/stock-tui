@@ -263,4 +263,55 @@ func TestDivergenceDetection(t *testing.T) {
 	if !div.Bear {
 		t.Error("expected bear divergence")
 	}
+	if !div.BearToday {
+		t.Error("condition holds at index 24 itself, expected BearToday true")
+	}
+}
+
+// TestDivergenceBearTodayDistinctFromBear covers the case where the bear
+// divergence condition held a couple of days ago but not on the current bar —
+// Bear should stay true (softer "非当日" weight) while BearToday must be false.
+func TestDivergenceBearTodayDistinctFromBear(t *testing.T) {
+	candles := make([]indicator.Candle, 25)
+	results := make([]indicator.Result, 25)
+	for i := range candles {
+		candles[i] = indicator.Candle{Close: float64(100 + i), High: float64(101 + i), Low: float64(99 + i)}
+		results[i] = indicator.Result{
+			RSI:  indicator.RSI{RSI6: 50},
+			MACD: indicator.MACD{DIF: 0.1},
+		}
+	}
+	results[10].RSI.RSI6 = 80 // RSI peak
+	// Bear condition holds two days ago (index 22), not today (index 24).
+	results[22].RSI.RSI6 = 65
+	results[24].RSI.RSI6 = 50 // back below 60 today — strict condition fails
+
+	div := Divergence(candles, results, 24)
+	if div.BearToday {
+		t.Error("condition does not hold at index 24, expected BearToday false")
+	}
+	if !div.Bear {
+		t.Error("condition held within recentWindow (index 22), expected Bear true")
+	}
+}
+
+// TestDivergenceStale confirms Bear/BearToday both stay false once the
+// triggering day falls outside recentWindow.
+func TestDivergenceStale(t *testing.T) {
+	candles := make([]indicator.Candle, 30)
+	results := make([]indicator.Result, 30)
+	for i := range candles {
+		candles[i] = indicator.Candle{Close: float64(100 + i), High: float64(101 + i), Low: float64(99 + i)}
+		results[i] = indicator.Result{
+			RSI:  indicator.RSI{RSI6: 50},
+			MACD: indicator.MACD{DIF: 0.1},
+		}
+	}
+	results[10].RSI.RSI6 = 80
+	results[20].RSI.RSI6 = 65 // triggers bear at index 20, well outside recentWindow of index 28
+
+	div := Divergence(candles, results, 28)
+	if div.Bear || div.BearToday {
+		t.Error("bear divergence at index 20 is stale by index 28, expected both false")
+	}
 }

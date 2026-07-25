@@ -3,8 +3,8 @@
 #
 # 🚀 现已迁移到 Go！性能更快、类型安全、统一技术栈
 #
-# Usage:
-#   ./scripts/screen-stocks.sh --holdings sh601991:8.504:1300,sh603256:193.752:100,sh605589:53.176:200
+# Usage（持仓格式：代码:成本:手数,1手=100股）:
+#   ./scripts/screen-stocks.sh --holdings sh601991:8.504:13,sh603256:193.752:1,sh605589:53.176:2
 #   ./scripts/screen-stocks.sh --holdings ... --max 14   # 调整上限（默认：持仓数+7）
 #   ./scripts/screen-stocks.sh --dry-run                 # 仅输出，不写 decision_log
 

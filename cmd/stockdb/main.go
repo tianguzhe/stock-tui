@@ -449,7 +449,7 @@ func cmdHot(args []string) error {
 
 func cmdScreen(args []string) error {
 	fs := flag.NewFlagSet("screen", flag.ContinueOnError)
-	holdings := fs.String("holdings", "", "持仓，格式：代码:成本:股数,... 如 sh601991:8.504:1300")
+	holdings := fs.String("holdings", "", "持仓，格式：代码:成本:手数(1手=100股),... 如 sh601991:8.504:13")
 	maxResults := fs.Int("max", 0, "持仓+候选总上限（默认：持仓数+7）")
 	capital := fs.Float64("capital", 0, "总资金（元）；提供时按单笔风险1%/止损距离输出候选建议仓位")
 	dryRun := fs.Bool("dry-run", false, "仅输出不写入decision_log")

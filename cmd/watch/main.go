@@ -457,13 +457,18 @@ func printDeepCard(r stockReport) {
 	if snap.Close > 0 {
 		todayBias = (s.Price - snap.Close) / snap.Close * 100
 	}
-	sarDist := (s.Price - snap.SAR_Value) / snap.SAR_Value * 100
-	stDist := (s.Price - snap.ST_Value) / snap.ST_Value * 100
+	sarDistStr, stDistStr := "—", "—"
+	if snap.SAR_Value > 0 {
+		sarDistStr = fmt.Sprintf("%.2f%%", (s.Price-snap.SAR_Value)/snap.SAR_Value*100)
+	}
+	if snap.ST_Value > 0 {
+		stDistStr = fmt.Sprintf("%.2f%%", (s.Price-snap.ST_Value)/snap.ST_Value*100)
+	}
 
 	fmt.Printf("  价位  昨收%.3f → 现%.3f(%+.2f%%) | BIAS6 %.1f%% BIAS24 %.1f%%\n",
 		snap.Close, s.Price, todayBias, snap.Bias6, snap.Bias24)
-	fmt.Printf("        SAR %.2f(距%.2f%%) | ST %.2f(距%.2f%%) | ATRpct %.1f%%\n",
-		snap.SAR_Value, sarDist, snap.ST_Value, stDist, snap.ATR_Pct)
+	fmt.Printf("        SAR %.2f(距%s) | ST %.2f(距%s) | ATRpct %.1f%%\n",
+		snap.SAR_Value, sarDistStr, snap.ST_Value, stDistStr, snap.ATR_Pct)
 
 	// ── 第7行: 综合诊断 ──
 	var diag []string
@@ -572,6 +577,9 @@ func calcVolume(client *http.Client, code string) (*klineVolResult, error) {
 		cnt++
 	}
 	avgVol := sumVol / float64(cnt)
+	if avgVol <= 0 {
+		return nil, fmt.Errorf("近%d日均量为0(疑似停牌)", cnt)
+	}
 
 	todayVol := candles[end].Volume
 	if todayVol < 1 {
@@ -663,18 +671,7 @@ func queryDeepSnapshot(db *sql.DB, code string) (*deepSnapshot, error) {
 // ── 持仓解析 ──
 
 func parseHoldings() ([]holding, error) {
-	paths := []string{
-		".holdings",
-		"/Users/admin/gitprj/stock-tui/.holdings",
-	}
-	var data []byte
-	var err error
-	for _, p := range paths {
-		data, err = os.ReadFile(p)
-		if err == nil {
-			break
-		}
-	}
+	data, err := os.ReadFile(".holdings")
 	if err != nil {
 		return nil, fmt.Errorf("读取.holdings: %w", err)
 	}
@@ -699,8 +696,14 @@ func parseHoldings() ([]holding, error) {
 			code := strings.TrimSpace(parts[0])
 			cost := 0.0
 			qty := 0
-			fmt.Sscanf(parts[1], "%f", &cost)
-			fmt.Sscanf(parts[2], "%d", &qty)
+			if _, err := fmt.Sscanf(parts[1], "%f", &cost); err != nil || cost <= 0 {
+				fmt.Fprintf(os.Stderr, "warn: 跳过持仓行,成本解析失败: %q\n", item)
+				continue
+			}
+			if _, err := fmt.Sscanf(parts[2], "%d", &qty); err != nil || qty <= 0 {
+				fmt.Fprintf(os.Stderr, "warn: 跳过持仓行,手数解析失败: %q\n", item)
+				continue
+			}
 
 			if seen[code] {
 				for i := range hh {

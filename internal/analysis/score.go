@@ -17,7 +17,6 @@ type ScoreState struct {
 	BIAS       int
 	CHOPCMI    int
 	Volume     int
-	SAR        int
 	Divergence int
 	Label      string
 	Signals    SignalState
@@ -266,12 +265,8 @@ func ScoreResult(candles []indicator.Candle, results []indicator.Result, obv []f
 	}
 	score.Volume = ClampInt(score.Volume, -5, 5)
 
-	switch {
-	case last.SAR.Long && last.SuperTrend.Long:
-		score.SAR = 3
-	case !last.SAR.Long && !last.SuperTrend.Long:
-		score.SAR = -3
-	}
+	// SAR/SuperTrend/Keltner 同属 ATR 系趋势跟踪，方向与 DMI/MA 高度重合——
+	// 按 CLAUDE.md「只作 stance 印证与移动止损参考，不叠加计分」，不再单独计分。
 
 	if n >= 20 {
 		div := Divergence(candles, results, n-1)
@@ -287,7 +282,7 @@ func ScoreResult(candles []indicator.Candle, results []indicator.Result, obv []f
 		}
 	}
 
-	score.Delta = score.DMI + score.MA + score.MACD + score.KdjWr + score.RSI + score.BIAS + score.CHOPCMI + score.Volume + score.SAR + score.Divergence
+	score.Delta = score.DMI + score.MA + score.MACD + score.KdjWr + score.RSI + score.BIAS + score.CHOPCMI + score.Volume + score.Divergence
 	score.Total = ClampInt(50+score.Delta, 0, 100)
 	score.Label = ScoreLabel(score.Total)
 	return score
@@ -333,6 +328,36 @@ func EvalSignals(candles []indicator.Candle, results []indicator.Result, obv []f
 	return s
 }
 
+// divergenceCondAt 计算索引 j 处顶/底背离的原始触发条件（不含状态记忆）。
+// 要求 j >= lookback，调用方负责边界检查。
+func divergenceCondAt(candles []indicator.Candle, results []indicator.Result, j, lookback, minGap int) (bear, bull bool, peakIdx, troughIdx int) {
+	refStart := j - lookback
+	refEnd := j - minGap
+
+	peakIdx, troughIdx = refStart, refStart
+	for k := refStart + 1; k <= refEnd; k++ {
+		if results[k].RSI.RSI6 > results[peakIdx].RSI.RSI6 {
+			peakIdx = k
+		}
+		if results[k].RSI.RSI6 < results[troughIdx].RSI.RSI6 {
+			troughIdx = k
+		}
+	}
+
+	rsiNow := results[j].RSI.RSI6
+	difNow := results[j].MACD.DIF
+
+	bear = rsiNow > 60 &&
+		rsiNow < results[peakIdx].RSI.RSI6 &&
+		candles[j].Close >= candles[peakIdx].Close &&
+		difNow > 0
+	bull = rsiNow < 40 &&
+		rsiNow > results[troughIdx].RSI.RSI6 &&
+		candles[j].Close <= candles[troughIdx].Close &&
+		difNow < 0
+	return
+}
+
 // Divergence 检测索引 i 处的 RSI 动量背离。
 func Divergence(candles []indicator.Candle, results []indicator.Result, i int) DivergenceState {
 	const lookback = 20
@@ -340,19 +365,11 @@ func Divergence(candles []indicator.Candle, results []indicator.Result, i int) D
 	if i < lookback {
 		return DivergenceState{}
 	}
+	// recentWindow: 顶/底背离条件在最近这几日内成立过、但非当日成立时，
+	// 仍标记 Bear/Bull(非当日,降权)——避免信号在条件刚好回摆一天时骤然消失。
+	const recentWindow = 3
 
-	refStart := i - lookback
-	refEnd := i - minGap
-
-	rsiPeakIdx, rsiTroughIdx := refStart, refStart
-	for j := refStart + 1; j <= refEnd; j++ {
-		if results[j].RSI.RSI6 > results[rsiPeakIdx].RSI.RSI6 {
-			rsiPeakIdx = j
-		}
-		if results[j].RSI.RSI6 < results[rsiTroughIdx].RSI.RSI6 {
-			rsiTroughIdx = j
-		}
-	}
+	bearToday, bullToday, rsiPeakIdx, rsiTroughIdx := divergenceCondAt(candles, results, i, lookback, minGap)
 
 	d := DivergenceState{
 		Ready:   true,
@@ -360,25 +377,32 @@ func Divergence(candles []indicator.Candle, results []indicator.Result, i int) D
 		LowIdx: i, RefLowIdx: rsiTroughIdx,
 	}
 
-	rsiNow := results[i].RSI.RSI6
-	difNow := results[i].MACD.DIF
-
-	if rsiNow > 60 &&
-		rsiNow < results[rsiPeakIdx].RSI.RSI6 &&
-		candles[i].Close >= candles[rsiPeakIdx].Close &&
-		difNow > 0 {
+	if bearToday {
 		d.BearScore = 1
 		d.Bear = true
 		d.BearToday = true
+	} else {
+		for j := i - 1; j >= i-recentWindow && j >= lookback; j-- {
+			if bear, _, _, _ := divergenceCondAt(candles, results, j, lookback, minGap); bear {
+				d.BearScore = 1
+				d.Bear = true
+				break
+			}
+		}
 	}
 
-	if rsiNow < 40 &&
-		rsiNow > results[rsiTroughIdx].RSI.RSI6 &&
-		candles[i].Close <= candles[rsiTroughIdx].Close &&
-		difNow < 0 {
+	if bullToday {
 		d.BullScore = 1
 		d.Bull = true
 		d.BullToday = true
+	} else {
+		for j := i - 1; j >= i-recentWindow && j >= lookback; j-- {
+			if _, bull, _, _ := divergenceCondAt(candles, results, j, lookback, minGap); bull {
+				d.BullScore = 1
+				d.Bull = true
+				break
+			}
+		}
 	}
 
 	return d

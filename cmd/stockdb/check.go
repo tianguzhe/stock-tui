@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"os"
 )
 
 // cmdCheckData runs data quality checks on the snapshot database.
@@ -61,8 +62,14 @@ func cmdCheckData(args []string) error {
 		for rows.Next() {
 			var date string
 			var count int
-			rows.Scan(&date, &count)
+			if err := rows.Scan(&date, &count); err != nil {
+				fmt.Fprintf(os.Stderr, "warn: scan trade_date row failed: %v\n", err)
+				continue
+			}
 			dates[date] = count
+		}
+		if err := rows.Err(); err != nil {
+			fmt.Fprintf(os.Stderr, "warn: iterate trade_date rows failed: %v\n", err)
 		}
 		if len(dates) >= 3 {
 			fmt.Printf("✅ 最近3个交易日数据完整\n")
@@ -189,9 +196,15 @@ func cmdCheckData(args []string) error {
 		totalStocks := 0
 		for rows.Next() {
 			var score, count int
-			rows.Scan(&score, &count)
+			if err := rows.Scan(&score, &count); err != nil {
+				fmt.Fprintf(os.Stderr, "warn: scan hot_score row failed: %v\n", err)
+				continue
+			}
 			totalStocks += count
 			fmt.Printf("  %d    | %d\n", score, count)
+		}
+		if err := rows.Err(); err != nil {
+			fmt.Fprintf(os.Stderr, "warn: iterate hot_score rows failed: %v\n", err)
 		}
 		fmt.Printf("\n✅ 热榜池总数: %d 只\n", totalStocks)
 		fmt.Println()

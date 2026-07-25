@@ -120,9 +120,13 @@ func saveSnapshot(data api.KlineData, snap store.Snapshot) error {
 func printAnalysis(data api.KlineData) store.Snapshot {
 	candles := data.Candles
 	dates := data.Dates
+	n := len(candles)
+	if n == 0 {
+		fmt.Fprintf(os.Stderr, "warn: %s 返回空K线,跳过分析\n", data.Code)
+		return store.Snapshot{Code: data.Code}
+	}
 	results := indicator.Calculate(candles)
 	tds := indicator.TDSequential(candles)
-	n := len(candles)
 	last := results[n-1]
 	lastCandle := candles[n-1]
 	closes := analysis.CloseSeries(candles)
@@ -198,9 +202,9 @@ func printAnalysis(data api.KlineData) store.Snapshot {
 	fmt.Printf("VolMA5=%.0f VolMA10=%.0f VolMA20=%.0f median20=%.0f | 今日量=%.0f 量比=%.2f | OBV=%s | 近5日量价: upDays=%d avgUpVol=%.0f downDays=%d avgDownVol=%.0f\n",
 		analysis.MeanTail(volumes, 5), analysis.MeanTail(volumes, 10), volMA20, analysis.MedianTail(volumes, 20),
 		lastCandle.Volume, volRatio, analysis.OBVTrend(obv), upCnt, upAvgVol, downCnt, downAvgVol)
-	fmt.Printf("SCORE total=%d delta=%+d dmi=%+d ma=%+d macd=%+d kdjwr=%+d rsi=%+d bias=%+d chopcmi=%+d volume=%+d sar=%+d div=%+d adj=%d perfadj=%+d late=%+d label=%s\n",
+	fmt.Printf("SCORE total=%d delta=%+d dmi=%+d ma=%+d macd=%+d kdjwr=%+d rsi=%+d bias=%+d chopcmi=%+d volume=%+d div=%+d adj=%d perfadj=%+d late=%+d label=%s\n",
 		score.Total, score.Delta, score.DMI, score.MA, score.MACD, score.KdjWr, score.RSI,
-		score.BIAS, score.CHOPCMI, score.Volume, score.SAR, score.Divergence, scoreAdj, perfAdj, latePen, score.Label)
+		score.BIAS, score.CHOPCMI, score.Volume, score.Divergence, scoreAdj, perfAdj, latePen, score.Label)
 	// CYQ 筹码指标(换手率数据不足时跳过)
 	if n := len(data.Turnovers); n == len(candles) && n > 0 {
 		cyq := indicator.CalcCYQ(candles, data.Turnovers)

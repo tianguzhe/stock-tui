@@ -7,14 +7,13 @@ import (
 	"math"
 	"regexp"
 	"strconv"
-	"strings"
 )
 
 const (
 	MinRSCoverage = 90.0 // RS20 覆盖率阈值（%）
 )
 
-// Compiled once; used by CdwnTopN, tdSafe, tdTopCount.
+// Compiled once; used by CdwnTopN, tdTopCount.
 var (
 	reCdwnTopN = regexp.MustCompile(`顶/(\d+)`)
 	reTopSetup = regexp.MustCompile(`见顶/(\d+)`)
@@ -182,24 +181,6 @@ func CdwnTopN(tdCountdown string) int {
 	return 0
 }
 
-// tdSafe checks TD safety: setup 见顶/8-9 or countdown 见顶/7-13 are high-risk zones.
-func tdSafe(c *Candidate) bool {
-	if strings.Contains(c.TDSetup, "见顶") {
-		matches := reTopSetup.FindStringSubmatch(c.TDSetup)
-		if len(matches) > 1 {
-			n, _ := strconv.Atoi(matches[1])
-			if n >= 8 {
-				return false
-			}
-		}
-	}
-	n := CdwnTopN(c.TDCountdown)
-	if n > 0 {
-		return n <= 6
-	}
-	return true
-}
-
 // tdTopCount returns the highest TD top count (setup or countdown).
 func tdTopCount(c *Candidate) int {
 	if matches := reTopSetup.FindStringSubmatch(c.TDSetup); len(matches) > 1 {
@@ -300,7 +281,10 @@ func ComputeTier(c *Candidate) Tier {
 	}
 
 	// Core technical requirements
-	coreTech := c.SARLong && c.SuperTrendLong && c.OBVUp && c.MACDHist > 0 && tdSafe(c)
+	// TD Sequential is deliberately excluded here — CLAUDE.md rules it out of the
+	// coreTech hard gate; its only sanctioned screener role is the tdTop>=5 && divBear
+	// joint condition inside lateStageRisk (demotion to watch, not exclusion).
+	coreTech := c.SARLong && c.SuperTrendLong && c.OBVUp && c.MACDHist > 0
 	if !coreTech {
 		return TierNone
 	}

@@ -78,11 +78,10 @@ func FetchProxyKline(client *http.Client, code string, bars int) (KlineData, err
 		"https://proxy.finance.qq.com/ifzqgtimg/appstock/app/newfqkline/get?_var=kline_dayqfq&param=%s,day,,,%d,qfq",
 		code, bars,
 	)
-	req, err := http.NewRequest(http.MethodGet, url, nil)
+	req, err := newTencentRequest(url)
 	if err != nil {
 		return KlineData{}, err
 	}
-	req.Header.Set("User-Agent", "Mozilla/5.0")
 
 	resp, err := c.Do(req)
 	if err != nil {

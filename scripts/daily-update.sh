@@ -63,8 +63,8 @@ if [ -f "$PROJECT_ROOT/.holdings" ]; then
   ./scripts/screen-stocks.sh --holdings "$HOLDINGS"
 else
   echo "未配置持仓文件 (.holdings)，跳过选股表生成"
-  echo "提示：可创建 .holdings 文件，格式如："
-  echo "  sh601138:72.825:400,sh600522:50.876:200"
+  echo "提示：可创建 .holdings 文件，格式如（代码:成本:手数,1手=100股）："
+  echo "  sh601138:72.825:4,sh600522:50.876:2"
 fi
 echo ""
 

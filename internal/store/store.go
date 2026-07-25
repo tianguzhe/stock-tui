@@ -795,6 +795,7 @@ WHERE trade_date = ?
 			`UPDATE snapshot SET rs20=?, rs60=?, rs120=? WHERE code=? AND trade_date=?`,
 			rank20[i], rank60[i], rank120[i], e.code, e.tradeDate)
 		if err != nil {
+			fmt.Fprintf(os.Stderr, "warn: update rs rank failed for %s@%s: %v\n", e.code, e.tradeDate, err)
 			lastErr = err
 		} else {
 			updated++

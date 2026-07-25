@@ -26,6 +26,18 @@ func TestCostWeightsTwoDay(t *testing.T) {
 	assertNear(t, "w[1](new)", w[1], 2.0/3, 1e-4)
 }
 
+// TestRawWeightSum pins the pre-normalization sum used by CYQResult.WeightSum
+// to 1-Π(1-turn), independently of costWeights' normalized output — this is
+// the exact bug the field previously had (it summed the normalized weights,
+// which are always ≈1, instead of this raw value).
+func TestRawWeightSum(t *testing.T) {
+	assertNear(t, "single day 0.5", rawWeightSum([]float64{0.5}), 0.5, 1e-9)
+	assertNear(t, "two day 0.5/0.5", rawWeightSum([]float64{0.5, 0.5}), 0.75, 1e-9)
+	assertNear(t, "all zero", rawWeightSum([]float64{0, 0, 0}), 0, 1e-9)
+	assertNear(t, "full turnover", rawWeightSum([]float64{0.1, 0, 1.0}), 1.0, 1e-9)
+	assertNear(t, "clamp out of range", rawWeightSum([]float64{-0.5, 1.5}), 1.0, 1e-9)
+}
+
 // TestCostWeightsZeroTurnover 全部换手率为 0: 权重全为 0(归一化退化)。
 func TestCostWeightsZeroTurnover(t *testing.T) {
 	w := costWeights([]float64{0, 0, 0})
@@ -137,7 +149,8 @@ func TestCalcCYQWithOpen(t *testing.T) {
 	assertNear(t, "WinnerLow(30)", last.WinnerLow, 1.0, 1e-4)
 	// CYQK Length = (1.0-1.0)*100 = 0
 	assertNear(t, "CYQK_Length", last.CYQK_Length, 0, 1e-9)
-	assertNear(t, "WeightSum", last.WeightSum, 1.0, 1e-9)
+	// 两日换手 0.5/0.5 → WeightSum(归一化前) = 1-(1-0.5)*(1-0.5) = 0.75
+	assertNear(t, "WeightSum", last.WeightSum, 0.75, 1e-9)
 }
 
 // TestCalcCYQPartialProfit 两日成本[10, 30],当前 close=20 介于中间,
@@ -210,7 +223,7 @@ func TestCalcCYQSingleDay(t *testing.T) {
 	// ASR ±10%:[10.8,13.2]; 成本 10<=13.2 → wUp=1, 成本 10<=10.8 → wDn=1 → (1-1)*100=0
 	assertNear(t, "ASR single-day", r.ASR, 0, 1e-9)
 	// WeightSum = sum before normalize = 0.5 (1*0.5)
-	assertNear(t, "WeightSum", r.WeightSum, 1.0, 1e-9)
+	assertNear(t, "WeightSum", r.WeightSum, 0.5, 1e-9)
 }
 
 // ---------------------------------------------------------------------------

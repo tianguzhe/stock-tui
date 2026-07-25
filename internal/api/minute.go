@@ -40,7 +40,7 @@ func FetchMinute(code string) (*MinuteResult, error) {
 		return nil, err
 	}
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 10<<20))
 	if err != nil {
 		return nil, fmt.Errorf("读取响应失败: %w", err)
 	}
