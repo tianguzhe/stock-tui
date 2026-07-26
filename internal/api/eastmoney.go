@@ -121,7 +121,12 @@ func NewEMRequest(url string) (*http.Request, error) {
 }
 
 // emFetchWithRetry 东财请求重试封装(内部版)。
+//
+// client 为 nil 时回退包内默认 client，与 FetchProxyKline / FetchEMKline 等
+// 导出入口的约定保持一致——否则导出的 FetchEMWithRetry 传 nil 会直接 panic
+// 在 client.Do 上，而同包其他函数都接受 nil。
 func emFetchWithRetry(client *http.Client, url string) ([]byte, error) {
+	client = httpClientOrDefault(client)
 	for attempt := 0; attempt < 3; attempt++ {
 		req, err := newEMRequest(url)
 		if err != nil {

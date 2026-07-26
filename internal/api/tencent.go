@@ -25,10 +25,14 @@ type Stock struct {
 	Volume       float64 // 成交量(手)
 	Amount       float64 // 成交额(万元)
 	TurnoverRate float64 // 换手率 % (field index 38)
-	PE           float64 // 市盈率动态 (field index 39)
-	MarketCap    float64 // 总市值 亿元 (field index 45)
-	Precision    int     // 价格小数位数（从原始字符串检测）
-	UpdatedAt    time.Time
+	// PE 口径存疑(field index 39): 2026-07-25 实测东材科技腾讯[39]=110.79,
+	// 而东财 f162(动态市盈率)=56.39,约差 2 倍(疑为静态 PE 按上年报计);
+	// 工商银行两者接近(7.44)因银行利润稳定。目前 PE 仅落库展示、不进任何
+	// 筛选逻辑,故未深究。若要用于选股须先确认口径。
+	PE        float64
+	MarketCap float64 // 总市值 亿元 (field index 45)
+	Precision int     // 价格小数位数（从原始字符串检测）
+	UpdatedAt time.Time
 }
 
 var reStock = regexp.MustCompile(`v_([a-z]{2}\d+)="([^"]+)"`)

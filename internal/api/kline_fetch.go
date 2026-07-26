@@ -25,7 +25,7 @@ type KlineData struct {
 	Candles    []indicator.Candle
 	Turnovers  []float64 // 换手率(小数, 0.0047 = 0.47%)
 	Amplitudes []float64 // 振幅 % = (高-低)/昨收 × 100
-	VolRatioRT float64   // 量比(实时, qt[46])
+	VolRatioRT float64   // 量比(实时, qt[49]; 注意 qt[46] 是市净率不是量比)
 	InsideVol  float64   // 内盘(手, 主动卖)
 	OutsideVol float64   // 外盘(手, 主动买)
 }
@@ -117,19 +117,7 @@ func FetchProxyKline(client *http.Client, code string, bars int) (KlineData, err
 		return KlineData{}, fmt.Errorf("no klines for %s", code)
 	}
 
-	name := code
-	var volRatioRT, insideVol, outsideVol float64
-	if q, ok := raw.Qt[code]; ok && len(q) > 1 {
-		name = rawJSONCell(q[1])
-		// proxy.qq.com qt: [7]内盘手 [8]外盘手 [46]量比
-		if len(q) > 46 {
-			volRatioRT = parseFloatCell(rawJSONCell(q[46]))
-		}
-		if len(q) > 8 {
-			insideVol = parseFloatCell(rawJSONCell(q[7]))
-			outsideVol = parseFloatCell(rawJSONCell(q[8]))
-		}
-	}
+	name, volRatioRT, insideVol, outsideVol := parseProxyQt(raw.Qt[code], code)
 
 	parsedBars, err := ParseProxyDailyBars(rows)
 	if err != nil {
@@ -154,6 +142,48 @@ func FetchProxyKline(client *http.Client, code string, bars int) (KlineData, err
 		Turnovers: turnovers, Amplitudes: amplitudes,
 		VolRatioRT: volRatioRT, InsideVol: insideVol, OutsideVol: outsideVol,
 	}, nil
+}
+
+// qt 数组索引。proxy.qq.com 的实时盘口摘要，2026-07-25 用六只标的实测确认
+// （详见 docs/data-apis.md）。定位方法：qtLimitUp/qtLimitDown 精确等于
+// 昨收×1.1 / ×0.9，以此锚定整段偏移，再验证相邻字段。
+const (
+	qtName       = 1  // 简称
+	qtOutsideVol = 7  // 外盘(主动买, 手)
+	qtInsideVol  = 8  // 内盘(主动卖, 手)
+	qtPB         = 46 // 市净率 —— 不是量比！ETF 无 PB 返回 0.00
+	qtLimitUp    = 47 // 涨停价
+	qtLimitDown  = 48 // 跌停价
+	qtVolRatio   = 49 // 量比
+)
+
+// parseProxyQt 从 proxy.qq.com 的 qt 实时摘要提取名称、量比与内外盘。
+// q 为空或过短时按缺失处理：名称回退代码本身，数值留零由调用方回退本地计算。
+//
+// ⚠ 历史缺陷（2026-07-25 修正）：曾把 qtPB(46) 当作量比。个股 PB 在 1~7 量级，
+// 远高于 VolSurge=1.5 / VolStrong=2.0，于是几乎所有个股都被判成"放量"，
+// 系统性污染 score.Volume、evalBullBear 资金维度与 screener 的量比门槛。
+// 而 ETF 没有 PB（返回 0.00）会触发 `<=0` 的本地回退，恰好显示正常——
+// 这让错误只在个股上出现，长期未被发现。
+//
+// ⚠ 内外盘方向：实测 6/6 中上涨标的 [7]>[8]、下跌标的 [7]<[8]，
+// 故 [7] 是主动买、[8] 是主动卖（旧实现两者颠倒）。
+func parseProxyQt(q []json.RawMessage, code string) (name string, volRatio, insideVol, outsideVol float64) {
+	name = code
+	if len(q) <= qtName {
+		return
+	}
+	if n := rawJSONCell(q[qtName]); n != "" {
+		name = n
+	}
+	if len(q) > qtVolRatio {
+		volRatio = parseFloatCell(rawJSONCell(q[qtVolRatio]))
+	}
+	if len(q) > qtInsideVol {
+		outsideVol = parseFloatCell(rawJSONCell(q[qtOutsideVol]))
+		insideVol = parseFloatCell(rawJSONCell(q[qtInsideVol]))
+	}
+	return
 }
 
 // FetchEMKline 从东财 push2his 拉前复权日K，用作腾讯日K的 HTTP fallback。
