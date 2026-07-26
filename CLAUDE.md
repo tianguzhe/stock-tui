@@ -20,7 +20,10 @@
 
 ### 数据源优先级与口径（2026-07 更新）
 - **默认 / `-save`**：**HTTP 前复权主力**——腾讯 **proxy `newfqkline` 前复权**为主（量单位**手**×100 转股；`row[7]`=**换手率%**→小数；`row[8]`=**成交额万元**→×10000 转元；`row[6]` 恒为 `{}` 无业务值；**振幅**不在 K 行，本地 `(H-L)/昨收×100`）。换手优先用 proxy `row[7]`，全 0 时才东财 f61 / TDX 流通股本兜底。**腾讯失败 → 东财全日 K fallback**（`push2his`，Amount 已是元 + 换手 + 振幅 f58）。东财请求需带 `Referer` + 完整 UA + 反限流重试；批量 worker 建议 `DisableKeepAlives: true`。字段布局与实测见 `docs/data-apis.md`。
-- **量比 `vol_ratio`**：优先腾讯 proxy qt 实时量比（`VolRatioRT`，**qt 索引 49**）；`<=0` 或缺 qt（东财 fallback）时回退本地 `Volume/MA20`。两套定义接近但**非同一指标**；score/screener 用落库 `vol_ratio`。阈值口径不变（0.8 / 1.5）。
+- **量比 `vol_ratio`**：优先腾讯 proxy qt 实时量比（`VolRatioRT`，**qt 索引 49**）；`<=0` 或缺 qt（东财 fallback）时回退 `analysis.VolRatio`。**两条路径现为同一口径**（不再是"接近但非同一指标"）；score/screener 用落库 `vol_ratio`。阈值不变（0.8 / 1.5）。
+  - **口径定义**：`量比 = 当日成交量 / 前 5 日（不含当日）平均成交量`。经实测反解腾讯 qt[49]，5 只标的全部吻合到小数点后两位（东材 0.767/0.77、工行 0.694/0.69、农行 0.792/0.79、华安 1.081/1.08、华天 0.958/0.96）
+  - ⚠️ **不是 `Volume/MA20`**：窗口是 5 不是 20，且**不含当日**。旧实现用 MA20（含当日），工行实测 0.758 vs 真值 0.69 差 10%。所有量比判断（`batch-save` / CLI 顶部 / `EvalSignals` / CLI 近15日行的放量缩量标签）统一走 `analysis.VolRatio`，改一处即全体同步
+  - **历史脏数据回填**：`go run ./cmd/stockdb repair-volratio [--dry-run]`。`batch-save` 只写当日行，qt[46] 时期的历史错误值需本命令重算。`inside_vol`/`outside_vol` 是当日实时盘口、历史不可追溯，受影响历史行一律置 NULL（不保留方向颠倒的值）
   - ⚠️ **索引 46 是市净率 PB，不是量比**（2026-07-25 修正，此前一直取错）。个股 PB 在 1~7 量级，远高于 `VolSurge`=1.5 / `VolStrong`=2.0，导致几乎所有个股被判成"放量"；ETF 无 PB 返回 `0.00` 恰好触发本地回退而显示正常，使错误只出现在个股上、长期隐蔽。字段定位锚点：`[47]`/`[48]` 精确等于昨收×1.1/×0.9。已由东财 `f50`(量比)/`f167`(市净率)/`f49`(外盘)/`f161`(内盘) 逐位交叉验证，见 `docs/data-apis.md`
   - ⚠️ **内外盘方向**：`qt[7]` 是**外盘(主动买)**、`qt[8]` 是**内盘(主动卖)**，此前两者颠倒（东财 `f49`/`f161` 已验证）
 - **两套换手率（勿混）**：
@@ -244,9 +247,12 @@
 ```bash
 # 0. 【必须第一步】更新同花顺热榜（确保 instrument 表在批量 -save 前已更新）
 ./scripts/import-hot-stocks.sh
-# ⚠️ 热榜脚本会清理不在热榜中的冷门代码。持仓/常看标的若不在热榜，
-#    会被踢出 instrument，后续 batch-save 不会覆盖它们——需事后
-#    INSERT OR IGNORE 补回，或改 hot 逻辑保留 note=holdings。
+# ⚠️ 热榜脚本清理不在榜的冷门代码（hot_score 每日 -1，归零即删）。
+#    ✅ 持仓已豁免：`note='holdings'` 的行不参与清理（2026-07-25 起）。
+#    标记由 `stockdb screen`（非 dry-run）在写 decision_log 时自动打，
+#    也可手动 `store.MarkHoldings`。**新买入的标的要跑一次正式 screen
+#    才会获得豁免**，否则冷门期仍可能被清掉。
+#    常看但未持仓的标的不在豁免范围，仍需自行留意。
 
 # 1. 收盘后批量更新快照（含换手率/市值/PE + low20/obv_up3；并行 Go 进程，全量约 90 秒）
 go run ./cmd/stockdb batch-save -P 4
