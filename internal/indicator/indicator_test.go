@@ -248,6 +248,83 @@ func TestCalculateSARUptrendThenReverse(t *testing.T) {
 	}
 }
 
+// TestCalculateSARReversalRespectsPenetrationRule guards Wilder's rule that the
+// SAR may never sit inside the price range of the reversal bar or the two bars
+// before it. On a flip the SAR jumps to the old EP, which can land inside the
+// current bar — without re-clamping in the NEW direction the next bar pierces it
+// immediately and the stance flips straight back (whipsaw).
+//
+// Invariant checked on every reversal bar: a fresh short SAR must be at or above
+// the recent highs, a fresh long SAR at or below the recent lows.
+func TestCalculateSARReversalRespectsPenetrationRule(t *testing.T) {
+	// The clamp only bites when the reversal bar ALSO makes a new extreme: the
+	// SAR jumps to the old EP, and an EP below this bar's high lands inside the
+	// bar. Build exactly that — a steady advance, then one huge outside bar that
+	// prints a new high (above EP) while collapsing through the trailing stop.
+	var candles []Candle
+	for i := 0; i < 15; i++ {
+		c := 10 + float64(i)
+		candles = append(candles, Candle{High: c + 0.5, Low: c - 0.5, Close: c})
+	}
+	// EP is now 24.5 (bar14 high). This bar tops it at 26 yet crashes to 20.
+	candles = append(candles, Candle{High: 26, Low: 20, Close: 21})
+	// A bounce that clears the OLD ep (24.5) but not the properly clamped SAR.
+	candles = append(candles, Candle{High: 25, Low: 21, Close: 24})
+	candles = append(candles, Candle{High: 24, Low: 20, Close: 21})
+
+	res := Calculate(candles)
+	if res[15].SAR.Long || !res[15].SAR.Reversed {
+		t.Fatalf("bar15 should flip to short: long=%v reversed=%v", res[15].SAR.Long, res[15].SAR.Reversed)
+	}
+	if res[15].SAR.Value < candles[15].High {
+		t.Errorf("bar15 short SAR=%v sits below the bar's own high %v — old EP left inside the bar",
+			res[15].SAR.Value, candles[15].High)
+	}
+	if res[16].SAR.Reversed {
+		t.Errorf("bar16 flipped straight back to long (whipsaw): SAR=%v vs bar16 high %v",
+			res[16].SAR.Value, candles[16].High)
+	}
+	reversals := 0
+	for i := 1; i < len(candles); i++ {
+		if !res[i].SAR.Reversed {
+			continue
+		}
+		reversals++
+		hi, lo := candles[i].High, candles[i].Low
+		if candles[i-1].High > hi {
+			hi = candles[i-1].High
+		}
+		if candles[i-1].Low < lo {
+			lo = candles[i-1].Low
+		}
+		if i >= 2 {
+			if candles[i-2].High > hi {
+				hi = candles[i-2].High
+			}
+			if candles[i-2].Low < lo {
+				lo = candles[i-2].Low
+			}
+		}
+		if res[i].SAR.Long {
+			if res[i].SAR.Value > lo {
+				t.Errorf("bar%d flipped long but SAR=%v sits above recent low %v (penetrates price)",
+					i, res[i].SAR.Value, lo)
+			}
+		} else if res[i].SAR.Value < hi {
+			t.Errorf("bar%d flipped short but SAR=%v sits below recent high %v (penetrates price)",
+				i, res[i].SAR.Value, hi)
+		}
+		// The flip must stick for at least one bar — an immediate flip-back is
+		// exactly the whipsaw the clamp exists to prevent.
+		if i+1 < len(res) && res[i+1].SAR.Reversed {
+			t.Errorf("bar%d reversal immediately flipped back on bar%d (whipsaw)", i, i+1)
+		}
+	}
+	if reversals == 0 {
+		t.Fatal("fixture produced no reversal — the invariant above was never exercised")
+	}
+}
+
 // TestCalculateKeltnerSqueeze holds the close flat (std=0 → BOLL collapses to the
 // mean) while every bar carries an intraday range (ATR>0 → Keltner stays wide).
 // The Bollinger band then sits entirely inside the Keltner channel = squeeze on,

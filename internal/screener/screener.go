@@ -4,9 +4,11 @@ package screener
 import (
 	"database/sql"
 	"fmt"
-	"math"
 	"regexp"
 	"strconv"
+
+	"stock-tui/internal/analysis"
+	"stock-tui/internal/market"
 )
 
 const (
@@ -50,7 +52,7 @@ type Candidate struct {
 	ATRPct            float64
 	Streak            int
 	MA20              float64
-	Low20             float64 // 近 20 日最低价,作 SAR 失效(空头)时的止损回退
+	Low20             float64 // 近 20 日最低价(落库列,由完整日K算得),作 SAR 失效(空头)时的止损回退
 	SARLong           bool
 	SuperTrendLong    bool
 	OBVUp             bool
@@ -86,31 +88,14 @@ type Candidate struct {
 	SortKey float64
 }
 
-// WilsonBounds computes Wilson 95% confidence interval for win rate.
-// Returns (lower_bound%, upper_bound%).
-//
-// Small sample water: N=10, win=40% → lower≈17%, upper≈69% — statistically meaningless.
-// Rule: exclusion requires lower>50 (signal significantly better than coin flip);
-// "historically bad" requires upper<50 (significantly worse than coin flip).
-func WilsonBounds(winPct float64, n int) (lower, upper float64) {
-	const z = 1.96 // 95% confidence
-	if n == 0 {
-		return 0.0, 100.0
-	}
-	// Clamp to [0,1] to avoid NaN from sqrt of negative value.
-	p := math.Max(0, math.Min(1, winPct/100.0))
-	denom := 1 + z*z/float64(n)
-	centre := p + z*z/(2*float64(n))
-	margin := z * math.Sqrt(p*(1-p)/float64(n)+z*z/(4*float64(n)*float64(n)))
-	lower = (centre - margin) / denom * 100
-	upper = (centre + margin) / denom * 100
-	return
-}
-
 // MarketBreadth computes % of stocks above MA20.
 // Momentum crash protection (Daniel & Moskowitz 2016): when breadth collapses,
 // chasing momentum stocks concentrates drawdown risk — capping recommendation count
 // is more effective than any individual stock filter.
+//
+// With no measurable candidates the breadth is unknown, and this feeds a risk
+// gate: returning 100 would silently disable the recommendation cap exactly when
+// we know least. Fail toward the protective side and report 0 so the cap engages.
 func MarketBreadth(candidates []Candidate) float64 {
 	var total, above int
 	for _, c := range candidates {
@@ -122,16 +107,22 @@ func MarketBreadth(candidates []Candidate) float64 {
 		}
 	}
 	if total == 0 {
-		return 100.0
+		return 0.0
 	}
 	return float64(above) / float64(total) * 100
 }
 
 // fundOK checks fundamental hard thresholds:
-// - Valid market cap & turnover rate
-// - Market cap ≥ 20B CNY
-// - Turnover rate 0.3% – 20%
+//   - Not risk-flagged (ST/*ST): delisting risk and thin liquidity put these
+//     outside the project's technical short-swing mandate.
+//   - Valid market cap & turnover rate
+//   - Market cap ≥ 20 亿元 (snapshot.market_cap is denominated in 亿元 — measured
+//     range on 2026-07-24 was 4.25 … 27621)
+//   - Turnover rate 0.3% – 20%
 func fundOK(c *Candidate) bool {
+	if market.IsST(c.Name) {
+		return false
+	}
 	if c.MarketCap <= 0 || c.TurnoverRate <= 0 {
 		return false
 	}
@@ -151,7 +142,7 @@ func fundOK(c *Candidate) bool {
 func perfOK(c *Candidate) bool {
 	// Trend follow bad
 	if c.PerfTrendFollowBullWin10.Valid && c.PerfTrendFollowBullN.Valid {
-		_, hi := WilsonBounds(c.PerfTrendFollowBullWin10.Float64, int(c.PerfTrendFollowBullN.Int64))
+		_, hi := analysis.WilsonBounds(c.PerfTrendFollowBullWin10.Float64, int(c.PerfTrendFollowBullN.Int64))
 		if hi < 50 {
 			return false
 		}
@@ -163,7 +154,7 @@ func perfOK(c *Candidate) bool {
 	}
 	// Overbought historically effective
 	if c.SigOverbought && c.PerfOverboughtBearWin10.Valid && c.PerfOverboughtBearN.Valid {
-		lo, _ := WilsonBounds(c.PerfOverboughtBearWin10.Float64, int(c.PerfOverboughtBearN.Int64))
+		lo, _ := analysis.WilsonBounds(c.PerfOverboughtBearWin10.Float64, int(c.PerfOverboughtBearN.Int64))
 		if lo > 50 {
 			return false
 		}
@@ -202,7 +193,7 @@ func divBearState(c *Candidate) string {
 	if !c.PerfDivBearWin10.Valid || !c.PerfDivBearN.Valid || c.PerfDivBearN.Int64 == 0 {
 		return "watch"
 	}
-	lo, _ := WilsonBounds(c.PerfDivBearWin10.Float64, int(c.PerfDivBearN.Int64))
+	lo, _ := analysis.WilsonBounds(c.PerfDivBearWin10.Float64, int(c.PerfDivBearN.Int64))
 	if lo > 50 {
 		return "exclude"
 	}
@@ -264,14 +255,18 @@ func ComputeTier(c *Candidate) Tier {
 	chg := c.ChangePct
 	vr := c.VolRatio
 
-	// ±9.5 gate implies 10% limit assumption for main board
-	if chg <= -9.5 {
-		return TierNone
+	// Near-limit gate, scaled to the instrument's actual board limit: locked at
+	// the limit means you cannot get filled (up) or are in a panic tape (down).
+	// A flat ±9.5 would treat an ordinary 12% ChiNext move as a limit-up and a
+	// genuine ST limit (±5%) as unremarkable. Markets without a limit (HK) have
+	// no such bar to detect, so the gate is skipped rather than given a number.
+	if limit := market.PriceLimitPct(c.Code, c.Name); limit != market.NoPriceLimit {
+		nearLimit := limit - 0.5
+		if chg <= -nearLimit || chg >= nearLimit {
+			return TierNone
+		}
 	}
 	if chg <= -5.0 && vr > 1.5 {
-		return TierNone
-	}
-	if chg >= 9.5 {
 		return TierNone
 	}
 
@@ -394,11 +389,34 @@ func effectiveStop(c *Candidate) (stop float64, ok bool) {
 	return 0, false
 }
 
-// PositionHint computes suggested position size based on 1% risk per trade.
+// PositionHint computes suggested position size based on RiskPerTrade of capital.
 //
 // risk per share = Close - effectiveStop. When no in-below-price stop exists
 // (SAR bearish AND no 20-day low below close), we cannot bound the risk, so
 // advise waiting instead of fabricating a position size.
+//
+// A stop sitting almost on top of the price is the dangerous case: position
+// value = capital * RiskPerTrade * Close / riskPerShare, so as the stop
+// distance shrinks the suggested size grows without bound. Measured on
+// 2026-07-24, sh603927 (close 12.80, SAR 12.795 — 0.04% away) sized to 135,900
+// shares ≈ 1.74M CNY against 68k of capital. A stop that tight is also
+// meaningless on its own terms: routine intraday noise takes it out.
+//
+// MinStopPct rejects those outright. It doubles as the position cap: with
+// riskPerShare >= Close*MinStopPct, position value is at most
+// capital*RiskPerTrade/MinStopPct = 50% of capital, so no separate
+// capital ceiling is needed.
+const (
+	RiskPerTrade = 0.01 // fraction of capital risked per trade
+	MinStopPct   = 0.02 // reject stops closer than this to the current price
+	// Absolute tolerance on the MinStopPct comparison. Subtracting two prices
+	// loses a few ulps (10.0-9.8 = 0.19999999999999996 < 10.0*0.02), which would
+	// otherwise reject a stop sitting exactly on the threshold while the message
+	// reports it as "2.00%". Prices here are single digits to a few hundred CNY,
+	// so 1e-9 is far below any meaningful stop distance.
+	stopEpsilon = 1e-9
+)
+
 func PositionHint(c *Candidate, capital float64) string {
 	if capital == 0 || c.Close == 0 {
 		return ""
@@ -411,7 +429,10 @@ func PositionHint(c *Candidate, capital float64) string {
 	if riskPerShare <= 0 {
 		return "止损距离过宽，建议观望"
 	}
-	shares := int(capital*0.01/riskPerShare/100) * 100
+	if riskPerShare < c.Close*MinStopPct-stopEpsilon {
+		return fmt.Sprintf("止损贴身(%.2f%%)，等回踩确认", riskPerShare/c.Close*100)
+	}
+	shares := int(capital*RiskPerTrade/riskPerShare/100) * 100
 	if shares <= 0 {
 		return "止损距离过宽，建议观望"
 	}
@@ -453,14 +474,7 @@ func LoadSnapshots(dbPath string) (date string, candidates []Candidate, rsCovera
 		       COALESCE(s.score_adj, s.score_total) AS score_total,
 		       s.adx, s.change_pct, s.close,
 		       s.sar_long, s.supertrend_long, s.obv_up,
-		       (SELECT COALESCE(SUM(obv_up), 0) FROM snapshot s2
-		        WHERE s2.code = s.code
-		          AND s2.trade_date IN (
-		            SELECT s3.trade_date FROM snapshot s3
-		            WHERE s3.code = s.code
-		              AND s3.trade_date <= s.trade_date
-		            ORDER BY s3.trade_date DESC LIMIT 3
-		          )) AS obv_3day_sum,
+		       COALESCE(s.obv_up3, 0) AS obv_up3,
 		       s.macd_hist, s.vol_ratio,
 		       s.td_setup, s.td_countdown,
 		       s.div_bear, s.sig_overbought,
@@ -469,14 +483,7 @@ func LoadSnapshots(dbPath string) (date string, candidates []Candidate, rsCovera
 		       COALESCE(s.pe, 0) AS pe,
 		       s.rs20, s.rs60, s.rs120,
 		       s.bias24, s.atr_pct, s.streak, s.ma20,
-		       (SELECT COALESCE(MIN(s3.low), 0) FROM snapshot s3
-		        WHERE s3.code = s.code
-		          AND s3.trade_date IN (
-		            SELECT trade_date FROM snapshot
-		            WHERE trade_date <= s.trade_date
-		            GROUP BY trade_date
-		            ORDER BY trade_date DESC LIMIT 20
-		          )) AS low20,
+		       COALESCE(s.low20, 0) AS low20,
 		       s.perf_trend_follow_bull_win10,
 		       s.perf_overbought_bear_win10,
 		       s.perf_div_bear_win10,
@@ -499,11 +506,11 @@ func LoadSnapshots(dbPath string) (date string, candidates []Candidate, rsCovera
 
 	for rows.Next() {
 		var c Candidate
-		var sarLongInt, stLongInt, obvUpInt, obv3daySumInt, divBearInt, sigOBInt, keltSqInt, d20Int, d55Int int
+		var sarLongInt, stLongInt, obvUpInt, obvUp3Int, divBearInt, sigOBInt, keltSqInt, d20Int, d55Int int
 		err = rows.Scan(
 			&c.Code, &c.Name, &c.HotScore,
 			&c.ScoreTotal, &c.ADX, &c.ChangePct, &c.Close,
-			&sarLongInt, &stLongInt, &obvUpInt, &obv3daySumInt,
+			&sarLongInt, &stLongInt, &obvUpInt, &obvUp3Int,
 			&c.MACDHist, &c.VolRatio,
 			&c.TDSetup, &c.TDCountdown,
 			&divBearInt, &sigOBInt,
@@ -527,7 +534,7 @@ func LoadSnapshots(dbPath string) (date string, candidates []Candidate, rsCovera
 		c.SARLong = sarLongInt == 1
 		c.SuperTrendLong = stLongInt == 1
 		c.OBVUp = obvUpInt == 1
-		c.OBVUp3Day = obv3daySumInt >= 3
+		c.OBVUp3Day = obvUp3Int == 1
 		c.DivBear = divBearInt == 1
 		c.SigOverbought = sigOBInt == 1
 		c.KeltnerSqueeze = keltSqInt == 1

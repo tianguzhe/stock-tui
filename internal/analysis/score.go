@@ -251,12 +251,11 @@ func ScoreResult(candles []indicator.Candle, results []indicator.Result, obv []f
 	case volRatio < VolQuiet && priceDown:
 		score.Volume++
 	}
-	if len(obv) >= 6 {
-		if obv[n-1] > obv[n-6] {
-			score.Volume++
-		} else if obv[n-1] < obv[n-6] {
-			score.Volume--
-		}
+	switch d := OBVDelta(obv); {
+	case d > 0:
+		score.Volume++
+	case d < 0:
+		score.Volume--
 	}
 	if avgUpVol > avgDownVol {
 		score.Volume++
@@ -269,22 +268,38 @@ func ScoreResult(candles []indicator.Candle, results []indicator.Result, obv []f
 	// 按 CLAUDE.md「只作 stance 印证与移动止损参考，不叠加计分」，不再单独计分。
 
 	if n >= 20 {
-		div := Divergence(candles, results, n-1)
-		if div.BearToday {
-			score.Divergence = -3
-		} else if div.Bear {
-			score.Divergence = -1
-		}
-		if div.BullToday {
-			score.Divergence = 2
-		} else if div.Bull {
-			score.Divergence = 1
-		}
+		score.Divergence = DivergenceScore(Divergence(candles, results, n-1))
 	}
 
 	score.Delta = score.DMI + score.MA + score.MACD + score.KdjWr + score.RSI + score.BIAS + score.CHOPCMI + score.Volume + score.Divergence
 	score.Total = ClampInt(50+score.Delta, 0, 100)
 	score.Label = ScoreLabel(score.Total)
+	return score
+}
+
+// DivergenceScore 把背离状态映射为评分贡献。
+//
+// 顶背离与底背离**分别计分后相加**,不能后者覆盖前者。二者当日互斥
+// (顶背离要求 RSI6>60、底背离要求 RSI6<40),但 Divergence 有 recentWindow=3
+// 的记忆窗口,所以「当日顶背离 + 3 日内底背离」在急涨行情中完全可达
+// (3 天前 RSI 38,今天 RSI 62)。旧实现按顺序覆盖,这种情形下 -3 会被 +1
+// 抹掉成 +1——当日顶背离不但丢失,方向还反了,误差 4 分。
+//
+// 当日成立权重更高(顶 -3 / 底 +2),窗口内非当日降一档(顶 -1 / 底 +1)。
+func DivergenceScore(d DivergenceState) int {
+	score := 0
+	switch {
+	case d.BearToday:
+		score -= 3
+	case d.Bear:
+		score--
+	}
+	switch {
+	case d.BullToday:
+		score += 2
+	case d.Bull:
+		score++
+	}
 	return score
 }
 
@@ -550,15 +565,28 @@ func PerfWin10(perfs []PerfStat, name string) (float64, int) {
 	return 0, 0
 }
 
-// PerfScale 按本股历史胜率重算惩罚值。
+// PerfScale 按本股历史胜率重算惩罚值(仅作用于负分惩罚)。
+//
+// 用 Wilson 95% 置信界而非点估计判定显著性,与 screener 的准入门槛同一把尺:
+//   - 上界 < weakBelow: 有把握说本股该信号历史确实差 → 惩罚减半
+//   - 下界 > strongAbove: 有把握说历史确实有效 → 惩罚加权 1.5 倍
+//   - 其余(含小样本): 区间太宽,不足以下结论 → 原样保留
+//
+// 旧实现用 win 点估计 + n>=10 硬门槛,n=10、win=30% 就把惩罚砍半,而这组数据
+// 的 Wilson 上界约 60%——统计上完全无法断定「历史差」,属于小样本过拟合。
+// 改用置信界后小样本自动失去调权能力,惩罚倾向于原样保留(更保守)。
+//
+// 整数除法向零取整: -3/2 = -1(减了 2/3 而非一半), -3*3/2 = -4。惩罚值域很小
+// (|v| <= 7),这点粒度损失可以接受,不引入浮点。
 func PerfScale(v int, win float64, n int, weakBelow, strongAbove float64) int {
-	if v >= 0 || n < 10 {
+	if v >= 0 {
 		return v
 	}
-	if win < weakBelow {
+	lo, hi := WilsonBounds(win, n)
+	if hi < weakBelow {
 		return v / 2
 	}
-	if win > strongAbove {
+	if lo > strongAbove {
 		return v * 3 / 2
 	}
 	return v

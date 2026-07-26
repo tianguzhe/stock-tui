@@ -103,42 +103,54 @@ func TestApplyPerfAdaptive(t *testing.T) {
 			wantAdj: 0, wantTotal: 35,
 		},
 		{
-			name:  "超买历史无效(win<35)惩罚减半向零截断",
+			// Wilson 上界 34.8% < 35% → 有把握说历史差,惩罚减半
+			name:  "超买历史显著差(上界<35)惩罚减半向零截断",
 			score: base(true, 0),
-			perfs: []analysis.PerfStat{perfStatOf("超买反转", 20, 30)},
+			perfs: []analysis.PerfStat{perfStatOf("超买反转", 40, 20)},
 			// -7→-3(+4) -5→-2(+3) -3→-1(+2) → adj=+9, total=35+9=44
 			wantAdj: 9, wantTotal: 44,
 		},
 		{
-			name:  "超买历史有效(win>55)惩罚x1.5",
+			// Wilson 下界 70.9% > 55% → 有把握说历史有效,惩罚加权
+			name:  "超买历史显著有效(下界>55)惩罚x1.5",
 			score: base(true, 0),
-			perfs: []analysis.PerfStat{perfStatOf("超买反转", 20, 60)},
+			perfs: []analysis.PerfStat{perfStatOf("超买反转", 40, 85)},
 			// -7→-10(-3) -5→-7(-2) -3→-4(-1) → adj=-6, total=35-6=29
 			wantAdj: -6, wantTotal: 29,
 		},
 		{
-			name:    "样本不足(n<10)不调整",
+			// 关键回归: 旧实现(点估计 win=30 < 35 且 n>=10)会把惩罚砍半。
+			// Wilson 区间 [14.6, 51.9] 跨越 50%,统计上说明不了任何问题。
+			name:    "点估计偏低但区间过宽_不调整",
 			score:   base(true, 0),
-			perfs:   []analysis.PerfStat{perfStatOf("超买反转", 9, 0)},
+			perfs:   []analysis.PerfStat{perfStatOf("超买反转", 20, 30)},
 			wantAdj: 0, wantTotal: 35,
 		},
 		{
-			name:    "中间胜率(35-55)不调整",
+			name:    "样本不足不调整",
+			score:   base(true, 0),
+			perfs:   []analysis.PerfStat{perfStatOf("超买反转", 5, 50)},
+			wantAdj: 0, wantTotal: 35,
+		},
+		{
+			name:    "中间胜率不调整",
 			score:   base(true, 0),
 			perfs:   []analysis.PerfStat{perfStatOf("超买反转", 20, 45)},
 			wantAdj: 0, wantTotal: 35,
 		},
 		{
-			name:  "顶背离历史无效(win<40)惩罚减半",
+			// Wilson 上界 34.3% < 40%
+			name:  "顶背离历史显著差(上界<40)惩罚减半",
 			score: base(false, -3),
 			perfs: []analysis.PerfStat{perfStatOf("顶背离", 100, 25)},
 			// -3→-1(+2), total = 50-18+2 = 34
 			wantAdj: 2, wantTotal: 34,
 		},
 		{
-			name:  "顶背离历史有效(win>55)惩罚x1.5",
+			// Wilson 下界 60.4% > 55%
+			name:  "顶背离历史显著有效(下界>55)惩罚x1.5",
 			score: base(false, -3),
-			perfs: []analysis.PerfStat{perfStatOf("顶背离", 100, 60)},
+			perfs: []analysis.PerfStat{perfStatOf("顶背离", 100, 70)},
 			// -3→-4(-1), total = 50-18-1 = 31
 			wantAdj: -1, wantTotal: 31,
 		},
@@ -161,7 +173,7 @@ func TestApplyPerfAdaptive(t *testing.T) {
 				s.Total = 49
 				return s
 			}(),
-			perfs:   []analysis.PerfStat{perfStatOf("超买反转", 20, 30)},
+			perfs:   []analysis.PerfStat{perfStatOf("超买反转", 40, 20)},
 			wantAdj: 1, wantTotal: 50,
 		},
 		{
@@ -330,10 +342,77 @@ func flatTDs(n int, last indicator.TD) []indicator.TD {
 	return ts
 }
 
+// TestSwingMembersMatchesConflictDetection 锁住 swingMembers 与
+// strongestSwingVote 的耦合: 前者渲染 SWING_CONFLICT 行的明细,后者判定是否冲突。
+// 两处各写了一套阈值,一旦漂移就会出现"报告了冲突却列不出矛盾项"(或反之)的
+// 自相矛盾输出。断言: 判定冲突 ⟺ 明细里同时存在看多项与看空项。
+func TestSwingMembersMatchesConflictDetection(t *testing.T) {
+	bullish := func(s string) bool {
+		return strings.Contains(s, "偏低") || strings.Contains(s, "超卖") || strings.Contains(s, "负乖离")
+	}
+	bearish := func(s string) bool {
+		return strings.Contains(s, "偏高") || strings.Contains(s, "超买") ||
+			(strings.Contains(s, "乖离") && !strings.Contains(s, "负乖离"))
+	}
+
+	cases := []struct {
+		name string
+		last indicator.Result
+	}{
+		{"RSI超卖 vs WR超买", func() indicator.Result {
+			var r indicator.Result
+			r.RSI.RSI6, r.WR.WR14 = 15, 5
+			return r
+		}()},
+		{"RSI超买 vs 负乖离", func() indicator.Result {
+			var r indicator.Result
+			r.RSI.RSI6, r.WR.WR14, r.BIAS.BIAS24 = 85, 50, -20
+			return r
+		}()},
+		{"KDJ超卖 vs 正乖离", func() indicator.Result {
+			var r indicator.Result
+			r.RSI.RSI6, r.WR.WR14, r.BIAS.BIAS24, r.KDJ.J = 50, 50, 20, -10
+			return r
+		}()},
+		{"三项同向看空_无冲突", func() indicator.Result {
+			var r indicator.Result
+			r.RSI.RSI6, r.WR.WR14, r.BIAS.BIAS24 = 85, 5, 20
+			return r
+		}()},
+		{"全中性_无冲突", func() indicator.Result {
+			var r indicator.Result
+			r.RSI.RSI6, r.WR.WR14 = 50, 50
+			return r
+		}()},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, _, conflict := strongestSwingVote(tc.last)
+			members := swingMembers(tc.last)
+			var sawBull, sawBear bool
+			for _, m := range members {
+				if bullish(m) {
+					sawBull = true
+				}
+				if bearish(m) {
+					sawBear = true
+				}
+			}
+			if got := sawBull && sawBear; got != conflict {
+				t.Errorf("conflict=%v 但明细方向混合=%v; members=%v", conflict, got, members)
+			}
+			if conflict && len(members) < 2 {
+				t.Errorf("判定冲突却只列出 %d 项: %v", len(members), members)
+			}
+		})
+	}
+}
+
 func TestEvalBullBear(t *testing.T) {
 	const n = 61 // ≥ ma60 window + the look-back for OBV/price direction
-	mk := func(last indicator.Result, td indicator.TD, div analysis.DivergenceState, perfs []analysis.PerfStat, volRatio float64) bullBearVerdict {
-		return evalBullBear(flatCandles(n, 10), flatResults(n, last), flatTDs(n, td), make([]float64, n), div, perfs, volRatio)
+	mk := func(last indicator.Result, td indicator.TD, div analysis.DivergenceState, perfs []analysis.PerfStat, volRatio float64, sig analysis.SignalState) bullBearVerdict {
+		return evalBullBear(flatCandles(n, 10), flatResults(n, last), flatTDs(n, td), make([]float64, n), div, perfs, volRatio, sig)
 	}
 	// noTrend cancels the trend vote: SAR long + ST short is neither dual-long
 	// nor dual-short, and ADX=0/flat-MA add nothing.
@@ -350,7 +429,9 @@ func TestEvalBullBear(t *testing.T) {
 		last.KDJ.J = 110      // -2
 		// 旧实现会把 RSI/BIAS 各投一票再叠加"评分偏弱",至少 3 个 bear;
 		// 新实现同轴只取最极端一项,且不回灌 score → 恰好 1 个 bear。
-		v := mk(last, indicator.TD{}, analysis.DivergenceState{}, []analysis.PerfStat{perfStatOf("超买反转", 20, 20)}, 1.0)
+		// RSI>70 + WR<20 + BIAS>10 三项齐备,复合超买信号成立 → PERF 调权生效。
+		v := mk(last, indicator.TD{}, analysis.DivergenceState{}, []analysis.PerfStat{perfStatOf("超买反转", 40, 20)}, 1.0,
+			analysis.SignalState{Overbought: true})
 		if len(v.Bears) != 1 || len(v.Bulls) != 0 {
 			t.Fatalf("bulls=%d bears=%d, want 0/1; bears=%+v", len(v.Bulls), len(v.Bears), v.Bears)
 		}
@@ -365,7 +446,8 @@ func TestEvalBullBear(t *testing.T) {
 	t.Run("超买样本不足_不降权", func(t *testing.T) {
 		last := noTrend(indicator.Result{})
 		last.RSI.RSI6 = 85
-		v := mk(last, indicator.TD{}, analysis.DivergenceState{}, []analysis.PerfStat{perfStatOf("超买反转", 5, 0)}, 1.0)
+		v := mk(last, indicator.TD{}, analysis.DivergenceState{}, []analysis.PerfStat{perfStatOf("超买反转", 5, 0)}, 1.0,
+			analysis.SignalState{Overbought: true})
 		if v.BearScore != 3 {
 			t.Errorf("BearScore=%d, want 3 (n<10 不调权)", v.BearScore)
 		}
@@ -377,13 +459,60 @@ func TestEvalBullBear(t *testing.T) {
 		}
 	})
 
+	// PERF「超买反转」是 3/3 复合信号的历史,只能调同一复合信号的权重。
+	// 单指标(这里只有 BIAS24 过线)投出的看空票不在该样本口径内,不得按它降权,
+	// 否则与落库 score_adj(ApplyPerfAdaptive 有同名 gate)得出两套结论。
+	t.Run("复合超买未触发_不按PERF调权", func(t *testing.T) {
+		last := noTrend(indicator.Result{})
+		last.RSI.RSI6 = 50    // 未超买
+		last.WR.WR14 = 50     // 中性
+		last.BIAS.BIAS24 = 20 // 仅乖离过大 → -3
+		perfs := []analysis.PerfStat{perfStatOf("超买反转", 20, 20)}
+		v := mk(last, indicator.TD{}, analysis.DivergenceState{}, perfs, 1.0, analysis.SignalState{Overbought: false})
+		if v.BearScore != 3 {
+			t.Errorf("BearScore=%d, want 3 (复合信号未触发,不降权)", v.BearScore)
+		}
+		if len(v.Bears) != 1 || strings.Contains(v.Bears[0].Label, "降权") {
+			t.Errorf("bear label %+v should carry no PERF note", v.Bears)
+		}
+	})
+
+	// 同轴矛盾只标记、不改计票: 分值必须与"无矛盾时取最极端项"完全一致,
+	// 否则 score 口径变动会让历史不可比。
+	t.Run("同轴方向矛盾_仍照常计票只标记", func(t *testing.T) {
+		last := noTrend(indicator.Result{})
+		last.RSI.RSI6 = 15    // 超卖 → +3
+		last.WR.WR14 = 5      // 超买 → -3(与 RSI 矛盾)
+		last.BIAS.BIAS24 = 20 // 乖离过大 → -3
+		last.KDJ.J = 50       // 中性
+		v := mk(last, indicator.TD{}, analysis.DivergenceState{}, nil, 1.0, analysis.SignalState{})
+		if !v.SwingConflict {
+			t.Error("SwingConflict = false, want true (RSI 超卖 vs WR/BIAS 超买)")
+		}
+		// 取绝对值最大者,平手保留先扫描到的 RSI(+3) → 记为多头票
+		if v.BullScore != 3 || v.BearScore != 0 {
+			t.Errorf("bullW=%d bearW=%d, want 3/0 (矛盾不改计票,仍取最极端项)", v.BullScore, v.BearScore)
+		}
+	})
+
+	t.Run("无矛盾时不置 SwingConflict", func(t *testing.T) {
+		last := noTrend(indicator.Result{})
+		last.RSI.RSI6 = 85
+		last.WR.WR14 = 5
+		last.BIAS.BIAS24 = 20
+		v := mk(last, indicator.TD{}, analysis.DivergenceState{}, nil, 1.0, analysis.SignalState{})
+		if v.SwingConflict {
+			t.Error("SwingConflict = true, want false (三项同向看空)")
+		}
+	})
+
 	t.Run("加权研判方向取决于权重和", func(t *testing.T) {
 		var last indicator.Result
 		last.RSI.RSI6, last.WR.WR14, last.KDJ.J, last.BIAS.BIAS24 = 50, 50, 50, 0 // 中性摆动,无超买超卖票
 		last.SAR.Long, last.SuperTrend.Long = true, true                          // SAR/ST 双多 → 趋势确认 +1
 		last.MACD.DIF, last.MACD.DEA, last.MACD.Histogram = 1, 0, 1               // MACD 金叉 +2
 		td := indicator.TD{CountdownCount: 13, CountdownSignal: indicator.TDBuy}  // TD 见底 +1（学术证据不支持高权重）
-		v := mk(last, td, analysis.DivergenceState{}, nil, 1.0)
+		v := mk(last, td, analysis.DivergenceState{}, nil, 1.0, analysis.SignalState{})
 		if v.BearScore != 0 || v.BullScore != 4 {
 			t.Fatalf("bullW=%d bearW=%d, want 4/0 (趋势1+MACD2+TD1); bulls=%+v", v.BullScore, v.BearScore, v.Bulls)
 		}

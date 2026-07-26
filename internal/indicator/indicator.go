@@ -514,7 +514,16 @@ func fillSAR(candles []Candle, results []Result) {
 			}
 			if candles[i].Low < sar {
 				long, reversed = false, true
+				// On reversal the SAR jumps to the old EP. Wilder then re-applies
+				// the penetration rule in the NEW direction: a short SAR must sit
+				// at or above the prior two bars' highs (and this bar's). Skipping
+				// this can leave the SAR inside the current bar's range, which
+				// flips the stance straight back on the next bar (whipsaw).
 				sar, ep, af = ep, candles[i].Low, step
+				sar = math.Max(sar, math.Max(candles[i].High, candles[i-1].High))
+				if i >= 2 {
+					sar = math.Max(sar, candles[i-2].High)
+				}
 			} else if candles[i].High > ep {
 				ep, af = candles[i].High, math.Min(af+step, maxAF)
 			}
@@ -526,6 +535,10 @@ func fillSAR(candles []Candle, results []Result) {
 			if candles[i].High > sar {
 				long, reversed = true, true
 				sar, ep, af = ep, candles[i].High, step
+				sar = math.Min(sar, math.Min(candles[i].Low, candles[i-1].Low))
+				if i >= 2 {
+					sar = math.Min(sar, candles[i-2].Low)
+				}
 			} else if candles[i].Low < ep {
 				ep, af = candles[i].Low, math.Min(af+step, maxAF)
 			}

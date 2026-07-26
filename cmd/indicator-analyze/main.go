@@ -201,7 +201,7 @@ func printAnalysis(data api.KlineData) store.Snapshot {
 		analysis.DonchianBreak(candles, results, 55, true), analysis.DonchianBreak(candles, results, 55, false))
 	fmt.Printf("VolMA5=%.0f VolMA10=%.0f VolMA20=%.0f median20=%.0f | 今日量=%.0f 量比=%.2f | OBV=%s | 近5日量价: upDays=%d avgUpVol=%.0f downDays=%d avgDownVol=%.0f\n",
 		analysis.MeanTail(volumes, 5), analysis.MeanTail(volumes, 10), volMA20, analysis.MedianTail(volumes, 20),
-		lastCandle.Volume, volRatio, analysis.OBVTrend(obv), upCnt, upAvgVol, downCnt, downAvgVol)
+		lastCandle.Volume, volRatio, analysis.OBVTrend(obv)+"/3日持续="+ynMark(analysis.OBVUp3Day(obv)), upCnt, upAvgVol, downCnt, downAvgVol)
 	fmt.Printf("SCORE total=%d delta=%+d dmi=%+d ma=%+d macd=%+d kdjwr=%+d rsi=%+d bias=%+d chopcmi=%+d volume=%+d div=%+d adj=%d perfadj=%+d late=%+d label=%s\n",
 		score.Total, score.Delta, score.DMI, score.MA, score.MACD, score.KdjWr, score.RSI,
 		score.BIAS, score.CHOPCMI, score.Volume, score.Divergence, scoreAdj, perfAdj, latePen, score.Label)
@@ -257,8 +257,8 @@ func printAnalysis(data api.KlineData) store.Snapshot {
 	printTD(tds[n-1])
 	printRecentExtremes(candles, dates, results)
 	printStreak(candles)
-	verdict := evalBullBear(candles, results, tds, obv, div, perfs, volRatio)
-	printBullBear(verdict, score)
+	verdict := evalBullBear(candles, results, tds, obv, div, perfs, volRatio, score.Signals)
+	printBullBear(verdict, score, last)
 	printReading(candles, results, tds, obv, score, div, perfs, volRatio, verdict)
 	printPerf(perfs)
 	printRecentRows(candles, dates, results, tds)
@@ -329,7 +329,7 @@ func printAnalysis(data api.KlineData) store.Snapshot {
 		SuperTrendLong: last.SuperTrend.Long,
 
 		VolRatio: volRatio,
-		OBVUp:    len(obv) >= 6 && obv[len(obv)-1] > obv[len(obv)-6],
+		OBVUp:    analysis.OBVUpLast(obv),
 
 		ScoreTotal: score.Total,
 		ScoreDelta: score.Delta,
@@ -367,6 +367,11 @@ func printAnalysis(data api.KlineData) store.Snapshot {
 
 		SARValue:        last.SAR.Value,
 		SuperTrendValue: last.SuperTrend.Value,
+
+		// Computed here from the full K-line series: the screener must not
+		// re-derive these from sparse snapshot history (see store.Snapshot.Low20).
+		Low20:  low20,
+		OBVUp3: analysis.OBVUp3Day(obv),
 	}
 	// 填充振幅和内外盘(如果 proxy.qq.com 提供了)
 	if len(data.Amplitudes) == n && n > 0 {
@@ -429,6 +434,10 @@ type bullBearVerdict struct {
 	BullScore int
 	BearScore int
 	Verdict   string // 偏多 / 偏空 / 中性
+	// SwingConflict: 超买超卖轴内部方向矛盾(如 RSI 超卖同时 WR 超买)。**仍按
+	// 最极端项正常计票**(分值口径不变、历史可比),仅作提示: 该票此时可信度低,
+	// 应以趋势维度(SAR/ST/DMI)复核后再采信。
+	SwingConflict bool
 }
 
 func (v *bullBearVerdict) addBull(label string, weight int) {
@@ -466,7 +475,14 @@ func perfNote(orig, adj int) string {
 // Positive weight = oversold (bullish), negative = overbought (bearish); zero
 // means no member is in an extreme zone. Ties keep the first (RSI) for
 // determinism.
-func strongestSwingVote(last indicator.Result) (string, int) {
+//
+// Taking the most extreme member is deliberately the aggressive choice, and it
+// hides disagreement: when one member reads oversold while another reads
+// overbought (different lookback windows — KDJ 9 日 vs WR 14 日 vs BIAS 24 日 —
+// or a gap distorting one of them), the losing side vanishes silently. conflict
+// reports that case so callers can flag the axis as unreliable rather than
+// presenting a confident one-sided vote.
+func strongestSwingVote(last indicator.Result) (label string, weight int, conflict bool) {
 	type cand struct {
 		label string
 		w     int
@@ -509,12 +525,50 @@ func strongestSwingVote(last indicator.Result) (string, int) {
 		cands = append(cands, cand{fmt.Sprintf("KDJ-J超卖(%.1f)", last.KDJ.J), 2})
 	}
 	best, bestLabel := 0, ""
+	sawBull, sawBear := false, false
 	for _, c := range cands {
+		if c.w > 0 {
+			sawBull = true
+		} else if c.w < 0 {
+			sawBear = true
+		}
 		if analysis.AbsInt(c.w) > analysis.AbsInt(best) {
 			best, bestLabel = c.w, c.label
 		}
 	}
-	return bestLabel, best
+	return bestLabel, best, sawBull && sawBear
+}
+
+// swingConflictText lists every extreme reading on the overbought/oversold axis,
+// used to explain a SWING_CONFLICT. Order matches strongestSwingVote's scan.
+func swingMembers(last indicator.Result) []string {
+	var out []string
+	add := func(format string, v float64) { out = append(out, fmt.Sprintf(format, v)) }
+	switch {
+	case last.RSI.RSI6 > 70:
+		add("RSI6=%.1f(偏高)", last.RSI.RSI6)
+	case last.RSI.RSI6 < 30:
+		add("RSI6=%.1f(偏低)", last.RSI.RSI6)
+	}
+	switch {
+	case last.WR.WR14 >= 80:
+		add("WR14=%.1f(超卖)", last.WR.WR14)
+	case last.WR.WR14 <= 20:
+		add("WR14=%.1f(超买)", last.WR.WR14)
+	}
+	switch {
+	case last.BIAS.BIAS24 > 10:
+		add("BIAS24=%.1f(正乖离)", last.BIAS.BIAS24)
+	case last.BIAS.BIAS24 < -10:
+		add("BIAS24=%.1f(负乖离)", last.BIAS.BIAS24)
+	}
+	switch {
+	case last.KDJ.J > 100:
+		add("KDJ-J=%.1f(超买)", last.KDJ.J)
+	case last.KDJ.J < 0:
+		add("KDJ-J=%.1f(超卖)", last.KDJ.J)
+	}
+	return out
 }
 
 // evalBullBear synthesizes a weighted, de-duplicated bull/bear verdict from the
@@ -524,7 +578,7 @@ func strongestSwingVote(last indicator.Result) (string, int) {
 // its most extreme member (RSI/WR/KDJ-J/BIAS), and the composite score is NOT
 // fed back as a vote. Overbought and top-divergence bear votes are reweighted by
 // this stock's own PERF history (perfScale), matching score_adj's methodology.
-func evalBullBear(candles []indicator.Candle, results []indicator.Result, tds []indicator.TD, obv []float64, div analysis.DivergenceState, perfs []analysis.PerfStat, volRatio float64) bullBearVerdict {
+func evalBullBear(candles []indicator.Candle, results []indicator.Result, tds []indicator.TD, obv []float64, div analysis.DivergenceState, perfs []analysis.PerfStat, volRatio float64, sig analysis.SignalState) bullBearVerdict {
 	n := len(candles)
 	last := results[n-1]
 	lastTD := tds[n-1]
@@ -558,25 +612,38 @@ func evalBullBear(candles []indicator.Candle, results []indicator.Result, tds []
 	}
 
 	// 超买超卖维度:RSI/WR/KDJ-J/BIAS 同源,只取最极端的一项计一票;看空侧按 PERF 调权。
-	if label, w := strongestSwingVote(last); w < 0 {
-		adj := analysis.PerfScale(w, obWin, obN, 35, 55)
-		v.addBear(label+perfNote(w, adj), -adj)
-	} else if w > 0 {
-		v.addBull(label, w)
+	//
+	// PERF「超买反转」是 RSI6>70 + WR/KDJ + BIAS24>10 的 3/3 复合信号,它的历史
+	// 胜率只能用来调**同一个复合信号**的权重。单指标(可能只是 BIAS24 略过 10)
+	// 投出的看空票不在该样本口径内,拿复合信号胜率去调它是分母错配,还会与落库的
+	// score_adj 得出两套结论。gate 与 ApplyPerfAdaptive 保持一致:仅当复合超买
+	// 信号真的触发时才按 PERF 调权。
+	// 同轴内方向矛盾只做标记,不改计票口径(仍取最极端项)——分值保持历史可比,
+	// 冲突由 SWING_CONFLICT 行提示人工判断。见 CLAUDE.md「指标分工」。
+	label, swingW, swingConflict := strongestSwingVote(last)
+	v.SwingConflict = swingConflict
+	if swingW < 0 {
+		adj := swingW
+		note := ""
+		if sig.Overbought {
+			adj = analysis.PerfScale(swingW, obWin, obN, 35, 55)
+			note = perfNote(swingW, adj)
+		}
+		v.addBear(label+note, -adj)
+	} else if swingW > 0 {
+		v.addBull(label, swingW)
 	}
 
 	// 资金维度:OBV 净流向 + 量比异动,合并一票。
 	moneyW := 0
 	var moneyParts []string
-	if n >= 6 {
-		switch {
-		case obv[n-1] > obv[n-6]:
-			moneyW++
-			moneyParts = append(moneyParts, "OBV净流入")
-		case obv[n-1] < obv[n-6]:
-			moneyW--
-			moneyParts = append(moneyParts, "OBV净流出")
-		}
+	switch d := analysis.OBVDelta(obv); {
+	case d > 0:
+		moneyW++
+		moneyParts = append(moneyParts, "OBV净流入")
+	case d < 0:
+		moneyW--
+		moneyParts = append(moneyParts, "OBV净流出")
 	}
 	priceUp := n > 1 && candles[n-1].Close > candles[n-2].Close
 	priceDown := n > 1 && candles[n-1].Close < candles[n-2].Close
@@ -642,9 +709,13 @@ func evalBullBear(candles []indicator.Candle, results []indicator.Result, tds []
 // printBullBear renders the weighted verdict. The composite score is shown as
 // context only (score=), never as a vote — it is the sum of the very dimensions
 // already counted above, so feeding it back would double-count everything.
-func printBullBear(v bullBearVerdict, score analysis.ScoreState) {
+func printBullBear(v bullBearVerdict, score analysis.ScoreState, last indicator.Result) {
 	fmt.Printf("BULLBEAR bull=[%s] bear=[%s] bullW=%d bearW=%d verdict=%s score=%d\n",
 		bbItemsText(v.Bulls), bbItemsText(v.Bears), v.BullScore, v.BearScore, v.Verdict, score.Total)
+	if v.SwingConflict {
+		fmt.Printf("SWING_CONFLICT 超买超卖轴方向矛盾(%s) → 该票仍按最极端项计入但可信度低, 请以趋势维度(SAR/ST/DMI)复核\n",
+			joinComma(swingMembers(last)))
+	}
 }
 
 // bbItemsText renders weighted items as "label·wN,...", or "-" when empty.
@@ -793,7 +864,10 @@ func joinComma(ss []string) string {
 }
 
 func printPerf(perfs []analysis.PerfStat) {
-	fmt.Println("历史信号性能(仅用信号当日及以前判断, 统计未来5/10日; N<5统计意义弱):")
+	// N 是信号 0→1 的**边沿数**,不是独立样本数: 相隔不足 10 日的两次边沿共享
+	// 前向窗口,胜率的有效样本量小于 N。因此 N 不能直接当独立试验数解读,
+	// 显著性一律走 analysis.WilsonBounds(score_adj / screener 门槛已统一用它)。
+	fmt.Println("历史信号性能(仅用信号当日及以前判断, 统计未来5/10日; N=信号边沿数, 窗口重叠使有效样本小于N, 显著性看Wilson区间):")
 	for _, p := range perfs {
 		if p.Triggers == 0 {
 			fmt.Printf("PERF %-14s dir=%s N=0\n", p.Name, p.Direction)

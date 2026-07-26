@@ -190,6 +190,8 @@ func buildSnapshot(data api.KlineData) store.Snapshot {
 		volRatio = analysis.Ratio(lastCandle.Volume, volMA20)
 	}
 	obv := analysis.OBVSeries(candles)
+	// 20 日最低价:止损回退线,必须来自完整日K(见 store.Snapshot.Low20 注释)。
+	low20, _ := analysis.RangeLowHigh(candles, n-20, n)
 	_, upAvgVol, _, downAvgVol := analysis.RecentVolumeHealth(candles, 5)
 	score := analysis.ScoreResult(candles, results, obv, upAvgVol, downAvgVol, volRatio)
 	div := analysis.Divergence(candles, results, n-1)
@@ -249,7 +251,7 @@ func buildSnapshot(data api.KlineData) store.Snapshot {
 		SARLong:                  last.SAR.Long,
 		SuperTrendLong:           last.SuperTrend.Long,
 		VolRatio:                 volRatio,
-		OBVUp:                    len(obv) >= 6 && obv[n-1] > obv[n-6],
+		OBVUp:                    analysis.OBVUpLast(obv),
 		ScoreTotal:               score.Total,
 		ScoreDelta:               score.Delta,
 		ScoreLabel:               score.Label,
@@ -278,6 +280,8 @@ func buildSnapshot(data api.KlineData) store.Snapshot {
 		DonchBreak55Bull:         analysis.DonchianBreak(candles, results, 55, true),
 		SARValue:                 last.SAR.Value,
 		SuperTrendValue:          last.SuperTrend.Value,
+		Low20:                    low20,
+		OBVUp3:                   analysis.OBVUp3Day(obv),
 	}
 	// 填充振幅和内外盘(如果 proxy.qq.com 提供了)
 	if len(data.Amplitudes) == n && n > 0 {

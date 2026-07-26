@@ -6,63 +6,6 @@ import (
 	"testing"
 )
 
-// TestWilsonBounds tests Wilson 95% confidence interval calculation.
-func TestWilsonBounds(t *testing.T) {
-	tests := []struct {
-		name      string
-		winPct    float64
-		n         int
-		wantLower float64
-		wantUpper float64
-		tolerance float64
-	}{
-		{
-			name:      "small sample wide interval N=10 win=40%",
-			winPct:    40,
-			n:         10,
-			wantLower: 16.8,
-			wantUpper: 68.7,
-			tolerance: 0.1,
-		},
-		{
-			name:      "large sample narrow interval N=100 win=60%",
-			winPct:    60,
-			n:         100,
-			wantLower: 50.1,
-			wantUpper: 69.2,
-			tolerance: 1.0,
-		},
-		{
-			name:      "zero sample full range",
-			winPct:    50,
-			n:         0,
-			wantLower: 0,
-			wantUpper: 100,
-			tolerance: 0,
-		},
-		{
-			name:      "perfect win rate still has upper bound",
-			winPct:    100,
-			n:         10,
-			wantLower: 70,
-			wantUpper: 100,
-			tolerance: 5,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			lo, hi := WilsonBounds(tt.winPct, tt.n)
-			if math.Abs(lo-tt.wantLower) > tt.tolerance {
-				t.Errorf("lower bound = %.1f, want %.1f±%.1f", lo, tt.wantLower, tt.tolerance)
-			}
-			if math.Abs(hi-tt.wantUpper) > tt.tolerance {
-				t.Errorf("upper bound = %.1f, want %.1f±%.1f", hi, tt.wantUpper, tt.tolerance)
-			}
-		})
-	}
-}
-
 // baseCandidate returns a candidate that passes all filters (⭐⭐⭐).
 func baseCandidate() Candidate {
 	return Candidate{
@@ -358,6 +301,56 @@ func TestComputeTier(t *testing.T) {
 			want: TierNone,
 		},
 		{
+			name: "ST 风险警示股一律排除",
+			mod:  func(c *Candidate) { c.Code, c.Name = "sz002759", "ST天际" },
+			want: TierNone,
+		},
+		{
+			name: "*ST 同样排除",
+			mod:  func(c *Candidate) { c.Code, c.Name = "sz002731", "*ST萃华" },
+			want: TierNone,
+		},
+		// 主板 10% 涨跌停: 9.5 起视为接近涨停
+		{
+			name: "主板涨 9.6% 视为涨停排除",
+			mod:  func(c *Candidate) { c.ChangePct = 9.6 },
+			want: TierNone,
+		},
+		// 创业板 20% 涨跌停: 12% 是普通波动,旧的固定 ±9.5 会误杀
+		{
+			name: "创业板涨 12% 属正常波动不排除",
+			mod: func(c *Candidate) {
+				c.Code, c.Name = "sz300750", "宁德时代"
+				c.ChangePct = 12.0
+			},
+			want: TierStar3,
+		},
+		{
+			name: "创业板涨 19.6% 才算涨停排除",
+			mod: func(c *Candidate) {
+				c.Code, c.Name = "sz300750", "宁德时代"
+				c.ChangePct = 19.6
+			},
+			want: TierNone,
+		},
+		{
+			name: "北交所涨 25% 不算涨停",
+			mod: func(c *Candidate) {
+				c.Code, c.Name = "bj920819", "颖泰生物"
+				c.ChangePct = 25.0
+			},
+			want: TierStar3,
+		},
+		// 港股无涨跌停,闸门整体跳过——不能拿任何百分比去卡它
+		{
+			name: "港股涨 15% 不触发涨停闸门",
+			mod: func(c *Candidate) {
+				c.Code, c.Name = "hk00700", "腾讯控股"
+				c.ChangePct = 15.0
+			},
+			want: TierStar3,
+		},
+		{
 			name: "RS20 too low - exclude",
 			mod:  func(c *Candidate) { c.RS20 = sql.NullFloat64{Float64: 55, Valid: true} },
 			want: TierNone,
@@ -422,9 +415,16 @@ func TestMarketBreadth(t *testing.T) {
 			want: 30.0,
 		},
 		{
-			name:       "empty candidates default 100%",
+			// 广度未知时必须向保护侧失败: 返回 100 会在信息最少时
+			// 悄悄关掉推荐数减半的风控闸门。
+			name:       "无可测样本时返回 0 以触发风控",
 			candidates: []Candidate{},
-			want:       100.0,
+			want:       0.0,
+		},
+		{
+			name:       "有候选但缺 close/MA20 同样视为未知",
+			candidates: []Candidate{{Close: 0, MA20: 0}, {Close: 10, MA20: 0}},
+			want:       0.0,
 		},
 	}
 
@@ -592,6 +592,60 @@ func TestPositionHint(t *testing.T) {
 				Low20:    0, // 无 Low20,无法算风险距离
 			},
 			capital: 68000,
+			want:    "止损距离过宽，建议观望",
+		},
+		// 止损贴身(SAR 刚翻多时的常态)会让 1% 风险除出天量仓位。
+		// 实测 2026-07-24 sh603927: close=12.80 SAR=12.795(距离 0.04%),
+		// 旧实现建议 145200 股 ≈ 185.8 万元,而总资金只有 6.8 万。
+		{
+			name: "stop too tight is rejected, not sized",
+			c: Candidate{
+				Close:    12.80,
+				SARValue: sql.NullFloat64{Float64: 12.795, Valid: true},
+			},
+			capital: 68000,
+			want:    "止损贴身(0.04%)，等回踩确认",
+		},
+		// 1.5% < MinStopPct(2%): 仍拒绝——日内噪音就能打掉。
+		{
+			name: "stop below min distance rejected",
+			c: Candidate{
+				Close:    10.0,
+				SARValue: sql.NullFloat64{Float64: 9.85, Valid: true},
+			},
+			capital: 68000,
+			want:    "止损贴身(1.50%)，等回踩确认",
+		},
+		// 恰好 2.0%: 边界通过。shares=int(680/0.2/100)*100=3400,
+		// 金额 34000 = 总资金的 50%(MinStopPct 保证的上限)。
+		{
+			name: "stop exactly at min distance is accepted",
+			c: Candidate{
+				Close:    10.0,
+				SARValue: sql.NullFloat64{Float64: 9.8, Valid: true},
+			},
+			capital: 68000,
+			want:    "建议≤3400股",
+		},
+		// Low20 回退路径同样受最小距离约束(SAR 翻空时的持仓行)。
+		{
+			name: "low20 fallback also honours min distance",
+			c: Candidate{
+				Close:    10.0,
+				SARValue: sql.NullFloat64{Float64: 10.5, Valid: true},
+				Low20:    9.9, // 仅 1% 距离
+			},
+			capital: 68000,
+			want:    "止损贴身(1.00%)，等回踩确认",
+		},
+		// 资金不足以买满一手: 止损距离合规(20%),但 1% 风险只够 6 股 → 不足 100
+		{
+			name: "capital too small for one lot",
+			c: Candidate{
+				Close:    400.0,
+				SARValue: sql.NullFloat64{Float64: 320.0, Valid: true},
+			},
+			capital: 5000, // 5000*0.01/80 = 0.625 股
 			want:    "止损距离过宽，建议观望",
 		},
 	}

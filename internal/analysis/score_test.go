@@ -1,6 +1,7 @@
 package analysis
 
 import (
+	"math"
 	"testing"
 
 	"stock-tui/internal/indicator"
@@ -130,6 +131,101 @@ func TestOBVTrend(t *testing.T) {
 	}
 }
 
+// TestOBVDeltaAndUpLast 覆盖落库 snapshot.obv_up 的判据本身。obv_up 进
+// screener 的 coreTech 硬门槛,判错会直接改变选股结果,必须锁死窗口口径。
+func TestOBVDeltaAndUpLast(t *testing.T) {
+	// 样本不足: 需要能回看 obvLookback(5) 根,即至少 6 根
+	short := []float64{1, 2, 3, 4, 5}
+	if got := OBVDelta(short); got != 0 {
+		t.Errorf("OBVDelta(5 bars) = %v, want 0 (样本不足)", got)
+	}
+	if OBVUpLast(short) {
+		t.Error("OBVUpLast(样本不足) = true, want false (不臆断方向)")
+	}
+	if got := OBVDelta(nil); got != 0 {
+		t.Errorf("OBVDelta(nil) = %v, want 0", got)
+	}
+	if OBVUpLast(nil) {
+		t.Error("OBVUpLast(nil) = true, want false")
+	}
+
+	// 恰好 6 根: 末根与首根比较
+	six := []float64{10, 0, 0, 0, 0, 12}
+	if got := OBVDelta(six); got != 2 {
+		t.Errorf("OBVDelta(6 bars) = %v, want 2 (12-10)", got)
+	}
+	if !OBVUpLast(six) {
+		t.Error("OBVUpLast(净流入) = false, want true")
+	}
+
+	// 净流出
+	out := []float64{20, 0, 0, 0, 0, 15}
+	if got := OBVDelta(out); got != -5 {
+		t.Errorf("OBVDelta(净流出) = %v, want -5", got)
+	}
+	if OBVUpLast(out) {
+		t.Error("OBVUpLast(净流出) = true, want false")
+	}
+
+	// 持平不算净流入(严格大于)
+	flat := []float64{7, 1, 2, 3, 4, 7}
+	if got := OBVDelta(flat); got != 0 {
+		t.Errorf("OBVDelta(持平) = %v, want 0", got)
+	}
+	if OBVUpLast(flat) {
+		t.Error("OBVUpLast(持平) = true, want false")
+	}
+
+	// 三者必须共用同一窗口: OBVUpLast / OBVTrend / OBVUp3Day 末根判据一致
+	rising := []float64{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}
+	if !OBVUpLast(rising) || OBVTrend(rising) != "上升(净流入)" || !OBVUp3Day(rising) {
+		t.Errorf("同一上升序列三者不一致: upLast=%v trend=%q up3=%v",
+			OBVUpLast(rising), OBVTrend(rising), OBVUp3Day(rising))
+	}
+	falling := []float64{10, 9, 8, 7, 6, 5, 4, 3, 2, 1}
+	if OBVUpLast(falling) || OBVTrend(falling) != "下降(净流出)" || OBVUp3Day(falling) {
+		t.Errorf("同一下降序列三者不一致: upLast=%v trend=%q up3=%v",
+			OBVUpLast(falling), OBVTrend(falling), OBVUp3Day(falling))
+	}
+}
+
+func TestOBVUp3Day(t *testing.T) {
+	// 样本不足: 最后 3 根各自要能回看 obvLookback(5) 根 → 至少 8 根
+	if got := OBVUp3Day([]float64{1, 2, 3, 4, 5, 6, 7}); got {
+		t.Error("OBVUp3Day(7 bars) = true, want false (样本不足)")
+	}
+	// 单调上升: 最后 3 根都高于各自 5 日前 → true
+	rising := []float64{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}
+	if got := OBVUp3Day(rising); !got {
+		t.Error("OBVUp3Day(rising) = false, want true")
+	}
+	// 最后一根回落到 5 日前之下 → false(要求连续 3 根成立)
+	broken := []float64{1, 2, 3, 4, 5, 6, 7, 8, 9, 3}
+	if got := OBVUp3Day(broken); got {
+		t.Error("OBVUp3Day(broken last bar) = true, want false")
+	}
+	// 只有最后一根成立(单日净流入),前两根不成立 → false,应降为 watch
+	onlyLast := []float64{10, 10, 10, 10, 10, 10, 9, 20}
+	if got := OBVUp3Day(onlyLast); got {
+		t.Error("OBVUp3Day(only last day up) = true, want false")
+	}
+	// 持平不算净流入(严格大于)
+	flat := []float64{5, 5, 5, 5, 5, 5, 5, 5, 5}
+	if got := OBVUp3Day(flat); got {
+		t.Error("OBVUp3Day(flat) = true, want false")
+	}
+	// 与单日 obv_up 口径一致: 末根的判据必须与 obv[n-1] > obv[n-6] 相同
+	series := []float64{100, 100, 100, 100, 100, 100, 101, 102, 103}
+	n := len(series)
+	singleDay := series[n-1] > series[n-6]
+	if !singleDay {
+		t.Fatal("fixture broken: 单日 obv_up 应为 true")
+	}
+	if !OBVUp3Day(series) {
+		t.Error("三日全满足时 OBVUp3Day 应为 true(与单日同窗口)")
+	}
+}
+
 func TestStreakValue(t *testing.T) {
 	candles := []indicator.Candle{
 		{Close: 10},
@@ -158,17 +254,26 @@ func TestPerfScale(t *testing.T) {
 	if got := PerfScale(3, 50, 20, 35, 55); got != 3 {
 		t.Errorf("PerfScale(3) = %d, want 3", got)
 	}
-	// n < 10 passes through
+	// 小样本一律原样保留: n=5 的区间几乎覆盖整个 [0,100]
 	if got := PerfScale(-7, 50, 5, 35, 55); got != -7 {
 		t.Errorf("PerfScale(-7,n=5) = %d, want -7", got)
 	}
-	// win < 35 -> halved
-	if got := PerfScale(-7, 20, 20, 35, 55); got != -3 {
-		t.Errorf("PerfScale(-7,win=20) = %d, want -3", got)
+	// 关键回归: n=10/win=30% 的 Wilson 区间是 [10.8, 60.3],跨越 50% 两侧,
+	// 统计上无法断定「历史差」。旧实现(点估计+n>=10)会把惩罚砍半。
+	if got := PerfScale(-7, 30, 10, 35, 55); got != -7 {
+		t.Errorf("PerfScale(-7,win=30,n=10) = %d, want -7 (区间过宽,不调权)", got)
 	}
-	// win > 55 -> amplified
-	if got := PerfScale(-4, 60, 20, 35, 55); got != -6 {
-		t.Errorf("PerfScale(-4,win=60) = %d, want -6", got)
+	// 同理 n=20/win=20%: 上界 41.6% > 35%,仍不足以断定历史差
+	if got := PerfScale(-7, 20, 20, 35, 55); got != -7 {
+		t.Errorf("PerfScale(-7,win=20,n=20) = %d, want -7 (上界41.6%%>35%%)", got)
+	}
+	// 上界显著低于 35%(win=20,n=40 → hi=34.8) → 惩罚减半(向零截断)
+	if got := PerfScale(-7, 20, 40, 35, 55); got != -3 {
+		t.Errorf("PerfScale(-7,win=20,n=40) = %d, want -3", got)
+	}
+	// 下界显著高于 55%(win=85,n=40 → lo=70.9) → 惩罚 x1.5
+	if got := PerfScale(-4, 85, 40, 35, 55); got != -6 {
+		t.Errorf("PerfScale(-4,win=85,n=40) = %d, want -6", got)
 	}
 }
 
@@ -268,6 +373,40 @@ func TestDivergenceDetection(t *testing.T) {
 	}
 }
 
+// TestDivergenceScore 锁定顶/底背离分别计分后相加,不互相覆盖。
+func TestDivergenceScore(t *testing.T) {
+	tests := []struct {
+		name string
+		d    DivergenceState
+		want int
+	}{
+		{"无背离", DivergenceState{}, 0},
+		{"当日顶背离", DivergenceState{Bear: true, BearToday: true}, -3},
+		{"非当日顶背离", DivergenceState{Bear: true}, -1},
+		{"当日底背离", DivergenceState{Bull: true, BullToday: true}, 2},
+		{"非当日底背离", DivergenceState{Bull: true}, 1},
+		// 回归用例: 旧实现在这里返回 +1(顶背离被覆盖),方向反了。
+		{
+			name: "当日顶背离 + 窗口内底背离",
+			d:    DivergenceState{Bear: true, BearToday: true, Bull: true},
+			want: -2,
+		},
+		// 反向: 当日底背离 + 窗口内顶背离,旧实现返回 +2,丢掉顶背离。
+		{
+			name: "当日底背离 + 窗口内顶背离",
+			d:    DivergenceState{Bull: true, BullToday: true, Bear: true},
+			want: 1,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := DivergenceScore(tt.d); got != tt.want {
+				t.Errorf("DivergenceScore() = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
 // TestDivergenceBearTodayDistinctFromBear covers the case where the bear
 // divergence condition held a couple of days ago but not on the current bar —
 // Bear should stay true (softer "非当日" weight) while BearToday must be false.
@@ -313,5 +452,75 @@ func TestDivergenceStale(t *testing.T) {
 	div := Divergence(candles, results, 28)
 	if div.Bear || div.BearToday {
 		t.Error("bear divergence at index 20 is stale by index 28, expected both false")
+	}
+}
+
+// TestWilsonBounds 锁定 Wilson 95% 置信区间的计算,它同时决定 screener 的准入
+// 门槛与 PerfScale 的惩罚调权,是两处共用的显著性标准。
+func TestWilsonBounds(t *testing.T) {
+	tests := []struct {
+		name      string
+		winPct    float64
+		n         int
+		wantLower float64
+		wantUpper float64
+		tolerance float64
+	}{
+		{
+			name:      "小样本区间极宽 N=10 win=40%",
+			winPct:    40,
+			n:         10,
+			wantLower: 16.8,
+			wantUpper: 68.7,
+			tolerance: 0.1,
+		},
+		{
+			name:      "大样本区间收窄 N=100 win=60%",
+			winPct:    60,
+			n:         100,
+			wantLower: 50.1,
+			wantUpper: 69.2,
+			tolerance: 1.0,
+		},
+		{
+			name:      "零样本返回全区间",
+			winPct:    50,
+			n:         0,
+			wantLower: 0,
+			wantUpper: 100,
+			tolerance: 0,
+		},
+		{
+			name:      "满胜率仍有上界",
+			winPct:    100,
+			n:         10,
+			wantLower: 70,
+			wantUpper: 100,
+			tolerance: 5,
+		},
+		// 越界输入被 clamp 到 [0,1],不得产生 NaN
+		{
+			name:      "胜率越界被clamp不产生NaN",
+			winPct:    150,
+			n:         20,
+			wantLower: 83.9,
+			wantUpper: 100,
+			tolerance: 0.5,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			lo, hi := WilsonBounds(tt.winPct, tt.n)
+			if math.IsNaN(lo) || math.IsNaN(hi) {
+				t.Fatalf("WilsonBounds(%v,%d) 返回 NaN: lo=%v hi=%v", tt.winPct, tt.n, lo, hi)
+			}
+			if math.Abs(lo-tt.wantLower) > tt.tolerance {
+				t.Errorf("lower bound = %.1f, want %.1f±%.1f", lo, tt.wantLower, tt.tolerance)
+			}
+			if math.Abs(hi-tt.wantUpper) > tt.tolerance {
+				t.Errorf("upper bound = %.1f, want %.1f±%.1f", hi, tt.wantUpper, tt.tolerance)
+			}
+		})
 	}
 }

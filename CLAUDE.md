@@ -39,6 +39,8 @@
   - `CYQK_Open/High/Low/Close` = 博弈K线(获利盘OHLC,0~100),`CYQK_Length` = 收-开
   - `VolumeLessBigKline`(无量长阳:长度>18%且换手<3%)、`Ratio90v3`(90比3)、`IsLowPosition`(PRY1<40%)
   - 前置依赖:至少 60 根日K(推荐 250+),换手率用小数(0.0646=6.46%),价格须前复权
+  - **模型差异(影响解读)**:通达信把每日成交量按三角/均匀分布铺开在 `[Low,High]` 区间上,本实现压成 `avgPrice`(VWAP,无量时 `(H+L)/2`)上的**点质量**。故 WINNER 在价格穿越某日 avgPrice 时**阶跃跳变**而非连续爬升,`ASR` 受影响最重(呈离散台阶,"筹码密集/稀疏"标签会在临界点抖动)。**只读量级**(深度套牢/全民获利/大致密集度),**不读日间细微变化、不当连续趋势线**
+  - 序列**无前视偏差**:第 i 项只用 `[0,i]` 的换手与成本重算权重,可安全用于回测/历史比对(旧版对全序列只算一套权重,历史各日混入未来交易日筹码,仅末日正确)
 - `MFI` 读取 `Candle.Volume`;其他核心价格指标不依赖成交量。ATR14 用 Wilder RMA;BOLL 为 20 日 ±2σ;Donchian 输出 20/55 日通道。
 - `SAR` 为 Wilder 抛物线转向(AF 0.02→0.20,触破翻转),输出 `Value`(止损/翻转价)、`Long`(多空 stance)、`Reversed`(本根是否刚翻转)。`Keltner` 为 EMA20±1.5×ATR20 通道,`Squeeze` = BOLL(20,2σ) 完全收进 Keltner 内(波动压缩、突破临近);`Keltner` 读取已算好的 `BOLL`,故 `Calculate` 内在 `fillBOLL` 之后填充。
 - `SuperTrend` 为 ATR 通道趋势跟踪(ATR10×3),输出 `Value`(趋势线:多头=下轨支撑/空头=上轨压力)、`Long`(趋势 stance)、`Reversed`(本根是否刚翻转);比 `SAR` 更平滑、噪音更低,适合作"当前趋势态"总览。与 SAR/Keltner 同属 ATR 系趋势工具,解读时注意三者不要互相当独立证据(见下「指标分工」)。
@@ -53,9 +55,9 @@
   - **SAR 翻多但 ST 仍空 → 弱势修复**:短线反弹信号,但大趋势仍空头。站上 ST 上轨值才确认趋势反转
   - **不一致时一律以 ST 判断大 stance**,SAR 作短线移动止损参考
   - CLI 近15日行 `SAR=空*`/`SAR=多*` 带 `*`=**当日刚翻转**;日志"止损价"列应区分 SAR 止损线(贴身)与 ST 趋势线(粗),不可混称
-- **动量/超买超卖**:`WR` 与 `KDJ` 同源(都基于 close 在 N 日 high-low 区间的位置),**勿当两个独立证据**;`RSI`(涨跌幅)、`BIAS`(乖离)口径不同可印证;`MACD` 相对独立(趋势性动量)。`StochRSI`(K/D)= RSI6 在 14 日窗口内的位置,RSI6 钝死极端值时判别力丧失、StochRSI 重新展开该区间——见下「极端行情指标口径 → 极端超卖/超买」段。
+- **动量/超买超卖**:`RSI`/`WR`/`KDJ-J`/`BIAS` 四者在**代码中按同一根轴处理**——`analysis.ScoreResult` 的 `KdjWr` 项与 CLI `strongestSwingVote` 都只取其中**绝对值最大的一项**计一票,不叠加。理由是四者在极端行情下高度同向,叠加会制造"虚假共振"。注意这是**偏激进**的选择(永远取更极端的读数);当同轴内出现方向矛盾(如 RSI 超卖同时 WR 超买,9 日与 14 日窗口不一致所致),CLI 会在 SWING_CONFLICT 行标出——**该票仍照常计入**(分值口径不变、历史可比),但可信度低,需以趋势维度(SAR/ST/DMI)复核后再采信。`MACD` 相对独立(趋势性动量),单独计票。`StochRSI`(K/D)= RSI6 在 14 日窗口内的位置,RSI6 钝死极端值时判别力丧失、StochRSI 重新展开该区间——见下「极端行情指标口径 → 极端超卖/超买」段。
 - **波动/通道**:`ATR`/BOLL 带宽量波动幅度;`BOLL`(σ 带)、`Keltner`(ATR 带)、`Donchian`(极值带)是三类通道,BOLL vs Keltner 的对比正是 Squeeze 的意义。
-- **资金**:`MFI`(0–100 有界、超买超卖,位于 `internal/indicator`)与 OBV(累计、趋势)互补;量比看量能强度。**MFI 定性口径**：> 80 超买 / 70–80 偏高 / 20–30 偏低 / < 20 超卖。**OBV 不在指标包**:实现为 `internal/analysis` 的 `OBVSeries`(经典累加:收涨加量/收跌减量/平盘持平)+ `OBVTrend`(近6日趋势文字"上升(净流入)"/"下降(净流出)"/"持平"),进 score 信号位 `OBVUp`、CLI `evalBullBear`、PERF 与 `OBV=` 输出;screener 的 star 分层另要求 OBV 3 日持续净流入(单日沦为 watch)。**未落 snapshot**,故选股表/回测/journal 看不到 OBV 数值,仅 CLI/分析路径运行时算。
+- **资金**:`MFI`(0–100 有界、超买超卖,位于 `internal/indicator`)与 OBV(累计、趋势)互补;量比看量能强度。**MFI 定性口径**：> 80 超买 / 70–80 偏高 / 20–30 偏低 / < 20 超卖。**OBV 不在指标包**:实现为 `internal/analysis` 的 `OBVSeries`(经典累加:收涨加量/收跌减量/平盘持平)+ `OBVTrend`(近6日趋势文字"上升(净流入)"/"下降(净流出)"/"持平"),进 score 信号位 `OBVUp`、CLI `evalBullBear`、PERF 与 `OBV=` 输出。**OBV 累计值本身不落库**(选股表/回测/journal 看不到数值),但两个**布尔判据**落库:`obv_up`(单日净流入)与 `obv_up3`(`OBVUp3Day`,连续 3 日净流入,screener star 分层要求,单日沦为 watch)。二者共用 `obvLookback`=5 的回看窗口(`obv[i] > obv[i-5]`),**改一个必须同步另一个**,否则"单日"与"3日持续"会各按一套窗口判断。CLI `OBV=` 行同时显示趋势文字与 `3日持续=是/否`。
 - **择时**:`TDSequential` 是独立口径,可与趋势/动量交叉印证。**学术证据**(Levine & Pedersen 2017, Lo/Mamaysky/Wang 2000)显示 TD 9→13 计数体系无统计显著预测力——项目中**不计入 score_total、不进 screener coreTech 硬门槛**；仅作 CLI 展示、PERF 统计(按个股历史自证)、evalBullBear 择时维度 w=1 与 lateStageRisk 联合条件(需 tdTop≥5 且 divBear 才触发)的辅助参考。
 
 ### 极端行情指标口径
@@ -161,9 +163,12 @@
   - `PERF 超买反转空头` win10 < 35%：超买警报在本股历史近乎无效，可降权
   - `PERF 顶背离空头` win10 < 40%：顶背离历史无效，不以此降评级
   - 反之（超买/背离信号 win10 > 55%）：信号有效，应等回调再入场
-- **PERF N 为信号边沿计数**（信号 0→1 翻转才计 1 次，连续触发日不重复计数，避免重叠前向窗口灌水）；Go screen(`internal/screener.WilsonBounds`)的排除/容忍判断用 **Wilson 95% 置信界**（排除型须下界>50%，"历史差"型须上界<50%），小样本自动失去否决力。
+- **PERF N 为信号边沿计数**（信号 0→1 翻转才计 1 次，连续触发日不重复计数，避免重叠前向窗口灌水）。注意边沿计数**只是缓解**：相隔不足 10 日的两次边沿仍共享前向窗口，**有效样本量小于 N**，故 N 不可当独立试验数解读。
+- **显著性判断一律走 Wilson 95% 置信界**（`analysis.WilsonBounds`，screener 与 `analysis.PerfScale` 共用同一实现）：排除型须下界>50%，"历史差"型须上界<50%，小样本自动失去否决力。`PerfScale` 也用置信界而非点估计——n=10/win=30% 的区间是 [10.8, 60.3]，跨越 50% 两侧，**不足以断定"历史差"**（旧版用 `win<35 && n>=10` 点估计就把惩罚砍半，属小样本过拟合）。
 - **RS 排名是热榜池内百分位**（非全市场）：池子本身按热度准入，RS 高位叠加了双重动量选择，短期反转暴露是结构性的——排序已按 0.3*RS20+0.5*RS60+0.2*RS120 综合动量降权短期。
-- **score_adj 口径**：`-save` 落库两个分——`score_total` 为原始固定尺评分（历史可比），`score_adj` 为 PERF 自适应分（超买/顶背离惩罚按本股历史胜率调权：win10 低于阈值减半、高于 55% ×1.5，gate 在复合超买信号上）。Go screen 用 `COALESCE(score_adj, score_total)` 筛选；CLI `SCORE` 行的 `adj=`/`perfadj=` 即调整分与调整量。
+- **score_adj 口径**：`-save` 落库两个分——`score_total` 为原始固定尺评分（历史可比），`score_adj` 为 PERF 自适应分（超买/顶背离惩罚按本股历史胜率调权：Wilson 上界低于阈值减半、下界高于 55% ×1.5，gate 在复合超买信号上）。Go screen 用 `COALESCE(score_adj, score_total)` 筛选；CLI `SCORE` 行的 `adj=`/`perfadj=` 即调整分与调整量。
+  - **gate 在复合信号上不可省**：PERF「超买反转」是 RSI6>70 + WR/KDJ + BIAS24>10 的 3/3 复合信号，其胜率只能调**同一复合信号**的权重。单指标（如仅 BIAS24 过线）投出的看空票不在该样本口径内，按它调权是分母错配。CLI `evalBullBear` 与 `ApplyPerfAdaptive` 共用此 gate。
+- **背离计分顶底分别累加**（`analysis.DivergenceScore`）：当日顶 -3 / 非当日顶 -1 / 当日底 +2 / 非当日底 +1，**相加而非覆盖**。二者当日互斥，但 `recentWindow=3` 的记忆窗口让「当日顶背离 + 3 日内底背离」在急涨行情中可达，旧实现顺序覆盖会把 -3 抹成 +1（方向反转，误差 4 分）。
 
 ## 技术面分析 CLI
 - 深度技术面分析优先用固定命令 `go run ./cmd/indicator-analyze <代码>`；不要再写一次性 `cmd/<name>/main.go`。
@@ -198,6 +203,7 @@
 ## snapshot 表结构关键点
 - 字段名：`trade_date`（非 `date`）、`sar_long`/`supertrend_long`（非 `sar_stance`）、下划线命名（snake_case）
 - 已有 `low`/`high`/`amplitude`/`inside_vol`/`outside_vol` 字段(struct/CREATE TABLE/ALTER 容错/SaveSnapshot 四子处同步)；回测盘中止损/止盈读 `COALESCE(low, close)` 与 `COALESCE(high, close)`(`internal/backtest` 的 `getPriceRange`)，旧行缺失时回退 close
+- **`low20`/`obv_up3` 必须落库，禁止用 snapshot 历史反查**：snapshot 逐日累积且股票池逐步扩张，反查得到的窗口远短于 20 日。2026-07-25 实测 645 只中仅 36 只(5.6%)有满 20 日数据，58% 不足 6 日——sh513260 因此显示止损 -0.2%，真实应为 -8.1%。两列由 `-save` 从完整 800 根日K算好(`analysis.RangeLowHigh` / `analysis.OBVUp3Day`)，screener 直接读列
 - 数据是**逐日累积**的（每次 `-save`/`batch-save` 仅写当日快照），**不是**一次性回填历史 K——`stockdb backtest` 需多日 snapshot 才有 `exit_date`；数据不足时 `exit_date` 为空。个股历史信号敏感度用 CLI `PERF`（实时 800 根日K），不依赖 snapshot 长序列
 - 查看数据范围：`sqlite3 data/stock.db "SELECT MIN(trade_date), MAX(trade_date), COUNT(DISTINCT trade_date) FROM snapshot;"`
 
@@ -240,10 +246,15 @@
 #    会被踢出 instrument，后续 batch-save 不会覆盖它们——需事后
 #    INSERT OR IGNORE 补回，或改 hot 逻辑保留 note=holdings。
 
-# 1. 收盘后批量更新快照（含换手率/市值/PE + CYQ 筹码衍生指标；并行 Go 进程，全量约 90 秒）
+# 1. 收盘后批量更新快照（含换手率/市值/PE + low20/obv_up3；并行 Go 进程，全量约 90 秒）
 go run ./cmd/stockdb batch-save -P 4
 # ⚠️ 4 线程并行拉取 + 串行 SQLite 写入（互斥锁避免 SQLITE_BUSY），
 #    前复权口径与 snapshot 一致；-P N 可调并发度（默认 4，CPU 高时可用 8）。
+# ⚠️ **`-n` 是日K根数（默认 800），不是股票数量**——batch-save 永远跑全池。
+#    误用 `-n 6` 会让全池快照基于 6 根日K计算：MA60/ADX/PERF/low20 全部失真，
+#    且静默成功（无报错）。要限制范围只能改 instrument 表，不能用 -n。
+# ⚠️ CYQ 筹码指标**不落库**——snapshot 无 CYQ 列，选股表/journal/回测都看不到，
+#    只有 `go run ./cmd/indicator-analyze <代码>` 运行时算并打印。
 
 # 2. 计算 RS 相对强度百分位排名（横截面 ret20 排名，全量落库当日即有效）
 go run ./cmd/stockdb rs-rank
@@ -267,6 +278,9 @@ go run ./cmd/stockdb backfill
 - `TD`：优先显示 countdown，无则显示 setup；snapshot 落库格式均为 `见顶/N`/`见底/N`（CLI 近15日行才用 `C顶N` 短格式）；setup `见顶/8` 次日警惕进入 countdown
 - `CYQ`：CLI 输出两行——`WINNER`(获利盘%)/`ASR`(浮筹%)/`PRY1`(年度相对位置%) 与博弈K线 OHLC + 控盘信号(无量长阳/90比3/低位) + 状态标签(深度套牢/全民获利/筹码密集/近年底位)
 - `SAR/ST`：`多/多` = SAR 多头 + SuperTrend 多头，双确认；持仓翻空时选股表显示 `⚠️SAR/ST双空` 等警示，必须执行退出纪律
-- `止损价`：选股表"止损(距%)"列口径——**SAR 在现价下方(多头)时用 `sar_value`(贴身移动止损);SAR 翻到现价上方(空头/双空)时其线是反手位非卖出止损,回退近 20 日最低价(`low20`,跌破前低就跑)**;两者皆无则显「—」。`--capital 总资金` 按此止损线输出候选建议仓位(单笔风险 1% / 止损距离),止损线失效(无 Low20)时输出「止损距离过宽,建议观望」。
+- `止损价`：选股表"止损(距%)"列口径——**SAR 在现价下方(多头)时用 `sar_value`(贴身移动止损);SAR 翻到现价上方(空头/双空)时其线是反手位非卖出止损,回退近 20 日最低价(落库列 `low20`,跌破前低就跑)**;两者皆无则显「—」。`--capital 总资金` 按此止损线输出候选建议仓位(单笔风险 `RiskPerTrade`=1% / 止损距离)。**止损距离 < `MinStopPct`=2% 时输出「止损贴身(X.XX%)，等回踩确认」而非股数**——贴身止损既会被日内噪音打掉，又会让 1% 风险除出天量仓位(实测 sh603927 SAR 距 0.04%，旧实现建议 145200 股≈185.8 万元，而总资金 6.8 万)。2% 门槛同时封顶单票仓位 ≤ 50% 资金,故无需另设资金上限。无有效止损线时输出「止损距离过宽,建议观望」。
 - 量比口径：量比 < 0.8 / > 1.5 为阈值，描述时一律写"量比 X.X（< 0.8）"格式，不用"缩量/放量"
-- 末端降级口径：乖离 `bias24/atr_pct > 4`（波动归一化）、连涨≥5日、换手率≥15%（`tr >= 15`,15–20% 闭区间含端点）任一触发即从推荐降为观察；市场广度（池内站上 MA20 比例）< 40% 时推荐上限减半
+- 末端降级口径：乖离 `bias24/atr_pct > 4`（波动归一化）、连涨≥5日、换手率≥15%（`tr >= 15`,15–20% 闭区间含端点）任一触发即从推荐降为观察；市场广度（池内站上 MA20 比例）< 40% 时推荐上限减半。**广度无可测样本时返回 0（不是 100）**——它喂的是风控闸门，信息最少时必须向保护侧失败
+- **涨跌停 gate 按板块取值**（`market.PriceLimitPct`，阈值 = 板块限幅 - 0.5）：港股 `hk*` **无限制**（返回 `market.NoPriceLimit`，调用方须整体跳过闸门）、北交所 `bj*` 30%、创业板 `sz300`/`sz301` 与科创板 `sh688`/`sh689` 及科创板ETF `sh588` 20%、其余主板/ETF 10%、主板 ST 5%（创业板/科创板 ST 仍按板块 20%）。**不可硬编码 ±9.5**——创业板涨 12% 是普通波动却会被当成涨停误杀，ST 涨 5% 已封板却会被放行。**ETF 注意**：基金限幅跟随所跟踪标的，代码前缀一般无法判定（`sz159` 段混有 10% 与 20% 产品），仅 `sh588` 段可确定为科创板 20%，其余一律保守按 10%（闸门宁可早触发）
+- **ST/*ST 一律排除**（`fundOK` 用 `market.IsST` 判名称）：退市风险 + 流动性差，与本项目"技术纪律短线仓"定位不符
+- **`market_cap` 单位是亿元**（实测 2026-07-24 全池 4.25 … 27621），`fundOK` 的 `< 20` 即滤掉 **20 亿**以下，不是 200 亿

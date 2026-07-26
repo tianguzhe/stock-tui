@@ -76,3 +76,67 @@ func TestPrefix(t *testing.T) {
 		}
 	}
 }
+
+func TestIsST(t *testing.T) {
+	cases := []struct {
+		name string
+		want bool
+	}{
+		{"ST天际", true},
+		{"*ST萃华", true},
+		{"SST前锋", true},
+		{"贵州茅台", false},
+		{"工业富联", false},
+		{"", false},
+	}
+	for _, tc := range cases {
+		if got := IsST(tc.name); got != tc.want {
+			t.Errorf("IsST(%q) = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestPriceLimitPct(t *testing.T) {
+	cases := []struct {
+		desc string
+		code string
+		name string
+		want float64
+	}{
+		{"沪市主板", "sh600519", "贵州茅台", 10},
+		{"深市主板", "sz002916", "深南电路", 10},
+		{"创业板", "sz300750", "宁德时代", 20},
+		{"创业板301", "sz301029", "怡合达", 20},
+		{"科创板", "sh688981", "中芯国际", 20},
+		{"北交所", "bj920819", "颖泰生物", 30},
+		{"主板ST按5%", "sz002759", "ST天际", 5},
+		{"创业板ST仍按板块20%", "sz300100", "ST双林", 20},
+		{"ETF按10%", "sh513260", "恒生科技ETF汇添富", 10},
+		{"未知代码回退最严格的10%", "", "", 10},
+	}
+	for _, tc := range cases {
+		if got := PriceLimitPct(tc.code, tc.name); got != tc.want {
+			t.Errorf("%s: PriceLimitPct(%q,%q) = %v, want %v", tc.desc, tc.code, tc.name, got, tc.want)
+		}
+	}
+}
+
+// TestPriceLimitPctNoLimitMarkets 港股无日涨跌幅限制,必须返回 NoPriceLimit 让
+// 调用方跳过闸门,而不是给个百分比——否则一只涨 15% 的港股会被当成涨停排除。
+func TestPriceLimitPctNoLimitMarkets(t *testing.T) {
+	if got := PriceLimitPct("hk00700", "腾讯控股"); got != NoPriceLimit {
+		t.Errorf("PriceLimitPct(hk) = %v, want NoPriceLimit(%v)", got, NoPriceLimit)
+	}
+	// ST 判断不得凌驾于"无限制"之上
+	if got := PriceLimitPct("hk00001", "ST某港股"); got != NoPriceLimit {
+		t.Errorf("PriceLimitPct(hk, ST名) = %v, want NoPriceLimit", got)
+	}
+	// 科创板 ETF(588 段全部跟踪科创板)按 20%
+	if got := PriceLimitPct("sh588000", "科创50ETF"); got != 20 {
+		t.Errorf("PriceLimitPct(sh588) = %v, want 20", got)
+	}
+	// sz159 混杂 10%/20% 产品,代码前缀无法区分 → 保守按 10%
+	if got := PriceLimitPct("sz159949", "创业板50ETF"); got != 10 {
+		t.Errorf("PriceLimitPct(sz159) = %v, want 10 (保守)", got)
+	}
+}

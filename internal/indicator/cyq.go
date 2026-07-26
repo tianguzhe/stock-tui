@@ -5,8 +5,17 @@ import "math"
 // CYQ (筹码分布) 衍生指标: WINNER / ASR / CYQK / 高控盘锁定法则
 //
 // 核心模型: 持仓成本衰减模型(holding decay)。
-// 每日成交量(股)按当日 [Low, High] 区间入场,后续各日以换手率衰减留存。
-// 最终计算每根 K 线的持仓成本权重→任意价格的获利盘比例 WINNER(price)。
+// 每日成交量(股)按该日**单一平均成本价**入场(优先 VWAP=Amount/Volume,
+// 无量时回退 (H+L)/2),后续各日以换手率衰减留存。最终得到每根 K 线的
+// 持仓成本权重→任意价格的获利盘比例 WINNER(price)。
+//
+// ⚠ 与通达信 CYQ 的模型差异(影响解读,不是 bug):
+// 通达信把每日成交量按三角/均匀分布**铺开在 [Low, High] 整个区间**上,本实现
+// 把它压成 avgPrice 上的一个**点质量**。后果是价格穿越某日 avgPrice 时 WINNER
+// 会阶跃跳变,而不是连续爬升; ASR(收盘±10% 区间筹码)受影响最重——本该平滑的
+// 活动筹码呈离散台阶,"筹码密集/稀疏"标签会在临界点抖动。
+// 因此: WINNER/ASR 适合读**量级**(深度套牢 / 全民获利 / 大致密集度),
+// 不适合读**日间细微变化**或当作连续趋势线。
 //
 // ⚠ 数据要求:
 //   - 至少 60 根日K(WINNER 显著衰减的窗口),推荐 250+
@@ -63,9 +72,17 @@ type CYQResult struct {
 //   - turnovers: 换手率序列(小数,如 0.0646),长度须与 candles 一致
 //
 // 返回:
-//   - 每根日K对应的 CYQResult,只有最后一日指标有意义(前 N 日未满历史窗口)
+//   - 每根日K对应的 CYQResult。第 i 项**只使用 [0, i] 的数据**,不含未来交易日,
+//     因此整条序列可安全用于回测/历史比对。
 //     当 len(candles) < MinCYQBars 时结果仍数学有效但参考价值大幅降低:
 //     权重挤在近期,CLI 应对此发出 SAMPLE_WARN。
+//
+// 实现注记(前视偏差): 旧版对全序列只算一套 costWeights,然后拿它计算每一根 K 线
+// 的 WINNER——于是第 i 日的获利盘里混进了 i 之后交易日的成本与换手,是典型的未来
+// 函数。只有最后一根恰好正确。现改为逐日用截至该日的窗口重算权重: 末日结果与
+// 旧版完全一致(窗口即全序列),历史各日则由"掺入未来"变为真实值。
+// 权重重算使总量级仍为 O(n²)(每日 O(i) 的权重 + 6 次 O(i) 的 winnerPrice),
+// n=800 实测毫秒级;且 CYQ 只在 CLI 单只分析路径调用,不进批量落库。
 func CalcCYQ(candles []Candle, turnovers []float64) []CYQResult {
 	n := minInt(len(candles), len(turnovers))
 	results := make([]CYQResult, n)
@@ -73,12 +90,7 @@ func CalcCYQ(candles []Candle, turnovers []float64) []CYQResult {
 		return results
 	}
 
-	// 1) 计算每根日K的持仓成本权重
-	weights := costWeights(turnovers)
-	sumW := rawWeightSum(turnovers)
-
-	// 2) 计算每根日K的平均价格(成本价)
-	//    优先 VWAP(Amount/Volume),volume=0 时回退 (H+L)/2
+	// 每根日K的平均成本价: 优先 VWAP(Amount/Volume),volume=0 时回退 (H+L)/2
 	avgPrices := make([]float64, n)
 	for i := 0; i < n; i++ {
 		if candles[i].Volume > 0 && candles[i].Amount > 0 {
@@ -88,26 +100,25 @@ func CalcCYQ(candles []Candle, turnovers []float64) []CYQResult {
 		}
 	}
 
-	// 3) 对每根日K计算 WINNER 系指标
-	//    注意:权重的意义是"今日持仓中,源自各日的比例"
-	//    WINNER(price) = 累计权重(成本价 <= price)
-	//    需要针对每个 target price 重新累计
-
-	// 按 avgPrice 排序的权重累计计算(以直线扫描)
-	// 对每根 K 线的 close/open/high/low 算 WINNER
+	// 逐日: 用 [0, i] 窗口重算权重,再对该日 close/open/high/low 求 WINNER。
+	// 权重的意义是"截至第 i 日的持仓中,源自各日的比例"。
 	for i := 0; i < n; i++ {
 		r := &results[i]
-		r.WinnerClose = winnerPrice(candles[i].Close, avgPrices, weights)
-		r.WinnerOpen = winnerPrice(candles[i].Open, avgPrices, weights)
-		r.WinnerHigh = winnerPrice(candles[i].High, avgPrices, weights)
-		r.WinnerLow = winnerPrice(candles[i].Low, avgPrices, weights)
-		r.WeightSum = sumW
+		turnsUpTo := turnovers[:i+1]
+		pricesUpTo := avgPrices[:i+1]
+		weights := costWeights(turnsUpTo)
+
+		r.WinnerClose = winnerPrice(candles[i].Close, pricesUpTo, weights)
+		r.WinnerOpen = winnerPrice(candles[i].Open, pricesUpTo, weights)
+		r.WinnerHigh = winnerPrice(candles[i].High, pricesUpTo, weights)
+		r.WinnerLow = winnerPrice(candles[i].Low, pricesUpTo, weights)
+		r.WeightSum = rawWeightSum(turnsUpTo)
 
 		// ASR: ±10%
 		closeUp := candles[i].Close * 1.1
 		closeDn := candles[i].Close * 0.9
-		wUp := winnerPrice(closeUp, avgPrices, weights)
-		wDn := winnerPrice(closeDn, avgPrices, weights)
+		wUp := winnerPrice(closeUp, pricesUpTo, weights)
+		wDn := winnerPrice(closeDn, pricesUpTo, weights)
 		r.ASR = clampF((wUp-wDn)*100, 0, 100)
 
 		// CYQK 博弈K线(值域 0~100)
@@ -121,11 +132,8 @@ func CalcCYQ(candles []Candle, turnovers []float64) []CYQResult {
 		// PRY1 近一年相对位置
 		r.PRY1 = calcPRY1(candles, i)
 
-		// 高控盘信号(仅最后日有意义,这里对所有日都算以便调试)
-		turnPct := 100.0
-		if i < len(turnovers) {
-			turnPct = turnovers[i] * 100 // 转 %
-		}
+		// 高控盘信号。i < n <= len(turnovers) 恒成立,无需边界回退。
+		turnPct := turnovers[i] * 100 // 小数 → %
 		r.VolumeLessBigKline = r.CYQK_Length > 18 && turnPct < 3
 		r.Ratio90v3 = r.WinnerClose > 0.90 && turnPct < 3
 		r.IsLowPosition = r.PRY1 < 40

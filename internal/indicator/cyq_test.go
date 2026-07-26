@@ -1,6 +1,7 @@
 package indicator
 
 import (
+	"math"
 	"testing"
 )
 
@@ -423,6 +424,44 @@ func TestCalcCYQAmountZeroVolumeNonZero(t *testing.T) {
 	// avgPrices=[10, 20], w=[0.3333, 0.6667]
 	// close=20 → WINNER=1.0
 	assertNear(t, "WinnerClose Amount=0", last.WinnerClose, 1.0, 1e-4)
+}
+
+// TestCalcCYQNoLookAhead 锁定"无前视偏差": 第 i 日的 CYQ 只能由 [0,i] 决定。
+//
+// 把序列截断到前 i+1 根后重算,末日结果必须与全序列第 i 项逐字段一致。旧实现
+// 对全序列只算一套权重,历史各日混入了未来交易日的成本与换手,本测试会失败。
+func TestCalcCYQNoLookAhead(t *testing.T) {
+	// 前半段低位成本、后半段拉高,让"未来"筹码与"过去"显著不同:
+	// 若第 i 日混入了后续高价筹码,WINNER 会明显偏低。
+	candles := make([]Candle, 10)
+	turns := make([]float64, 10)
+	for i := range candles {
+		base := 10.0 + float64(i)*3 // 10,13,16,... 单调抬升
+		candles[i] = Candle{
+			Open: base, High: base + 1, Low: base - 1, Close: base,
+			Volume: 100, Amount: base * 100,
+		}
+		turns[i] = 0.05 + float64(i)*0.01
+	}
+
+	full := CalcCYQ(candles, turns)
+	for i := range candles {
+		truncated := CalcCYQ(candles[:i+1], turns[:i+1])
+		got, want := truncated[i], full[i]
+		if math.Abs(got.WinnerClose-want.WinnerClose) > 1e-12 {
+			t.Errorf("i=%d WinnerClose: 截断=%v 全序列=%v (全序列混入了未来筹码)",
+				i, got.WinnerClose, want.WinnerClose)
+		}
+		if math.Abs(got.ASR-want.ASR) > 1e-12 {
+			t.Errorf("i=%d ASR: 截断=%v 全序列=%v", i, got.ASR, want.ASR)
+		}
+		if math.Abs(got.WeightSum-want.WeightSum) > 1e-12 {
+			t.Errorf("i=%d WeightSum: 截断=%v 全序列=%v", i, got.WeightSum, want.WeightSum)
+		}
+		if math.Abs(got.PRY1-want.PRY1) > 1e-12 {
+			t.Errorf("i=%d PRY1: 截断=%v 全序列=%v", i, got.PRY1, want.PRY1)
+		}
+	}
 }
 
 // TestCalcCYQNoAmountNoVolume Volume=0 && Amount=0 → 回退 (H+L)/2, 不除零

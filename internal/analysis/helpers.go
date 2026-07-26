@@ -9,6 +9,31 @@ import (
 	"stock-tui/internal/indicator"
 )
 
+// WilsonBounds 计算胜率的 Wilson 95% 置信区间,返回 (下界%, 上界%)。
+//
+// 小样本会自动失去判别力: N=10、win=40% → 下界≈17%、上界≈69%,区间跨越
+// 50% 两侧,统计上说明不了任何问题。用法约定:
+//   - 断言「信号显著优于抛硬币」须 下界 > 阈值
+//   - 断言「历史确实差」须 上界 < 阈值
+//
+// screener 的准入门槛与 PerfScale 的惩罚调权共用本函数,避免两处各设一套
+// 显著性标准(旧实现 PerfScale 用 n>=10 硬门槛,n=10/win=30% 就敢把惩罚砍半,
+// 而同一组数据的 Wilson 上界高达 60%,远不足以断定「历史差」)。
+func WilsonBounds(winPct float64, n int) (lower, upper float64) {
+	const z = 1.96 // 95% confidence
+	if n == 0 {
+		return 0.0, 100.0
+	}
+	// Clamp to [0,1] to avoid NaN from sqrt of negative value.
+	p := math.Max(0, math.Min(1, winPct/100.0))
+	denom := 1 + z*z/float64(n)
+	centre := p + z*z/(2*float64(n))
+	margin := z * math.Sqrt(p*(1-p)/float64(n)+z*z/(4*float64(n)*float64(n)))
+	lower = (centre - margin) / denom * 100
+	upper = (centre + margin) / denom * 100
+	return
+}
+
 // NDayReturn 计算 N 日涨跌幅(%)。不足 N+1 根或基准为 0 时返回 0。
 func NDayReturn(candles []indicator.Candle, n int) float64 {
 	last := len(candles) - 1
@@ -183,15 +208,58 @@ func DonchianBreak(candles []indicator.Candle, results []indicator.Result, perio
 	return close < prev.Lower20
 }
 
-// OBVTrend 返回近 6 日 OBV 趋势文字描述。
+// obvLookback 是 OBV 净流入判据的回看根数: 拿 obv[i] 与 obv[i-obvLookback]
+// 比较。OBVUpLast(落库 obv_up)、OBVUp3Day(落库 obv_up3)、OBVTrend 三者**都**
+// 从这里取窗口,改一处即全体同步——否则"单日净流入""3日持续净流入""趋势文字"
+// 会各按一套窗口判断,选股表上就会出现自相矛盾的组合。
+const obvLookback = 5
+
+// OBVDelta 返回最后一根 OBV 相对 obvLookback 根前的变化量: 正=净流入、
+// 负=净流出、0=持平或样本不足。所有 OBV 方向判断都应经由它取窗口。
+func OBVDelta(obv []float64) float64 {
+	if len(obv) <= obvLookback {
+		return 0
+	}
+	return obv[len(obv)-1] - obv[len(obv)-1-obvLookback]
+}
+
+// OBVUpLast 判断最后一根日K是否 OBV 净流入,即落库的 snapshot.obv_up。
+// 样本不足时返回 false(不臆断方向)。
+func OBVUpLast(obv []float64) bool {
+	return OBVDelta(obv) > 0
+}
+
+// OBVUp3Day 判断最近 3 根日K是否每根都满足 OBV 净流入(持续净流入)。
+//
+// 与单日 OBVUp 的关系: OBVUp 只看最后一根是否满足,本函数要求连续 3 根都满足,
+// 两者用同一个 obvLookback 窗口。screener 的 star 分层用它,单日成立仅给
+// watch(2026-06 回测: 单日组 70.2% 胜率 /+8.87%,3 日组 82.6% /+21.02%)。
+//
+// 须由完整日K序列计算后落库,不可用 snapshot 最近 3 行统计——snapshot 逐日
+// 累积且股票池逐步扩张,新进池个股行数不足会恒为 false,把本该 star 的标的
+// 全压成 watch;缺跑的交易日也会让"最近 3 行"跨越远超 3 天的区间。
+// 样本不足(最后 3 根都要能回看 obvLookback 根)时返回 false。
+func OBVUp3Day(obv []float64) bool {
+	if len(obv) < obvLookback+3 {
+		return false
+	}
+	for i := len(obv) - 3; i < len(obv); i++ {
+		if obv[i] <= obv[i-obvLookback] {
+			return false
+		}
+	}
+	return true
+}
+
+// OBVTrend 返回 OBV 趋势文字描述,窗口同 obvLookback。
 func OBVTrend(obv []float64) string {
-	if len(obv) < 6 {
+	if len(obv) <= obvLookback {
 		return "样本不足"
 	}
-	if obv[len(obv)-1] > obv[len(obv)-6] {
+	switch d := OBVDelta(obv); {
+	case d > 0:
 		return "上升(净流入)"
-	}
-	if obv[len(obv)-1] < obv[len(obv)-6] {
+	case d < 0:
 		return "下降(净流出)"
 	}
 	return "持平"

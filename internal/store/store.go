@@ -112,6 +112,18 @@ type Snapshot struct {
 	SARValue        float64
 	SuperTrendValue float64
 
+	// Low20 is the 20-trading-day low computed from the full K-line series at
+	// -save time. It must NOT be re-derived by querying snapshot history: this
+	// table accumulates one row per run, so a stock that entered the pool days
+	// ago only has a handful of rows and MIN(low) over them yields a stop line
+	// far above the true 20-day low (measured 2026-07-25: 58% of the pool had
+	// ≤6 rows in the window; sh513260 showed -0.2% instead of the real -8.1%).
+	Low20 float64
+
+	// OBVUp3 reports 3 consecutive days of OBV net inflow, likewise computed
+	// from the full series rather than by counting the last 3 snapshot rows.
+	OBVUp3 bool
+
 	// PERF-adaptive adjusted total score (sidecar: score_total keeps the original
 	// scale so history stays comparable; screeners read COALESCE(score_adj, score_total)).
 	ScoreAdj int
@@ -209,6 +221,8 @@ CREATE TABLE IF NOT EXISTS snapshot (
   score_adj INTEGER,
   sar_value REAL,
   supertrend_value REAL,
+  low20 REAL,
+  obv_up3 INTEGER,
   PRIMARY KEY (code, trade_date)
 );
 CREATE TABLE IF NOT EXISTS metadata (
@@ -273,6 +287,8 @@ CREATE INDEX IF NOT EXISTS idx_decision_log_pending ON decision_log(outcome_pct)
 		"amplitude REAL",
 		"inside_vol REAL",
 		"outside_vol REAL",
+		"low20 REAL",
+		"obv_up3 INTEGER",
 	} {
 		if _, err := s.db.Exec("ALTER TABLE snapshot ADD COLUMN " + col); err != nil && !isDuplicateColumnErr(err) {
 			return err
@@ -575,7 +591,8 @@ INSERT INTO snapshot (
   perf_trend_follow_bull_avg10,
   keltner_squeeze, donch_break20_bull, donch_break55_bull,
   score_adj,
-  sar_value, supertrend_value
+  sar_value, supertrend_value,
+  low20, obv_up3
 ) VALUES (
   ?, ?, ?,
   ?, ?, ?, ?, ?, ?, ?, ?,
@@ -597,6 +614,7 @@ INSERT INTO snapshot (
   ?,
   ?, ?, ?,
   ?,
+  ?, ?,
   ?, ?
 )
 ON CONFLICT(code, trade_date) DO UPDATE SET
@@ -622,7 +640,8 @@ ON CONFLICT(code, trade_date) DO UPDATE SET
   perf_trend_follow_bull_avg10=excluded.perf_trend_follow_bull_avg10,
   keltner_squeeze=excluded.keltner_squeeze, donch_break20_bull=excluded.donch_break20_bull, donch_break55_bull=excluded.donch_break55_bull,
   score_adj=excluded.score_adj,
-  sar_value=excluded.sar_value, supertrend_value=excluded.supertrend_value`,
+  sar_value=excluded.sar_value, supertrend_value=excluded.supertrend_value,
+  low20=excluded.low20, obv_up3=excluded.obv_up3`,
 		snap.Code, snap.TradeDate, time.Now().Format(time.RFC3339),
 		snap.Close, snap.ChangePct, snap.Low, snap.High, snap.MA5, snap.MA10, snap.MA20, snap.MA60,
 		snap.KDJ_J, snap.MACD_DIF, snap.MACD_DEA, snap.MACD_Hist,
@@ -643,7 +662,8 @@ ON CONFLICT(code, trade_date) DO UPDATE SET
 		snap.PerfTrendFollowBullAvg10,
 		boolToInt(snap.KeltnerSqueeze), boolToInt(snap.DonchBreak20Bull), boolToInt(snap.DonchBreak55Bull),
 		snap.ScoreAdj,
-		snap.SARValue, snap.SuperTrendValue)
+		snap.SARValue, snap.SuperTrendValue,
+		snap.Low20, boolToInt(snap.OBVUp3))
 	if err != nil {
 		return fmt.Errorf("save snapshot %s@%s: %w", snap.Code, snap.TradeDate, err)
 	}
