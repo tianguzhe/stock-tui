@@ -325,7 +325,7 @@ func TestTDShortUsesTechnicalDirection(t *testing.T) {
 func flatCandles(n int, close float64) []indicator.Candle {
 	cs := make([]indicator.Candle, n)
 	for i := range cs {
-		cs[i] = indicator.Candle{High: close, Low: close, Close: close, Volume: 1}
+		cs[i] = indicator.Candle{Open: close, High: close, Low: close, Close: close, Volume: 1}
 	}
 	return cs
 }
@@ -412,7 +412,7 @@ func TestSwingMembersMatchesConflictDetection(t *testing.T) {
 func TestEvalBullBear(t *testing.T) {
 	const n = 61 // ≥ ma60 window + the look-back for OBV/price direction
 	mk := func(last indicator.Result, td indicator.TD, div analysis.DivergenceState, perfs []analysis.PerfStat, volRatio float64, sig analysis.SignalState) bullBearVerdict {
-		return evalBullBear(flatCandles(n, 10), flatResults(n, last), flatTDs(n, td), make([]float64, n), div, perfs, volRatio, sig)
+		return evalBullBear(flatCandles(n, 10), flatResults(n, last), flatTDs(n, td), make([]float64, n), div, perfs, volRatio, sig, 10)
 	}
 	// noTrend cancels the trend vote: SAR long + ST short is neither dual-long
 	// nor dual-short, and ADX=0/flat-MA add nothing.

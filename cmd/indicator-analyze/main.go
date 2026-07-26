@@ -257,7 +257,8 @@ func printAnalysis(data api.KlineData) store.Snapshot {
 	printTD(tds[n-1])
 	printRecentExtremes(candles, dates, results)
 	printStreak(candles)
-	verdict := evalBullBear(candles, results, tds, obv, div, perfs, volRatio, score.Signals)
+	limitPct := market.PriceLimitPct(data.Code, data.Name)
+	verdict := evalBullBear(candles, results, tds, obv, div, perfs, volRatio, score.Signals, limitPct)
 	printBullBear(verdict, score, last)
 	printReading(candles, results, tds, obv, score, div, perfs, volRatio, verdict)
 	printPerf(perfs)
@@ -456,6 +457,14 @@ func (v *bullBearVerdict) addBear(label string, weight int) {
 	v.BearScore += weight
 }
 
+// changePctAt 返回索引 i 处的当日涨跌幅%,无前一根时为 0。
+func changePctAt(candles []indicator.Candle, i int) float64 {
+	if i <= 0 || i >= len(candles) || candles[i-1].Close == 0 {
+		return 0
+	}
+	return (candles[i].Close - candles[i-1].Close) / candles[i-1].Close * 100
+}
+
 // perfNote labels how PERF-history reweighting changed a penalty, for display.
 func perfNote(orig, adj int) string {
 	switch {
@@ -578,11 +587,23 @@ func swingMembers(last indicator.Result) []string {
 // its most extreme member (RSI/WR/KDJ-J/BIAS), and the composite score is NOT
 // fed back as a vote. Overbought and top-divergence bear votes are reweighted by
 // this stock's own PERF history (perfScale), matching score_adj's methodology.
-func evalBullBear(candles []indicator.Candle, results []indicator.Result, tds []indicator.TD, obv []float64, div analysis.DivergenceState, perfs []analysis.PerfStat, volRatio float64, sig analysis.SignalState) bullBearVerdict {
+func evalBullBear(candles []indicator.Candle, results []indicator.Result, tds []indicator.TD, obv []float64, div analysis.DivergenceState, perfs []analysis.PerfStat, volRatio float64, sig analysis.SignalState, limitPct float64) bullBearVerdict {
 	n := len(candles)
 	last := results[n-1]
 	lastTD := tds[n-1]
 	var v bullBearVerdict
+
+	// 价格行为维度:当日 K 线本身的极端程度,唯一不经指标转换的一票。
+	// 其余六维全部是指标衍生,会漏掉跌停/跳空这类最强信号(2026-07-26:
+	// 大唐发电跌停 -10.01% 却得到 bullW=4/bearW=0)。仅极端情形投票。
+	if pa := analysis.EvalPriceAction(candles, n-1, limitPct); pa.Weight != 0 {
+		label := fmt.Sprintf("%s(%+.2f%%)", pa.Label, changePctAt(candles, n-1))
+		if pa.Weight > 0 {
+			v.addBull(label, pa.Weight)
+		} else {
+			v.addBear(label, -pa.Weight)
+		}
+	}
 
 	obWin, obN := analysis.PerfWin10(perfs, "超买反转")
 	divWin, divN := analysis.PerfWin10(perfs, "顶背离")

@@ -162,6 +162,78 @@ func CloseMA(candles []indicator.Candle, end, period int) float64 {
 	return total / float64(end-start+1)
 }
 
+// GapThreshold 是跳空的判定阈值(开盘价相对昨收的偏离)。
+const GapThreshold = 3.0
+
+// PriceAction 描述当日 K 线本身的极端程度——不经任何指标转换。
+//
+// 存在理由: 其余各维度(趋势/动量/超买超卖/资金/择时/背离)全部是**指标衍生**的,
+// 它们会漏掉最强烈的市场信号。2026-07-26 实测: 大唐发电当日跌停 -10.01%,
+// 六维投出 bullW=4 / bearW=0「偏多」——跌停这个事实没有进入任何一票。
+//
+// 只在**极端**情形取值,日常波动一律返回零值,以免与资金维度的量价判断
+// (放量上涨/下跌)重复计票。
+type PriceAction struct {
+	LimitUp   bool    // 接近涨停(距板块限幅 0.5 个百分点内)
+	LimitDown bool    // 接近跌停
+	GapPct    float64 // 跳空幅度%(开盘 vs 昨收),|GapPct| <= GapThreshold 时为 0
+	Weight    int     // 综合权重: 正=看多, 负=看空, 0=无极端信号
+	Label     string  // 供展示的说明文字, Weight==0 时为空
+}
+
+// EvalPriceAction 判定索引 i 处的价格行为。limitPct 为该标的的板块涨跌幅限制
+// (由 market.PriceLimitPct 提供); 传 market.NoPriceLimit(0) 表示无涨跌停制度
+// (如港股), 此时只判跳空。
+//
+// 权重口径:
+//   - 涨停/跌停: ±3 —— 封板意味着当日无法成交(涨停)或恐慌性抛压(跌停),
+//     是单根 K 线能给出的最强信号
+//   - 跳空 > GapThreshold: ±2 —— 跳空改变持仓成本结构,且常伴随事件驱动
+//   - 两者叠加时取较强者而非相加(同属"当日价格行为"一轴,不自我重复计票)
+func EvalPriceAction(candles []indicator.Candle, i int, limitPct float64) PriceAction {
+	var pa PriceAction
+	if i <= 0 || i >= len(candles) {
+		return pa
+	}
+	prevClose := candles[i-1].Close
+	if prevClose <= 0 {
+		return pa
+	}
+	pct := (candles[i].Close - prevClose) / prevClose * 100
+
+	if limitPct > 0 {
+		near := limitPct - 0.5
+		switch {
+		case pct >= near:
+			pa.LimitUp = true
+			pa.Weight = 3
+			pa.Label = "涨停"
+		case pct <= -near:
+			pa.LimitDown = true
+			pa.Weight = -3
+			pa.Label = "跌停"
+		}
+	}
+
+	// Open<=0 表示该根缺开盘价(部分数据源/合成数据),不能据此判跳空——
+	// 否则会算出 -100% 的假跳空。缺数据时不产生信号。
+	if candles[i].Open <= 0 {
+		return pa
+	}
+	if gap := (candles[i].Open - prevClose) / prevClose * 100; math.Abs(gap) > GapThreshold {
+		pa.GapPct = gap
+		w, label := 2, "向上跳空"
+		if gap < 0 {
+			w, label = -2, "向下跳空"
+		}
+		// 同一轴内不叠加: 已有更强的涨跌停信号时保留它。
+		if AbsInt(w) > AbsInt(pa.Weight) {
+			pa.Weight, pa.Label = w, label
+		}
+	}
+	return pa
+}
+
 // volRatioLookback 是量比的基准窗口: 腾讯口径取**前 5 个交易日**(不含当日)。
 const volRatioLookback = 5
 

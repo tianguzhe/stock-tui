@@ -579,3 +579,84 @@ func TestVolRatio(t *testing.T) {
 		t.Errorf("VolRatio(均量0) = %v, want 0", v)
 	}
 }
+
+// TestEvalPriceAction 锁定"当日价格行为"维度。它是唯一不经指标转换的一票,
+// 存在的理由是其余六维会漏掉跌停/跳空这类最强信号。
+func TestEvalPriceAction(t *testing.T) {
+	// 昨收 10.00 的两根 K 线,便于直接换算涨跌幅。
+	mk := func(open, close float64) []indicator.Candle {
+		return []indicator.Candle{
+			{Open: 10, High: 10, Low: 10, Close: 10},
+			{Open: open, High: close, Low: close, Close: close},
+		}
+	}
+
+	t.Run("主板跌停看空w3", func(t *testing.T) {
+		pa := EvalPriceAction(mk(10, 9.0), 1, 10) // -10%
+		if !pa.LimitDown || pa.Weight != -3 {
+			t.Errorf("跌停: LimitDown=%v Weight=%d, want true/-3", pa.LimitDown, pa.Weight)
+		}
+	})
+	t.Run("主板涨停看多w3", func(t *testing.T) {
+		pa := EvalPriceAction(mk(10, 11.0), 1, 10) // +10%
+		if !pa.LimitUp || pa.Weight != 3 {
+			t.Errorf("涨停: LimitUp=%v Weight=%d, want true/3", pa.LimitUp, pa.Weight)
+		}
+	})
+	t.Run("创业板12%不算涨停", func(t *testing.T) {
+		pa := EvalPriceAction(mk(10, 11.2), 1, 20) // +12%, 限幅20%
+		if pa.LimitUp || pa.Weight != 0 {
+			t.Errorf("创业板+12%%: LimitUp=%v Weight=%d, want false/0", pa.LimitUp, pa.Weight)
+		}
+	})
+	t.Run("港股无涨跌停_大涨不投票", func(t *testing.T) {
+		pa := EvalPriceAction(mk(10, 11.5), 1, 0) // limitPct=NoPriceLimit
+		if pa.LimitUp || pa.LimitDown {
+			t.Errorf("港股不应判涨跌停: %+v", pa)
+		}
+	})
+	t.Run("日常波动不投票", func(t *testing.T) {
+		if pa := EvalPriceAction(mk(10, 10.3), 1, 10); pa.Weight != 0 {
+			t.Errorf("+3%%日常波动 Weight=%d, want 0 (避免与资金维度重复计票)", pa.Weight)
+		}
+	})
+	t.Run("向下跳空w2", func(t *testing.T) {
+		pa := EvalPriceAction(mk(9.5, 9.7), 1, 10) // 开盘 -5%
+		if pa.Weight != -2 || pa.GapPct >= 0 {
+			t.Errorf("向下跳空: Weight=%d GapPct=%.2f, want -2/负值", pa.Weight, pa.GapPct)
+		}
+	})
+	t.Run("跳空幅度不足不投票", func(t *testing.T) {
+		if pa := EvalPriceAction(mk(9.8, 9.9), 1, 10); pa.Weight != 0 { // 开盘 -2% < 3%
+			t.Errorf("小跳空 Weight=%d, want 0", pa.Weight)
+		}
+	})
+	t.Run("跌停与跳空并存取较强者_不叠加", func(t *testing.T) {
+		pa := EvalPriceAction(mk(9.5, 9.0), 1, 10) // 向下跳空 + 跌停
+		if pa.Weight != -3 {
+			t.Errorf("Weight=%d, want -3 (同轴取最强,不叠加为-5)", pa.Weight)
+		}
+	})
+	t.Run("Open缺失不误判跳空", func(t *testing.T) {
+		// Open=0 会算出 -100% 假跳空;缺数据时不应产生信号
+		if pa := EvalPriceAction(mk(0, 10), 1, 10); pa.Weight != 0 {
+			t.Errorf("Open=0 时 Weight=%d, want 0", pa.Weight)
+		}
+	})
+	t.Run("边界安全", func(t *testing.T) {
+		cs := mk(10, 10)
+		for _, i := range []int{-1, 0, 2, 99} {
+			if pa := EvalPriceAction(cs, i, 10); pa.Weight != 0 {
+				t.Errorf("i=%d 越界应返回零值, got %+v", i, pa)
+			}
+		}
+		if pa := EvalPriceAction(nil, 1, 10); pa.Weight != 0 {
+			t.Errorf("nil 输入应返回零值, got %+v", pa)
+		}
+		// 昨收为 0 不得除零
+		zero := []indicator.Candle{{Close: 0}, {Open: 5, Close: 5}}
+		if pa := EvalPriceAction(zero, 1, 10); pa.Weight != 0 {
+			t.Errorf("昨收=0 应返回零值, got %+v", pa)
+		}
+	})
+}

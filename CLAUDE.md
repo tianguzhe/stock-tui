@@ -23,7 +23,9 @@
 - **量比 `vol_ratio`**：优先腾讯 proxy qt 实时量比（`VolRatioRT`，**qt 索引 49**）；`<=0` 或缺 qt（东财 fallback）时回退 `analysis.VolRatio`。**两条路径现为同一口径**（不再是"接近但非同一指标"）；score/screener 用落库 `vol_ratio`。阈值不变（0.8 / 1.5）。
   - **口径定义**：`量比 = 当日成交量 / 前 5 日（不含当日）平均成交量`。经实测反解腾讯 qt[49]，5 只标的全部吻合到小数点后两位（东材 0.767/0.77、工行 0.694/0.69、农行 0.792/0.79、华安 1.081/1.08、华天 0.958/0.96）
   - ⚠️ **不是 `Volume/MA20`**：窗口是 5 不是 20，且**不含当日**。旧实现用 MA20（含当日），工行实测 0.758 vs 真值 0.69 差 10%。所有量比判断（`batch-save` / CLI 顶部 / `EvalSignals` / CLI 近15日行的放量缩量标签）统一走 `analysis.VolRatio`，改一处即全体同步
-  - **历史脏数据回填**：`go run ./cmd/stockdb repair-volratio [--dry-run]`。`batch-save` 只写当日行，qt[46] 时期的历史错误值需本命令重算。`inside_vol`/`outside_vol` 是当日实时盘口、历史不可追溯，受影响历史行一律置 NULL（不保留方向颠倒的值）
+  - **历史脏数据回填**（两步，顺序不可颠倒）：
+    1. `go run ./cmd/stockdb repair-volratio [--dry-run]` —— 重算历史 `vol_ratio`。`inside_vol`/`outside_vol` 是当日实时盘口、历史不可追溯，受影响历史行一律置 NULL（不保留方向颠倒的值）
+    2. `go run ./cmd/stockdb repair-scores [--dry-run] [--all]` —— **按完整日K重算历史行的全部指标与评分**。仅修 `vol_ratio` 不够：score 的 Volume 分项、`EvalSignals` 的 BreakBull/BreakBear、以及派生的 PERF 与 `score_adj` 都基于量比。实现上把 KlineData 截断到目标交易日后调用**同一个** `buildSnapshot`，故口径与当日 batch-save 逐字段一致，且天然无前视偏差。`turnover_rate`/`market_cap`/`pe`/`inside_vol`/`outside_vol` 沿用原值（实时数据不可重现），`rs20/60/120` 不在写入列内故不受影响。幂等，可重复执行
   - ⚠️ **索引 46 是市净率 PB，不是量比**（2026-07-25 修正，此前一直取错）。个股 PB 在 1~7 量级，远高于 `VolSurge`=1.5 / `VolStrong`=2.0，导致几乎所有个股被判成"放量"；ETF 无 PB 返回 `0.00` 恰好触发本地回退而显示正常，使错误只出现在个股上、长期隐蔽。字段定位锚点：`[47]`/`[48]` 精确等于昨收×1.1/×0.9。已由东财 `f50`(量比)/`f167`(市净率)/`f49`(外盘)/`f161`(内盘) 逐位交叉验证，见 `docs/data-apis.md`
   - ⚠️ **内外盘方向**：`qt[7]` 是**外盘(主动买)**、`qt[8]` 是**内盘(主动卖)**，此前两者颠倒（东财 `f49`/`f161` 已验证）
 - **两套换手率（勿混）**：
@@ -63,6 +65,7 @@
 - **动量/超买超卖**:`RSI`/`WR`/`KDJ-J`/`BIAS` 四者在**代码中按同一根轴处理**——`analysis.ScoreResult` 的 `KdjWr` 项与 CLI `strongestSwingVote` 都只取其中**绝对值最大的一项**计一票,不叠加。理由是四者在极端行情下高度同向,叠加会制造"虚假共振"。注意这是**偏激进**的选择(永远取更极端的读数);当同轴内出现方向矛盾(如 RSI 超卖同时 WR 超买,9 日与 14 日窗口不一致所致),CLI 会在 SWING_CONFLICT 行标出——**该票仍照常计入**(分值口径不变、历史可比),但可信度低,需以趋势维度(SAR/ST/DMI)复核后再采信。`MACD` 相对独立(趋势性动量),单独计票。`StochRSI`(K/D)= RSI6 在 14 日窗口内的位置,RSI6 钝死极端值时判别力丧失、StochRSI 重新展开该区间——见下「极端行情指标口径 → 极端超卖/超买」段。
 - **波动/通道**:`ATR`/BOLL 带宽量波动幅度;`BOLL`(σ 带)、`Keltner`(ATR 带)、`Donchian`(极值带)是三类通道,BOLL vs Keltner 的对比正是 Squeeze 的意义。
 - **资金**:`MFI`(0–100 有界、超买超卖,位于 `internal/indicator`)与 OBV(累计、趋势)互补;量比看量能强度。**MFI 定性口径**：> 80 超买 / 70–80 偏高 / 20–30 偏低 / < 20 超卖。**OBV 不在指标包**:实现为 `internal/analysis` 的 `OBVSeries`(经典累加:收涨加量/收跌减量/平盘持平)+ `OBVTrend`(近6日趋势文字"上升(净流入)"/"下降(净流出)"/"持平"),进 score 信号位 `OBVUp`、CLI `evalBullBear`、PERF 与 `OBV=` 输出。**OBV 累计值本身不落库**(选股表/回测/journal 看不到数值),但两个**布尔判据**落库:`obv_up`(单日净流入)与 `obv_up3`(`OBVUp3Day`,连续 3 日净流入,screener star 分层要求,单日沦为 watch)。二者共用 `obvLookback`=5 的回看窗口(`obv[i] > obv[i-5]`),**改一个必须同步另一个**,否则"单日"与"3日持续"会各按一套窗口判断。CLI `OBV=` 行同时显示趋势文字与 `3日持续=是/否`。
+- **当日价格行为**:涨跌停、跳空是**唯一不经指标转换**的一票(`analysis.EvalPriceAction`)。其余各维全是指标衍生,会漏掉最强烈的市场信号——2026-07-26 实测大唐发电跌停 -10.01%,六维投出 bullW=4/bearW=0「偏多」,跌停这个事实没进入任何一票。**仅极端情形投票**(涨跌停 ±3 / 跳空>3% ±2,同轴取最强不叠加),日常波动不投,以免与资金维度的量价判断重复计票。板块限幅由 `market.PriceLimitPct` 提供,港股(无涨跌停)只判跳空。
 - **择时**:`TDSequential` 是独立口径,可与趋势/动量交叉印证。**学术证据**(Levine & Pedersen 2017, Lo/Mamaysky/Wang 2000)显示 TD 9→13 计数体系无统计显著预测力——项目中**不计入 score_total、不进 screener coreTech 硬门槛**；仅作 CLI 展示、PERF 统计(按个股历史自证)、evalBullBear 择时维度 w=1 与 lateStageRisk 联合条件(需 tdTop≥5 且 divBear 才触发)的辅助参考。
 
 ### 极端行情指标口径
