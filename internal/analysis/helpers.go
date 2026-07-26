@@ -162,6 +162,37 @@ func CloseMA(candles []indicator.Candle, end, period int) float64 {
 	return total / float64(end-start+1)
 }
 
+// volRatioLookback 是量比的基准窗口: 腾讯口径取**前 5 个交易日**(不含当日)。
+const volRatioLookback = 5
+
+// VolRatio 计算索引 i 处的量比 = 当日成交量 / 前 5 日(不含当日)平均成交量。
+//
+// 口径经实测反解: 2026-07-25 用 5 只标的对照腾讯 qt[49] 实时量比,
+// 本式全部吻合到小数点后两位(东材 0.767/0.77、工行 0.694/0.69、
+// 农行 0.792/0.79、华安 1.081/1.08、华天 0.958/0.96)。
+//
+// ⚠ 关键在于**不含当日**且窗口是 5 而非 20。旧实现用 Volume/MA20(含当日),
+// 与腾讯实时量比不是同一指标(工行实测 0.758 vs 真值 0.69,差 10%),
+// 导致落库的 vol_ratio 在"取 qt"与"本地回退"两条路径上口径不一致——
+// 同一个 0.8/1.5 阈值卡在两套分布上。现统一为本式。
+//
+// 样本不足(i<=0)时返回 0,由调用方按"无量比"处理;窗口不满 5 日时用可得日数,
+// 与项目其他指标的 warmup 风格一致。
+func VolRatio(candles []indicator.Candle, i int) float64 {
+	if i <= 0 || i >= len(candles) {
+		return 0
+	}
+	start := i - volRatioLookback
+	if start < 0 {
+		start = 0
+	}
+	total := 0.0
+	for j := start; j < i; j++ {
+		total += candles[j].Volume
+	}
+	return Ratio(candles[i].Volume, total/float64(i-start))
+}
+
 // VolumeMA 计算截至 end 索引的 period 日成交量 SMA。
 func VolumeMA(candles []indicator.Candle, end, period int) float64 {
 	start := MaxInt(0, end-period+1)

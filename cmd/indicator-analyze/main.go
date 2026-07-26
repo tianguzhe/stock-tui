@@ -137,10 +137,10 @@ func printAnalysis(data api.KlineData) store.Snapshot {
 	low60, high60 := analysis.RangeLowHigh(candles, n-60, n)
 	low120, high120 := analysis.RangeLowHigh(candles, n-120, n)
 	volMA20 := analysis.MeanTail(volumes, 20)
-	// 量比: 优先用 API 实时数据,回退本地计算(Volume/MA20)
+	// 量比: 优先腾讯 qt 实时值,缺失时本地重算(同一口径,见 analysis.VolRatio)
 	volRatio := data.VolRatioRT
 	if volRatio <= 0 {
-		volRatio = analysis.Ratio(lastCandle.Volume, volMA20)
+		volRatio = analysis.VolRatio(candles, n-1)
 	}
 	obv := analysis.OBVSeries(candles)
 	upCnt, upAvgVol, downCnt, downAvgVol := analysis.RecentVolumeHealth(candles, 5)
@@ -886,8 +886,9 @@ func printRecentRows(candles []indicator.Candle, dates []string, results []indic
 	for i := start; i < len(candles); i++ {
 		row := results[i]
 		volumeTag := "平"
-		if vm := analysis.VolumeMA(candles, i, 20); vm > 0 {
-			ratio := candles[i].Volume / vm
+		// 与 SCORE/BULLBEAR 行同口径(analysis.VolRatio),避免同一屏出现
+		// "量比 0.69" 与"放量"并存的自相矛盾。
+		if ratio := analysis.VolRatio(candles, i); ratio > 0 {
 			if ratio > analysis.VolSurge {
 				volumeTag = "放量"
 			} else if ratio < analysis.VolQuiet {

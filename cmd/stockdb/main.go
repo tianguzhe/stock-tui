@@ -58,6 +58,8 @@ func run(args []string) error {
 		return cmdCheckData(rest)
 	case "batch-save":
 		return batchSaveCmd(rest)
+	case "repair-volratio":
+		return repairVolRatioCmd(rest)
 	default:
 		return usageErr()
 	}
@@ -77,6 +79,7 @@ func usageErr() error {
   stockdb hot [--top N]                   fetch THS hot list and import into instrument table
   stockdb check-data                      data quality checks (RS coverage, continuity, backfill progress)
   stockdb batch-save [-P N] [-n N]      batch-save analysis snapshots for all instruments
+  stockdb repair-volratio [--dry-run]   重算历史 snapshot 的 vol_ratio(修 qt[46] 误取市净率)
 `)
 }
 

@@ -524,3 +524,58 @@ func TestWilsonBounds(t *testing.T) {
 		})
 	}
 }
+
+// TestVolRatio 锁定量比口径 = 当日量 / 前5日(不含当日)均量。
+//
+// fixture 取自 2026-07-25 对腾讯 qt[49] 的实测反解,5 只标的全部吻合:
+// 东材 0.77、工行 0.69、农行 0.79、华安 1.08、华天 0.96。
+// 这里用工商银行的真实成交量序列做端到端验证——它同时是区分度最好的样本
+// (旧的 Volume/MA20 口径在它身上得 0.758,与真值 0.69 差 10%)。
+func TestVolRatio(t *testing.T) {
+	// 工商银行 2026-07-09..07-24 真实成交量(手,取自腾讯 proxy K线),
+	// 最后一根为 07-24。当日 3689522 / 前5日均 5317914.2 = 0.6938 ≈ qt[49]=0.69
+	vols := []float64{
+		4039925, 4068382, 6507835, 4764820, 4023618,
+		3517401, 7151598, 6220762, 5758785, 4301543,
+		3156883, 3689522,
+	}
+	candles := make([]indicator.Candle, len(vols))
+	for i, v := range vols {
+		candles[i] = indicator.Candle{Close: 7.75, Volume: v}
+	}
+
+	last := len(candles) - 1
+	got := VolRatio(candles, last)
+	if math.Abs(got-0.69) > 0.005 {
+		t.Errorf("VolRatio = %.4f, want ≈0.69 (腾讯 qt[49] 实测值)", got)
+	}
+
+	// 旧口径 Volume/MA20(含当日) 会得到明显不同的值 —— 锁定两者确实有别,
+	// 防止有人"顺手"改回 MeanTail(volumes,20)。
+	if oldStyle := Ratio(candles[last].Volume, MeanTail(VolumeSeries(candles), 20)); math.Abs(oldStyle-got) < 0.01 {
+		t.Errorf("旧口径 %.4f 与新口径 %.4f 过于接近，fixture 失去区分度", oldStyle, got)
+	}
+
+	// 边界: 无前日 / 越界 / 空输入一律返回 0
+	if v := VolRatio(candles, 0); v != 0 {
+		t.Errorf("VolRatio(i=0) = %v, want 0", v)
+	}
+	if v := VolRatio(candles, len(candles)); v != 0 {
+		t.Errorf("VolRatio(越界) = %v, want 0", v)
+	}
+	if v := VolRatio(nil, 1); v != 0 {
+		t.Errorf("VolRatio(nil) = %v, want 0", v)
+	}
+
+	// 窗口不满 5 日时用可得日数: i=2 → 前两日均量 (100+200)/2=150
+	short := []indicator.Candle{{Volume: 100}, {Volume: 200}, {Volume: 300}}
+	if v := VolRatio(short, 2); math.Abs(v-2.0) > 1e-9 {
+		t.Errorf("VolRatio(窗口不满) = %v, want 2.0 (300/150)", v)
+	}
+
+	// 前5日均量为0时安全返回0(Ratio 保护),不 panic 不 Inf
+	zero := []indicator.Candle{{Volume: 0}, {Volume: 0}, {Volume: 500}}
+	if v := VolRatio(zero, 2); v != 0 {
+		t.Errorf("VolRatio(均量0) = %v, want 0", v)
+	}
+}

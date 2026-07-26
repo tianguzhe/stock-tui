@@ -170,6 +170,18 @@ func runScreen(holdingsRaw string, maxResults int, capital float64, dryRun bool)
 		upsertedHoldings, upsertedSelected, skippedHoldings := saveDecisions(st, date, candidates, holdings, selected)
 		fmt.Printf("\n> 📝 已写入 decision_log（更新/新增 %d 持仓 + %d 候选；无快照持仓 %d）\n",
 			upsertedHoldings, upsertedSelected, skippedHoldings)
+
+		// 给持仓打上 holdings 标记，豁免热榜的冷门清理——否则低热度持仓会被
+		// 淘汰出 instrument，batch-save 停止更新，持仓行读到的快照越来越旧。
+		codes := make([]string, 0, len(holdings))
+		for _, h := range holdings {
+			codes = append(codes, h.Code)
+		}
+		if n, err := st.MarkHoldings(codes); err != nil {
+			fmt.Fprintf(os.Stderr, "warn: 标记持仓豁免失败: %v\n", err)
+		} else if n > 0 {
+			fmt.Printf("> 🔒 %d 只持仓已标记为豁免热榜清理\n", n)
+		}
 	} else {
 		fmt.Println("\n> 🔍 dry-run 模式，未写入 decision_log")
 	}

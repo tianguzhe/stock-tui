@@ -659,3 +659,82 @@ func TestImportHotStocksIdempotentSameDay(t *testing.T) {
 		t.Errorf("hot_score = %d after second call, want 2 (no double decay)", got)
 	}
 }
+
+// TestHotPruneExemptsHoldings 持仓豁免热榜清理：hot_score 衰减到 0 的普通标的
+// 会被删除，但 note='holdings' 的必须留下——否则 batch-save 停止更新它，
+// 选股表的持仓行会静默读到越来越旧的快照。
+func TestHotPruneExemptsHoldings(t *testing.T) {
+	s := openTemp(t)
+
+	// 两只都冷到 hot_score=0，其中一只是持仓。
+	for _, c := range []struct{ code, name string }{
+		{"sh600001", "冷门股"},
+		{"sh600002", "持仓股"},
+	} {
+		if err := s.UpsertInstrument(c.code, c.name, "sh", ""); err != nil {
+			t.Fatalf("upsert %s: %v", c.code, err)
+		}
+	}
+	if _, err := s.db.Exec(`UPDATE instrument SET hot_score = 0`); err != nil {
+		t.Fatalf("set hot_score=0: %v", err)
+	}
+	n, err := s.MarkHoldings([]string{"sh600002"})
+	if err != nil {
+		t.Fatalf("MarkHoldings: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("MarkHoldings updated %d rows, want 1", n)
+	}
+
+	// 触发一次热榜导入（今日尚未衰减过，故 decay+prune 会执行）。
+	if _, err := s.ImportHotStocks([]HotStockEntry{
+		{Code: "sh600003", Name: "今日热门", Market: "sh"},
+	}); err != nil {
+		t.Fatalf("ImportHotStocks: %v", err)
+	}
+
+	var coldGone, holdingKept int
+	if err := s.db.QueryRow(
+		`SELECT COUNT(*) FROM instrument WHERE code='sh600001'`).Scan(&coldGone); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.QueryRow(
+		`SELECT COUNT(*) FROM instrument WHERE code='sh600002'`).Scan(&holdingKept); err != nil {
+		t.Fatal(err)
+	}
+	if coldGone != 0 {
+		t.Error("非持仓的冷门标的应被清理，但仍存在")
+	}
+	if holdingKept != 1 {
+		t.Error("持仓标的被热榜清理了——batch-save 将停止更新它，持仓数据会静默陈旧")
+	}
+}
+
+// TestMarkHoldingsIdempotentAndSkipsMissing 重复标记不重复计数；
+// instrument 中不存在的代码被忽略而非报错。
+func TestMarkHoldingsIdempotentAndSkipsMissing(t *testing.T) {
+	s := openTemp(t)
+	if err := s.UpsertInstrument("sh600519", "贵州茅台", "sh", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	n, err := s.MarkHoldings([]string{"sh600519", "sh999999"})
+	if err != nil {
+		t.Fatalf("MarkHoldings: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("首次标记 updated=%d, want 1 (不存在的代码应被忽略)", n)
+	}
+
+	n, err = s.MarkHoldings([]string{"sh600519"})
+	if err != nil {
+		t.Fatalf("MarkHoldings 二次: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("重复标记 updated=%d, want 0 (已是 holdings)", n)
+	}
+
+	if _, err := s.MarkHoldings(nil); err != nil {
+		t.Errorf("MarkHoldings(nil) 应安全返回, got %v", err)
+	}
+}

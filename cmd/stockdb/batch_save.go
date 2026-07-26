@@ -182,12 +182,10 @@ func buildSnapshot(data api.KlineData) store.Snapshot {
 	lastCandle := candles[n-1]
 	closes := analysis.CloseSeries(candles)
 	ma5, ma10, ma20, ma60 := analysis.MeanTail(closes, 5), analysis.MeanTail(closes, 10), analysis.MeanTail(closes, 20), analysis.MeanTail(closes, 60)
-	volumes := analysis.VolumeSeries(candles)
-	volMA20 := analysis.MeanTail(volumes, 20)
-	// 量比: 优先用 API 实时数据,回退本地计算(Volume/MA20)
+	// 量比: 优先腾讯 qt 实时值,缺失时本地重算(同一口径,见 analysis.VolRatio)
 	volRatio := data.VolRatioRT
 	if volRatio <= 0 {
-		volRatio = analysis.Ratio(lastCandle.Volume, volMA20)
+		volRatio = analysis.VolRatio(candles, n-1)
 	}
 	obv := analysis.OBVSeries(candles)
 	// 20 日最低价:止损回退线,必须来自完整日K(见 store.Snapshot.Low20 注释)。

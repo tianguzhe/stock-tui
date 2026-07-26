@@ -466,6 +466,44 @@ WHERE code = ? AND tag_id = (SELECT id FROM tag WHERE name = ?)`, code, tag)
 	return nil
 }
 
+// NoteHoldings marks an instrument as user-held. Rows carrying this note are
+// exempt from the hot-list decay pruning in ImportHotStocks: a position must
+// keep receiving daily snapshots regardless of how cold the market is on it,
+// otherwise the screener's holdings table silently serves stale data.
+const NoteHoldings = "holdings"
+
+// MarkHoldings sets note=NoteHoldings on the given codes, exempting them from
+// hot-list pruning. Codes absent from instrument are ignored (a position with
+// no instrument row has no snapshots to protect yet); use UpsertInstrument
+// first if it needs creating. Returns the number of rows updated.
+func (s *Store) MarkHoldings(codes []string) (int, error) {
+	if len(codes) == 0 {
+		return 0, nil
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+
+	updated := 0
+	for _, code := range codes {
+		r, err := tx.Exec(
+			`UPDATE instrument SET note = ? WHERE code = ? AND COALESCE(note, '') != ?`,
+			NoteHoldings, code, NoteHoldings)
+		if err != nil {
+			return 0, fmt.Errorf("mark holding %s: %w", code, err)
+		}
+		if n, err := r.RowsAffected(); err == nil {
+			updated += int(n)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return updated, nil
+}
+
 // HotStockEntry is a minimal data transfer type for ImportHotStocks.
 // Defined here to avoid a circular import with the api package.
 type HotStockEntry struct {
@@ -509,7 +547,12 @@ func (s *Store) ImportHotStocks(stocks []HotStockEntry) (HotImportResult, error)
 	}
 	if lastDecay != today {
 		res.Decayed = true
-		pr, err := tx.Exec(`DELETE FROM instrument WHERE hot_score = 0`)
+		// 持仓豁免：note='holdings' 的标的不随热度清理。否则低热度的持仓
+		// 会在几天内被淘汰出 instrument，batch-save 随之停止更新它们，
+		// 而选股表仍照常列出——持仓行会悄悄读到越来越陈旧的快照。
+		pr, err := tx.Exec(
+			`DELETE FROM instrument WHERE hot_score = 0 AND COALESCE(note, '') != ?`,
+			NoteHoldings)
 		if err != nil {
 			return res, fmt.Errorf("prune cold hot-score instruments: %w", err)
 		}

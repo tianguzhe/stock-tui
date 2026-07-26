@@ -310,7 +310,7 @@ func EvalSignals(candles []indicator.Candle, results []indicator.Result, obv []f
 	}
 	r, prev := results[i], results[i-1]
 	ma5, ma20, ma60 := CloseMA(candles, i, 5), CloseMA(candles, i, 20), CloseMA(candles, i, 60)
-	vr := Ratio(candles[i].Volume, VolumeMA(candles, i, 20))
+	vr := VolRatio(candles, i)
 	fiveAgo := MaxInt(0, i-5)
 	priceUp5 := candles[i].Close > candles[fiveAgo].Close
 	priceDown5 := candles[i].Close < candles[fiveAgo].Close
