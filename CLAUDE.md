@@ -2,16 +2,27 @@
 
 ## 目录结构
 - `cmd/indicator-analyze` — 单标的深度技术面分析 CLI（tdx.go 单独存放 TDX TCP 协议逻辑，-tdx 标志显式启用）
-- `cmd/stockdb` — 数据库管理（tag/history/rs-rank/backfill/backtest/batch-save/hot）
+- `cmd/stockdb` — 数据库管理（tag/history/rs-rank/backfill/backtest/batch-save/hot/check-data）
+- `cmd/watch` — 盘中实时监控 TUI（BubbleTea，读 `.holdings` 自动展示持仓行情）
+- `main.go` — TUI 自选股行情入口（`go run .`）
 - `internal/api` — 行情 API（`FetchStocks`/`FetchMinute`/`FetchDailyKline`/`proxy_kline` 解析 + 东财反限流）
 - `internal/analysis` — 技术面评分/信号/背离/PERF 引擎（cmd 共享，勿在 cmd 内再复制一套）
+- `internal/backtest` — 回测引擎（`engine.go` 单信号回测 + `portfolio.go` 组合回测）
 - `internal/indicator` — 技术指标计算引擎（`Calculate` 核心集 + CYQ 筹码分布 / CYC 成本均线 / TD Sequential 衍生指标）
+- `internal/market` — 市场工具（代码规范化 `NormalizeCode`、涨跌停限幅 `PriceLimitPct`、ST 判定 `IsST`）
 - `internal/store` — SQLite 存储层（snapshot/decision_log/instrument）
+- `internal/ui` — BubbleTea UI 组件（TUI 渲染）
 - `scripts/` — 每日更新/选股/日志生成/测试脚本
+- `reports/` — 组合报告与板块分析输出
 - `docs/journal/` — 每日复盘日志
 - `docs/holdings-monitor/` — 持仓监控文档（含候选观察状态）
 - `docs/daily-decision.md` — 每日操作决策主文件（账户总览/止损红线/持仓决策矩阵/建仓闸门/执行记录），**纯手动维护、不在任何脚本自动化范围内**；持仓/成本/止损变动时需与 `docs/journal/` 当日 journal.md 同步更新，否则两处口径会不一致
 - `docs/cyq-data-source-notes.md` — CYQ 筹码指标数据源注意事项
+
+### 盘中监控 TUI
+- 命令：`go run ./cmd/watch`（或编译后的 `./watch`）
+- 读取 `.holdings` 文件自动展示持仓实时行情、浮盈、技术面诊断
+- 支持多账户（`#` 开头的注释行分隔）
 
 ## 行情数据
 - `internal/api` 封装行情 API（实时报价 `FetchStocks`、分时 `FetchMinute`、**日K获取 `FetchDailyKline`**——proxy 前复权 + 东财 fallback + TDX 换手率兜底，共享层消除 cmd 间重复）。
@@ -162,7 +173,7 @@
 - 后续若要添加多个关键百分比标示线,按从背景到前景排序:百分比线/昨收线/开盘线在前,价格线永远最后;测试应断言价格 series 为连续原始价格序列。
 
 ## 持仓格式与浮盈计算
-- 持仓以**手(1手=100股)**为最小单位。`.holdings` 文件格式：`代码:成本:手数`（如 `sh601138:65.490:2`）。
+- 持仓以**手(1手=100股)**为最小单位。`.holdings` 文件格式：`代码:成本:手数`（如 `sh601138:65.490:2`）。支持 `#` 开头的注释行分隔多账户（如 `# 银河证券账户`），工具会自动跳过。
 - 浮盈 = (今收 - 成本) × 手数 × 100。
 
 ## PERF 历史驱动的信号权重（核心方法论）
@@ -272,6 +283,9 @@ go run ./cmd/stockdb rs-rank
 
 # 3. 回填决策结果（信号后满 10 个交易日的 decision_log 自动结算，输出分层胜率）
 go run ./cmd/stockdb backfill
+
+# 3.1（可选）数据质量检查——验证 RS 覆盖率、连续性、回填进度
+go run ./cmd/stockdb check-data
 
 # 4. 生成选股表（持仓置顶 + 优质候选，合计≤持仓数+7；--max 可手动指定上限）
 ./scripts/screen-stocks.sh \
