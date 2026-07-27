@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -179,7 +180,7 @@ CREATE TABLE IF NOT EXISTS instrument_tag (
   PRIMARY KEY (code, tag_id)
 );
 CREATE TABLE IF NOT EXISTS snapshot (
-  code        TEXT NOT NULL REFERENCES instrument(code) ON DELETE CASCADE,
+  code        TEXT NOT NULL,
   trade_date  TEXT NOT NULL,
   captured_at TEXT NOT NULL,
   close REAL, change_pct REAL,
@@ -231,7 +232,7 @@ CREATE TABLE IF NOT EXISTS metadata (
 );
 CREATE TABLE IF NOT EXISTS decision_log (
   id           INTEGER PRIMARY KEY AUTOINCREMENT,
-  code         TEXT NOT NULL REFERENCES instrument(code) ON DELETE CASCADE,
+  code         TEXT NOT NULL,
   log_date     TEXT NOT NULL,
   action       TEXT NOT NULL,
   tier         TEXT NOT NULL,
@@ -254,7 +255,7 @@ CREATE INDEX IF NOT EXISTS idx_decision_log_pending ON decision_log(outcome_pct)
 	if _, err := s.db.Exec(schema); err != nil {
 		return fmt.Errorf("migrate schema: %w", err)
 	}
-	if err := s.ensureDecisionLogForeignKey(); err != nil {
+	if err := s.dropInstrumentForeignKeys(); err != nil {
 		return err
 	}
 	// Add new columns to existing databases; SQLite does not support IF NOT EXISTS
@@ -321,93 +322,121 @@ CREATE INDEX IF NOT EXISTS idx_decision_log_pending ON decision_log(outcome_pct)
 	return nil
 }
 
-func (s *Store) ensureDecisionLogForeignKey() error {
-	rows, err := s.db.Query(`PRAGMA foreign_key_list(decision_log)`)
-	if err != nil {
-		return fmt.Errorf("inspect decision_log foreign keys: %w", err)
-	}
-	hasFK := false
-	for rows.Next() {
-		var id, seq int
-		var table, from, to, onUpdate, onDelete, match string
-		if err := rows.Scan(&id, &seq, &table, &from, &to, &onUpdate, &onDelete, &match); err != nil {
-			rows.Close()
+// instrumentFKRe matches the inline `REFERENCES instrument(code) ON DELETE CASCADE`
+// column constraint so it can be stripped from a table's own CREATE statement.
+// It deliberately does not consume the trailing comma that separates columns.
+var instrumentFKRe = regexp.MustCompile(`(?i)\s+REFERENCES\s+instrument\s*\(\s*code\s*\)\s+ON\s+DELETE\s+CASCADE`)
+
+// dropInstrumentForeignKeys removes the instrument(code) ON DELETE CASCADE
+// constraint from snapshot and decision_log.
+//
+// Why: instrument is a rotating watchlist — ImportHotStocks prunes cold codes
+// every day — while snapshot and decision_log are historical facts. Backtests
+// and PERF statistics read snapshot directly (internal/backtest never joins
+// instrument), so cascading the prune into them silently shrank the sample:
+// the 2026-07-27 prune of 23 codes destroyed 332 snapshot rows and 7
+// decision_log rows, 5 of which were already settled. A code that re-enters
+// the hot list is re-inserted with its history erased, and nothing errors.
+//
+// Dropping the constraint does not widen stock selection: screener still joins
+// instrument, so codes that aged out of the pool stay out of the candidate set.
+//
+// The rebuild reuses each table's own CREATE statement from sqlite_master with
+// the FK clause stripped. The new table therefore has exactly the legacy column
+// order — including any ALTER-added columns — so the copy can use SELECT *.
+func (s *Store) dropInstrumentForeignKeys() error {
+	for _, t := range []struct {
+		name    string
+		indexes []string
+	}{
+		{name: "snapshot"},
+		{name: "decision_log", indexes: []string{
+			`CREATE INDEX IF NOT EXISTS idx_decision_log_date ON decision_log(log_date)`,
+			`CREATE INDEX IF NOT EXISTS idx_decision_log_pending ON decision_log(outcome_pct) WHERE outcome_pct IS NULL`,
+		}},
+	} {
+		if err := s.rebuildWithoutInstrumentFK(t.name, t.indexes); err != nil {
 			return err
 		}
-		if table == "instrument" && from == "code" && to == "code" && onDelete == "CASCADE" {
-			hasFK = true
-		}
 	}
-	if err := rows.Close(); err != nil {
+	return nil
+}
+
+// rebuildWithoutInstrumentFK is a no-op when table carries no instrument FK,
+// so it is safe to run on every Open. indexes are recreated after the swap
+// (dropping the legacy table also drops the indexes that travelled with it).
+func (s *Store) rebuildWithoutInstrumentFK(table string, indexes []string) error {
+	hasFK, err := s.hasInstrumentFK(table)
+	if err != nil || !hasFK {
 		return err
 	}
-	if err := rows.Err(); err != nil {
-		return err
+
+	var createSQL string
+	if err := s.db.QueryRow(
+		`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?`, table,
+	).Scan(&createSQL); err != nil {
+		return fmt.Errorf("read %s schema: %w", table, err)
 	}
-	if hasFK {
-		return nil
+	strippedSQL := instrumentFKRe.ReplaceAllString(createSQL, "")
+	// Fail loudly rather than rebuild a table that still cascades: a silent
+	// pass here would look like a successful migration while history keeps
+	// disappearing.
+	if strings.Contains(strings.ToLower(strippedSQL), "references instrument") {
+		return fmt.Errorf("strip instrument FK from %s: unrecognised schema %q", table, createSQL)
 	}
 
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer tx.Rollback() //nolint:errcheck
 
-	if _, err := tx.Exec(`ALTER TABLE decision_log RENAME TO decision_log_legacy`); err != nil {
-		return fmt.Errorf("rename legacy decision_log: %w", err)
+	legacy := table + "_fk_legacy"
+	if _, err := tx.Exec(fmt.Sprintf(`ALTER TABLE %s RENAME TO %s`, table, legacy)); err != nil {
+		return fmt.Errorf("rename %s: %w", table, err)
 	}
-	if _, err := tx.Exec(`DROP INDEX IF EXISTS idx_decision_log_date`); err != nil {
-		return fmt.Errorf("drop legacy decision_log date index: %w", err)
+	if _, err := tx.Exec(strippedSQL); err != nil {
+		return fmt.Errorf("recreate %s without instrument FK: %w", table, err)
 	}
-	if _, err := tx.Exec(`DROP INDEX IF EXISTS idx_decision_log_pending`); err != nil {
-		return fmt.Errorf("drop legacy decision_log pending index: %w", err)
+	if _, err := tx.Exec(fmt.Sprintf(`INSERT INTO %s SELECT * FROM %s`, table, legacy)); err != nil {
+		return fmt.Errorf("copy %s rows: %w", table, err)
 	}
-	if _, err := tx.Exec(`
-CREATE TABLE decision_log (
-  id           INTEGER PRIMARY KEY AUTOINCREMENT,
-  code         TEXT NOT NULL REFERENCES instrument(code) ON DELETE CASCADE,
-  log_date     TEXT NOT NULL,
-  action       TEXT NOT NULL,
-  tier         TEXT NOT NULL,
-  score_total  INTEGER,
-  adx          REAL,
-  sar_long     INTEGER,
-  st_long      INTEGER,
-  obv_up       INTEGER,
-  macd_hist    REAL,
-  td_countdown TEXT,
-  signals      TEXT,
-  created_at   TEXT NOT NULL,
-  outcome_pct  REAL,
-  outcome_date TEXT,
-  correct      INTEGER,
-  UNIQUE(code, log_date, action)
-)`); err != nil {
-		return fmt.Errorf("create repaired decision_log: %w", err)
+	if _, err := tx.Exec(`DROP TABLE ` + legacy); err != nil {
+		return fmt.Errorf("drop legacy %s: %w", table, err)
 	}
-	if _, err := tx.Exec(`
-INSERT OR IGNORE INTO decision_log
-  (id, code, log_date, action, tier, score_total, adx, sar_long, st_long,
-   obv_up, macd_hist, td_countdown, signals, created_at, outcome_pct,
-   outcome_date, correct)
-SELECT id, code, log_date, action, tier, score_total, adx, sar_long, st_long,
-       obv_up, macd_hist, td_countdown, signals, created_at, outcome_pct,
-       outcome_date, correct
-FROM decision_log_legacy
-WHERE EXISTS (SELECT 1 FROM instrument WHERE instrument.code = decision_log_legacy.code)`); err != nil {
-		return fmt.Errorf("copy legacy decision_log: %w", err)
-	}
-	if _, err := tx.Exec(`DROP TABLE decision_log_legacy`); err != nil {
-		return fmt.Errorf("drop legacy decision_log: %w", err)
-	}
-	if _, err := tx.Exec(`CREATE INDEX IF NOT EXISTS idx_decision_log_date ON decision_log(log_date)`); err != nil {
-		return fmt.Errorf("create decision_log date index: %w", err)
-	}
-	if _, err := tx.Exec(`CREATE INDEX IF NOT EXISTS idx_decision_log_pending ON decision_log(outcome_pct) WHERE outcome_pct IS NULL`); err != nil {
-		return fmt.Errorf("create decision_log pending index: %w", err)
+	for _, idx := range indexes {
+		if _, err := tx.Exec(idx); err != nil {
+			return fmt.Errorf("recreate %s index: %w", table, err)
+		}
 	}
 	return tx.Commit()
+}
+
+// hasInstrumentFK reports whether table declares a foreign key onto
+// instrument(code). table must be a trusted internal identifier: PRAGMA does
+// not accept bound parameters, so it is interpolated.
+func (s *Store) hasInstrumentFK(table string) (bool, error) {
+	rows, err := s.db.Query(`PRAGMA foreign_key_list(` + table + `)`)
+	if err != nil {
+		return false, fmt.Errorf("inspect %s foreign keys: %w", table, err)
+	}
+	defer rows.Close() //nolint:errcheck
+
+	hasFK := false
+	for rows.Next() {
+		var id, seq int
+		var refTable, from, to, onUpdate, onDelete, match string
+		if err := rows.Scan(&id, &seq, &refTable, &from, &to, &onUpdate, &onDelete, &match); err != nil {
+			return false, fmt.Errorf("scan %s foreign keys: %w", table, err)
+		}
+		if refTable == "instrument" && from == "code" {
+			hasFK = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return false, fmt.Errorf("read %s foreign keys: %w", table, err)
+	}
+	return hasFK, nil
 }
 
 // UpsertInstrument inserts the instrument or updates its name/market/note when

@@ -241,13 +241,18 @@ ALTER TABLE snapshot_legacy RENAME TO snapshot;
 	}
 }
 
-func TestMigrationRepairsLegacyDecisionLogSchema(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "legacy-decision.db")
+// TestMigrationDropsInstrumentForeignKeys 迁移必须移除 snapshot/decision_log 指向
+// instrument 的级联外键。instrument 是每日轮动的热榜池（ImportHotStocks 清理冷门
+// 代码），而这两张表是回测与 PERF 的历史样本来源，级联删除会随热榜清理静默销毁历史。
+// 迁移同时不得丢弃已成孤儿的历史行——它们正是过去被级联删除前的样本。
+func TestMigrationDropsInstrumentForeignKeys(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy-fk.db")
 
 	legacy, err := sql.Open("sqlite", path)
 	if err != nil {
 		t.Fatalf("open legacy sqlite: %v", err)
 	}
+	// 裸连接默认 foreign_keys=OFF，故可以直接埋入孤儿行。
 	_, err = legacy.Exec(`
 CREATE TABLE instrument (
   code       TEXT PRIMARY KEY,
@@ -265,7 +270,7 @@ CREATE TABLE snapshot (
 );
 CREATE TABLE decision_log (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  code TEXT NOT NULL,
+  code TEXT NOT NULL REFERENCES instrument(code) ON DELETE CASCADE,
   log_date TEXT NOT NULL,
   action TEXT NOT NULL,
   tier TEXT NOT NULL,
@@ -284,6 +289,10 @@ CREATE TABLE decision_log (
   UNIQUE(code, log_date, action)
 );
 INSERT INTO instrument (code, name, market, created_at) VALUES ('sz000001', '平安银行', 'sz', 'now');
+INSERT INTO snapshot (code, trade_date, captured_at, close)
+VALUES ('sz000001', '2026-06-01', 'now', 10.5),
+       ('sz000001', '2026-06-02', 'now', 11.5),
+       ('sz999999', '2026-06-01', 'now', 99.5);
 INSERT INTO decision_log (code, log_date, action, tier, created_at)
 VALUES ('sz000001', '2026-06-01', 'recommend', '⭐⭐', 'now'),
        ('sz999999', '2026-06-01', 'recommend', '⭐⭐', 'now');`)
@@ -294,29 +303,103 @@ VALUES ('sz000001', '2026-06-01', 'recommend', '⭐⭐', 'now'),
 		t.Fatalf("close legacy sqlite: %v", err)
 	}
 
-	repaired, err := Open(path)
+	migrated, err := Open(path)
 	if err != nil {
-		t.Fatalf("open repaired store: %v", err)
+		t.Fatalf("open migrated store: %v", err)
 	}
-	defer repaired.Close()
+	defer migrated.Close()
 
-	var fkCount int
-	if err := repaired.db.QueryRow(`
-SELECT COUNT(*)
-FROM pragma_foreign_key_list('decision_log')
-WHERE "table" = 'instrument' AND "from" = 'code' AND "to" = 'code' AND on_delete = 'CASCADE'`).Scan(&fkCount); err != nil {
-		t.Fatalf("inspect repaired foreign keys: %v", err)
-	}
-	if fkCount != 1 {
-		t.Fatalf("expected repaired decision_log foreign key, got %d", fkCount)
+	for _, table := range []string{"snapshot", "decision_log"} {
+		hasFK, err := migrated.hasInstrumentFK(table)
+		if err != nil {
+			t.Fatalf("inspect %s foreign keys: %v", table, err)
+		}
+		if hasFK {
+			t.Errorf("%s 仍带 instrument 外键：热榜清理会继续级联删除历史", table)
+		}
 	}
 
-	var rows int
-	if err := repaired.db.QueryRow(`SELECT COUNT(*) FROM decision_log`).Scan(&rows); err != nil {
-		t.Fatalf("count repaired decisions: %v", err)
+	var snapRows int
+	if err := migrated.db.QueryRow(`SELECT COUNT(*) FROM snapshot`).Scan(&snapRows); err != nil {
+		t.Fatalf("count migrated snapshots: %v", err)
 	}
-	if rows != 1 {
-		t.Fatalf("expected only valid legacy decision row copied, got %d", rows)
+	if snapRows != 3 {
+		t.Errorf("snapshot 行数 = %d, want 3（含孤儿行）", snapRows)
+	}
+
+	var logRows int
+	if err := migrated.db.QueryRow(`SELECT COUNT(*) FROM decision_log`).Scan(&logRows); err != nil {
+		t.Fatalf("count migrated decisions: %v", err)
+	}
+	if logRows != 2 {
+		t.Errorf("decision_log 行数 = %d, want 2（含孤儿行）", logRows)
+	}
+
+	// 重建走 SELECT *，列顺序错位会静默串值，故校验具体取值。
+	var close2 float64
+	if err := migrated.db.QueryRow(
+		`SELECT close FROM snapshot WHERE code = 'sz000001' AND trade_date = '2026-06-02'`).Scan(&close2); err != nil {
+		t.Fatalf("read migrated close: %v", err)
+	}
+	if close2 != 11.5 {
+		t.Errorf("close = %v, want 11.5（列顺序在重建中错位）", close2)
+	}
+}
+
+// TestHotPruneKeepsHistoricalRows 是上面迁移的端到端对应：热榜清理冷门标的后，
+// 该标的的 snapshot/decision_log 历史必须留下。回测与 PERF 直接读 snapshot 而不
+// join instrument，级联删除会让样本静默缩水；重新入榜的标的还会以"新股"身份从零
+// 开始累积，全程不报错。
+func TestHotPruneKeepsHistoricalRows(t *testing.T) {
+	s := openTemp(t)
+
+	if err := s.UpsertInstrument("sh600001", "冷门股", "sh", ""); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+	if err := s.SaveSnapshot(Snapshot{
+		Code: "sh600001", TradeDate: "2026-06-01", Close: 12.5, ScoreTotal: 60,
+	}); err != nil {
+		t.Fatalf("save snapshot: %v", err)
+	}
+	if _, err := s.db.Exec(`
+INSERT INTO decision_log (code, log_date, action, tier, created_at)
+VALUES ('sh600001', '2026-06-01', 'recommend', '⭐⭐', 'now')`); err != nil {
+		t.Fatalf("seed decision_log: %v", err)
+	}
+	if _, err := s.db.Exec(`UPDATE instrument SET hot_score = 0`); err != nil {
+		t.Fatalf("set hot_score=0: %v", err)
+	}
+
+	// 今日尚未衰减过，故这次导入会执行 decay+prune。
+	if _, err := s.ImportHotStocks([]HotStockEntry{
+		{Code: "sh600003", Name: "今日热门", Market: "sh"},
+	}); err != nil {
+		t.Fatalf("ImportHotStocks: %v", err)
+	}
+
+	var stillPooled int
+	if err := s.db.QueryRow(
+		`SELECT COUNT(*) FROM instrument WHERE code = 'sh600001'`).Scan(&stillPooled); err != nil {
+		t.Fatal(err)
+	}
+	if stillPooled != 0 {
+		t.Fatal("冷门标的应被移出 instrument 池（拉取范围需要收敛）")
+	}
+
+	var snapKept, logKept int
+	if err := s.db.QueryRow(
+		`SELECT COUNT(*) FROM snapshot WHERE code = 'sh600001'`).Scan(&snapKept); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.QueryRow(
+		`SELECT COUNT(*) FROM decision_log WHERE code = 'sh600001'`).Scan(&logKept); err != nil {
+		t.Fatal(err)
+	}
+	if snapKept != 1 {
+		t.Error("热榜清理连带删除了 snapshot 历史——回测与 PERF 样本会静默缩水")
+	}
+	if logKept != 1 {
+		t.Error("热榜清理连带删除了 decision_log——已结算的胜率样本会丢失")
 	}
 }
 
