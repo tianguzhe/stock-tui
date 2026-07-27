@@ -1,55 +1,51 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 
+	"stock-tui/internal/holdings"
 	"stock-tui/internal/screener"
 	"stock-tui/internal/store"
 )
 
-func parseHoldings(raw string) ([]screener.Holding, error) {
-	if raw == "" {
-		return nil, nil
+// resolveHoldings takes positions from the --holdings flag when it is given and
+// falls back to the portfolio file otherwise, so the daily run needs no hand-
+// assembled argument. Either way duplicate codes are merged by share-weighted
+// cost — the same position held in two brokerage accounts must screen as one
+// row, and hand-merging it every day is what this replaces.
+//
+// A missing portfolio file is not an error: screening still runs for candidates.
+func resolveHoldings(raw, path string) ([]screener.Holding, error) {
+	var (
+		hs  []holdings.Holding
+		err error
+	)
+	if strings.TrimSpace(raw) != "" {
+		hs, err = holdings.Parse(raw)
+	} else {
+		hs, err = holdings.Load(path)
+		if errors.Is(err, os.ErrNotExist) {
+			fmt.Fprintf(os.Stderr, "info: 未找到 %s，按无持仓处理\n", path)
+			return nil, nil
+		}
 	}
-	var holdings []screener.Holding
-	for _, item := range strings.Split(raw, ",") {
-		item = strings.TrimSpace(item)
-		if item == "" {
-			continue
-		}
-		parts := strings.Split(item, ":")
-		if len(parts) != 3 {
-			return nil, fmt.Errorf("invalid holding format: %s (expected code:cost:shares)", item)
-		}
-		code := strings.TrimSpace(parts[0])
-		cost, err := strconv.ParseFloat(strings.TrimSpace(parts[1]), 64)
-		if err != nil {
-			return nil, fmt.Errorf("invalid cost in holding %s: %w", item, err)
-		}
-		shares, err := strconv.Atoi(strings.TrimSpace(parts[2]))
-		if err != nil {
-			return nil, fmt.Errorf("invalid shares in holding %s: %w", item, err)
-		}
-		holdings = append(holdings, screener.Holding{
-			Code:   code,
-			Cost:   cost,
-			Shares: shares,
-		})
+	if err != nil {
+		return nil, err
 	}
-	return holdings, nil
+
+	out := make([]screener.Holding, len(hs))
+	for i, h := range hs {
+		out[i] = screener.Holding{Code: h.Code, Cost: h.Cost, Shares: h.Shares}
+	}
+	return out, nil
 }
 
-func runScreen(holdingsRaw string, maxResults int, capital float64, dryRun bool) error {
-	holdings, err := parseHoldings(holdingsRaw)
-	if err != nil {
-		return err
-	}
-
+func runScreen(holdings []screener.Holding, maxResults int, capital float64, dryRun bool) error {
 	// Load snapshots
 	date, candidates, rsCoverage, err := screener.LoadSnapshots(store.DefaultPath())
 	if err != nil {

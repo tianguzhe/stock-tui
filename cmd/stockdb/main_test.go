@@ -1,95 +1,85 @@
 package main
 
 import (
+	"math"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
 
-func TestParseHoldings(t *testing.T) {
-	tests := []struct {
-		name    string
-		input   string
-		want    int
-		wantErr bool
-	}{
-		{
-			name:    "single holding",
-			input:   "sh601991:8.504:1300",
-			want:    1,
-			wantErr: false,
-		},
-		{
-			name:    "multiple holdings",
-			input:   "sh601991:8.504:1300,sh603256:193.752:100",
-			want:    2,
-			wantErr: false,
-		},
-		{
-			name:    "empty string",
-			input:   "",
-			want:    0,
-			wantErr: false,
-		},
-		{
-			name:    "trailing comma",
-			input:   "sh601991:8.504:1300,",
-			want:    1,
-			wantErr: false,
-		},
-		{
-			name:    "invalid format - missing shares",
-			input:   "sh601991:8.504",
-			want:    0,
-			wantErr: true,
-		},
-		{
-			name:    "invalid format - non-numeric cost",
-			input:   "sh601991:abc:1300",
-			want:    0,
-			wantErr: true,
-		},
-		{
-			name:    "invalid format - non-numeric shares",
-			input:   "sh601991:8.504:abc",
-			want:    0,
-			wantErr: true,
-		},
+// 逐项解析规则由 internal/holdings 覆盖；这里只验证 cmd 层的职责：
+// 取值来源的优先级、缺文件的降级、以及到 screener.Holding 的转换。
+
+func TestResolveHoldingsFlagTakesPrecedenceOverFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), ".holdings")
+	if err := os.WriteFile(path, []byte("sz000001:1.0:1\n"), 0o644); err != nil {
+		t.Fatal(err)
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got, err := parseHoldings(tt.input)
-			if (err != nil) != tt.wantErr {
-				t.Errorf("parseHoldings() error = %v, wantErr %v", err, tt.wantErr)
-				return
-			}
-			if !tt.wantErr && len(got) != tt.want {
-				t.Errorf("parseHoldings() got %d holdings, want %d", len(got), tt.want)
-			}
-		})
+	got, err := resolveHoldings("sh601991:8.504:13", path)
+	if err != nil {
+		t.Fatalf("resolveHoldings: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d holdings, want 1: %+v", len(got), got)
+	}
+	if got[0].Code != "sh601991" || got[0].Cost != 8.504 || got[0].Shares != 13 {
+		t.Errorf("got %+v, want sh601991 @8.504 ×13", got[0])
 	}
 }
 
-func TestParseHoldingsValues(t *testing.T) {
-	input := "sh601991:8.504:1300"
-	holdings, err := parseHoldings(input)
+func TestResolveHoldingsFallsBackToFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), ".holdings")
+	content := "# 银河证券账户\nsh601138:61.551:2,sh600909:8.965:2\n# 国泰海通证券账户\nsh600909:9.465:6\n"
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := resolveHoldings("", path)
 	if err != nil {
-		t.Fatalf("parseHoldings() error = %v", err)
+		t.Fatalf("resolveHoldings: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d holdings, want 2 after merge: %+v", len(got), got)
 	}
 
-	if len(holdings) != 1 {
-		t.Fatalf("len(holdings) = %d, want 1", len(holdings))
+	// 两账户同持 sh600909，须合并为一行：(8.965*2 + 9.465*6)/8 = 9.340。
+	var merged bool
+	for _, h := range got {
+		if h.Code != "sh600909" {
+			continue
+		}
+		merged = true
+		if h.Shares != 8 || math.Abs(h.Cost-9.34) > 1e-9 {
+			t.Errorf("sh600909 = %+v, want 8 手 @9.340", h)
+		}
 	}
+	if !merged {
+		t.Error("sh600909 缺失——跨账户持仓未被合并")
+	}
+}
 
-	h := holdings[0]
-	if h.Code != "sh601991" {
-		t.Errorf("Code = %s, want sh601991", h.Code)
+// 没有持仓文件时仍应能筛选候选，而不是直接失败。
+func TestResolveHoldingsMissingFileIsNotAnError(t *testing.T) {
+	got, err := resolveHoldings("", filepath.Join(t.TempDir(), "absent"))
+	if err != nil {
+		t.Fatalf("resolveHoldings(missing file) = %v, want nil error", err)
 	}
-	if h.Cost != 8.504 {
-		t.Errorf("Cost = %f, want 8.504", h.Cost)
+	if len(got) != 0 {
+		t.Errorf("got %+v, want no holdings", got)
 	}
-	if h.Shares != 1300 {
-		t.Errorf("Shares = %d, want 1300", h.Shares)
+}
+
+func TestResolveHoldingsRejectsMalformedFlag(t *testing.T) {
+	for _, raw := range []string{
+		"sh601991:8.504",     // 缺手数
+		"sh601991:abc:1300",  // 成本非数字
+		"sh601991:8.504:abc", // 手数非数字
+	} {
+		if _, err := resolveHoldings(raw, filepath.Join(t.TempDir(), "absent")); err == nil {
+			t.Errorf("resolveHoldings(%q) = nil error, want error", raw)
+		}
 	}
 }
 
@@ -144,10 +134,10 @@ func TestRunCommand(t *testing.T) {
 
 func TestNormalize(t *testing.T) {
 	tests := []struct {
-		name    string
-		input   string
-		want    string
-		wantOk  bool
+		name   string
+		input  string
+		want   string
+		wantOk bool
 	}{
 		{
 			name:   "shanghai stock with prefix",

@@ -175,6 +175,9 @@
 ## 持仓格式与浮盈计算
 - 持仓以**手(1手=100股)**为最小单位。`.holdings` 文件格式：`代码:成本:手数`（如 `sh601138:65.490:2`）。支持 `#` 开头的注释行分隔多账户（如 `# 银河证券账户`），工具会自动跳过。
 - 浮盈 = (今收 - 成本) × 手数 × 100。
+- **解析与合并统一走 `internal/holdings`**（`Load`/`Parse`/`Merge`），`cmd/stockdb screen` 与 `cmd/watch` 共用，勿再各写一套。
+  - **同一代码分散在多个账户会自动按手数加权合并**（如 sh600909 银河2手@8.965 + 国泰6手@9.465 → 8手@9.340）。**不要手工先算合并成本再传参**——手算四舍五入会引入误差（实测 sh512480 手工传 1.214 vs 精确 1.2136，浮盈差 1 元）。
+  - **格式错误一律报错，不静默跳过**：持仓数字直接决定浮盈与仓位，跳过一行会让组合悄悄少算一笔且无任何症状。
 
 ## PERF 历史驱动的信号权重（核心方法论）
 - 推荐/评估标的前，**先查该股自身 PERF 历史**，不用同一把尺子量所有股：
@@ -198,9 +201,10 @@
 - 快速提取关键字段：`go run ./cmd/indicator-analyze <code> 2>/dev/null | grep -E "SCORE|TD_NOW|SAR_KELT|DIVERGENCE|PERF|CYQ"`
 - 批量落库：`go run ./cmd/stockdb batch-save -P 4`（并行拉数 + 串行写库，全池约 90 秒；完整流程见「每日工作流」）
 - 多因子选股筛选：**已统一为 Go 实现**（类型安全、性能更优）
-  - **推荐**：`go run ./cmd/stockdb screen --holdings 代码:成本:手数,...` 或快捷脚本 `./scripts/screen-stocks.sh --holdings ...`
+  - **推荐**：`go run ./cmd/stockdb screen --capital 80000`（**省略 `--holdings` 时自动读取 `.holdings` 并合并多账户重复持仓**）或快捷脚本 `./scripts/screen-stocks.sh --capital 80000`
   - 旧版 Python `screen-stocks.py`/`test_screen_stocks.py` 已删除，选股与测试一律以 Go screen(`cmd/stockdb screen` + `internal/screener`)为准
-  - 示例：`go run ./cmd/stockdb screen --holdings sh601138:65.490:2,sh600522:25.008:1 --max 10 --capital 68000`
+  - 临时覆盖持仓才需显式传参：`--holdings sh601138:65.490:2,sh600522:25.008:1`（优先于文件）；`--holdings-file` 可指定非默认路径
+  - `.holdings` 不存在时按无持仓处理（仅筛候选），不报错
   - `--max` 默认值为**持仓数+7**（动态计算），可手动指定固定上限
   - `--dry-run` 临时查询不写 decision_log（正式落库每日一次即可）；`--capital 68000` 输出候选建议仓位（单笔风险1%/止损距离）
   - 持仓须先 `-save` 落库，否则显示"无快照数据"
@@ -288,8 +292,8 @@ go run ./cmd/stockdb backfill
 go run ./cmd/stockdb check-data
 
 # 4. 生成选股表（持仓置顶 + 优质候选，合计≤持仓数+7；--max 可手动指定上限）
-./scripts/screen-stocks.sh \
-  --holdings <代码:成本:手数,...>
+#    自动读取 .holdings 并按手数加权合并多账户重复持仓，无需手工拼参数
+./scripts/screen-stocks.sh --capital 80000
 
 # 5. 生成次日日志模板（含昨日预判自动回填）
 ./scripts/gen-journal.sh

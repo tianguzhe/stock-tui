@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"stock-tui/internal/api"
+	"stock-tui/internal/holdings"
 	"stock-tui/internal/store"
 )
 
@@ -670,57 +671,21 @@ func queryDeepSnapshot(db *sql.DB, code string) (*deepSnapshot, error) {
 
 // ── 持仓解析 ──
 
+// parseHoldings reads the shared .holdings file. Parsing, comment handling and
+// the share-weighted merge of a code held across several accounts all live in
+// internal/holdings, which cmd/stockdb screen reads through as well — the two
+// must agree, or the TUI and the screener would report different cost bases.
+//
+// A malformed line is an error rather than a skipped row: these figures drive
+// the P&L display, and dropping one silently understates the portfolio.
 func parseHoldings() ([]holding, error) {
-	data, err := os.ReadFile(".holdings")
+	hs, err := holdings.Load(holdings.DefaultPath)
 	if err != nil {
-		return nil, fmt.Errorf("读取.holdings: %w", err)
+		return nil, err
 	}
-
-	seen := make(map[string]bool)
-	var hh []holding
-
-	for _, line := range strings.Split(string(data), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		for _, item := range strings.Split(line, ",") {
-			item = strings.TrimSpace(item)
-			if item == "" {
-				continue
-			}
-			parts := strings.Split(item, ":")
-			if len(parts) != 3 {
-				continue
-			}
-			code := strings.TrimSpace(parts[0])
-			cost := 0.0
-			qty := 0
-			if _, err := fmt.Sscanf(parts[1], "%f", &cost); err != nil || cost <= 0 {
-				fmt.Fprintf(os.Stderr, "warn: 跳过持仓行,成本解析失败: %q\n", item)
-				continue
-			}
-			if _, err := fmt.Sscanf(parts[2], "%d", &qty); err != nil || qty <= 0 {
-				fmt.Fprintf(os.Stderr, "warn: 跳过持仓行,手数解析失败: %q\n", item)
-				continue
-			}
-
-			if seen[code] {
-				for i := range hh {
-					if hh[i].Code == code {
-						tq := hh[i].Quantity + qty
-						if tq > 0 {
-							hh[i].Cost = (hh[i].Cost*float64(hh[i].Quantity) + cost*float64(qty)) / float64(tq)
-							hh[i].Quantity = tq
-						}
-						break
-					}
-				}
-				continue
-			}
-			seen[code] = true
-			hh = append(hh, holding{Code: code, Cost: cost, Quantity: qty})
-		}
+	out := make([]holding, len(hs))
+	for i, h := range hs {
+		out[i] = holding{Code: h.Code, Cost: h.Cost, Quantity: h.Shares}
 	}
-	return hh, nil
+	return out, nil
 }
