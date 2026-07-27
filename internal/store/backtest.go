@@ -9,10 +9,10 @@ import (
 
 // BacktestResult 单次信号回测结果
 type BacktestResult struct {
-	ID            int64   `json:"id"`
-	BacktestRunID string  `json:"backtest_run_id"`
-	RunDate       string  `json:"run_date"`
-	Config        string  `json:"config"`
+	ID            int64  `json:"id"`
+	BacktestRunID string `json:"backtest_run_id"`
+	RunDate       string `json:"run_date"`
+	Config        string `json:"config"`
 
 	// 信号信息
 	EntryDate  string  `json:"entry_date"`
@@ -22,18 +22,18 @@ type BacktestResult struct {
 	EntryPrice float64 `json:"entry_price"`
 
 	// 回测结果
-	ExitDate     string  `json:"exit_date"`
-	ExitPrice    float64 `json:"exit_price"`
-	HoldingDays  int     `json:"holding_days"`
-	ReturnPct    float64 `json:"return_pct"`
-	Win          int     `json:"win"` // 0=亏损 1=盈利
+	ExitDate    string  `json:"exit_date"`
+	ExitPrice   float64 `json:"exit_price"`
+	HoldingDays int     `json:"holding_days"`
+	ReturnPct   float64 `json:"return_pct"`
+	Win         int     `json:"win"` // 0=亏损 1=盈利
 
 	// 入场时快照
-	ScoreTotal  int     `json:"score_total"`
-	ADX         float64 `json:"adx"`
-	RSRankPct   float64 `json:"rs_rank_pct"`
-	SARStance   string  `json:"sar_stance"`
-	TDSetup     string  `json:"td_setup"`
+	ScoreTotal int     `json:"score_total"`
+	ADX        float64 `json:"adx"`
+	RSRankPct  float64 `json:"rs_rank_pct"`
+	SARStance  string  `json:"sar_stance"`
+	TDSetup    string  `json:"td_setup"`
 
 	// 最大回撤
 	MaxAdversePct float64 `json:"max_adverse_pct"` // 持有期间最大浮亏
@@ -41,9 +41,9 @@ type BacktestResult struct {
 
 // BacktestSummary 回测汇总统计
 type BacktestSummary struct {
-	BacktestRunID string  `json:"backtest_run_id"`
-	RunDate       string  `json:"run_date"`
-	Config        string  `json:"config"`
+	BacktestRunID string `json:"backtest_run_id"`
+	RunDate       string `json:"run_date"`
+	Config        string `json:"config"`
 
 	// 时间范围
 	StartDate string `json:"start_date"`

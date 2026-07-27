@@ -27,11 +27,11 @@ const (
 // ── 样式 ──────────────────────────────────────────────────────────────────────
 
 var (
-	red         = lipgloss.NewStyle().Foreground(lipgloss.Color("#f38ba8")) // Catppuccin Mocha red
-	green       = lipgloss.NewStyle().Foreground(lipgloss.Color("#a6e3a1")) // Catppuccin Mocha green
-	dim         = lipgloss.NewStyle().Foreground(lipgloss.Color("#6c7086")) // Catppuccin Mocha overlay0 / dim gray
-	watchUp     = lipgloss.NewStyle().Foreground(lipgloss.Color("#89b4fa")) // Catppuccin Mocha blue — 观察中·涨
-	watchDown   = lipgloss.NewStyle().Foreground(lipgloss.Color("#7f849c")) // Catppuccin Mocha overlay2 — 观察中·跌
+	red       = lipgloss.NewStyle().Foreground(lipgloss.Color("#f38ba8")) // Catppuccin Mocha red
+	green     = lipgloss.NewStyle().Foreground(lipgloss.Color("#a6e3a1")) // Catppuccin Mocha green
+	dim       = lipgloss.NewStyle().Foreground(lipgloss.Color("#6c7086")) // Catppuccin Mocha overlay0 / dim gray
+	watchUp   = lipgloss.NewStyle().Foreground(lipgloss.Color("#89b4fa")) // Catppuccin Mocha blue — 观察中·涨
+	watchDown = lipgloss.NewStyle().Foreground(lipgloss.Color("#7f849c")) // Catppuccin Mocha overlay2 — 观察中·跌
 
 	subtextStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#a6adc8")) // Catppuccin Mocha subtext0
 	mauveStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("#cba6f7")) // Catppuccin Mocha mauve

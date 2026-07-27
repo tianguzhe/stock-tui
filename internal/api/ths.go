@@ -50,7 +50,7 @@ func FetchHotStocks() ([]HotStock, error) {
 type thsResponse struct {
 	Data struct {
 		StockList []struct {
-			Code   string `json:"code"`   // raw digits, e.g. "002354", "600519"
+			Code   string `json:"code"` // raw digits, e.g. "002354", "600519"
 			Name   string `json:"name"`
 			Market int    `json:"market"` // 17=沪市, 33=深市
 			Order  int    `json:"order"`

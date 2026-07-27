@@ -239,8 +239,8 @@ func TestStatsByTierAggregatesCorrectly(t *testing.T) {
 		wins    int
 		winRate float64
 	}{
-		"⭐⭐⭐":  {3, 2, 66.67}, // 2/3 wins
-		"⭐⭐":   {2, 1, 50.0},  // 1/2 wins
+		"⭐⭐⭐": {3, 2, 66.67}, // 2/3 wins
+		"⭐⭐":  {2, 1, 50.0},  // 1/2 wins
 		"📌持仓": {1, 1, 100.0}, // 1/1 wins
 	}
 
