@@ -28,6 +28,7 @@
 - `internal/api` 封装行情 API（实时报价 `FetchStocks`、分时 `FetchMinute`、**日K获取 `FetchDailyKline`**——proxy 前复权 + 东财 fallback + TDX 换手率兜底，共享层消除 cmd 间重复）。
 - `internal/analysis` 技术面评分引擎（`ScoreResult`/`EvalSignals`/`Divergence`/`Performance`/`ApplyPerfAdaptive`/`LateStagePenalty` + 共用工具函数），从 cmd 共有逻辑中抽取。
 - 接口文档见 `docs/data-apis.md`(腾讯/东财/新浪 OHLC 字段顺序、`sh`/`sz`/`bj` 前缀映射、换手率字段均已更新)。
+- `FetchStockInfo` 通过 `push2.eastmoney.com/api/qt/stock/get` 获取基本面：f127(行业) f128(地区板块) f162(PE) f167(PB) f189(上市日期)。
 
 ### 数据源优先级与口径（2026-07 更新）
 - **默认 / `-save`**：**HTTP 前复权主力**——腾讯 **proxy `newfqkline` 前复权**为主（量单位**手**×100 转股；`row[7]`=**换手率%**→小数；`row[8]`=**成交额万元**→×10000 转元；`row[6]` 恒为 `{}` 无业务值；**振幅**不在 K 行，本地 `(H-L)/昨收×100`）。换手优先用 proxy `row[7]`，全 0 时才东财 f61 / TDX 流通股本兜底。**腾讯失败 → 东财全日 K fallback**（`push2his`，Amount 已是元 + 换手 + 振幅 f58）。东财请求需带 `Referer` + 完整 UA + 反限流重试；批量 worker 建议 `DisableKeepAlives: true`。字段布局与实测见 `docs/data-apis.md`。
@@ -46,6 +47,10 @@
 	- tdx 网关代码映射：sh→`setcode=1`(沪), sz→`setcode=0`(深), bj→`setcode=2`(北)。
 	- tdx 网关日K 返回**按日期升序**(最旧在前、最新在后)。
 	- tdx 网关换手率兜底：`PBHQInfo.ExtInfo.LTGB`(流通股本,单位万股) → `turnover = Volume(股) / (LTGB×10000)`。
+	- tdx 网关 PBHQInfo 响应中 Volume/Inside/Outside 为 JSON 字符串（非 float），解析时注意类型。
+	- TDX HTTP 网关无需 Token 即可调用 PBHQInfo/PBFXT 基础行情接口。
+	- tdx 网关支持港股：setcode=31（`Code` 裸码，不加 `hk` 前缀）。
+	- Proxy 与 TDX 网关交叉验证：OHLC 完全一致(max diff=0.00%)，个股换手率偏差 <0.01%。
 
 ## 技术指标
 - `indicator.Calculate([]Candle) []Result`(KDJ/MACD/RSI/StochRSI/WR/DMI/CMI/BIAS/CHOP/ATR/BOLL/Donchian/MFI/SAR/Keltner/SuperTrend);`WR` 为正值口径(**值越大越超卖**,与标准威廉符号相反)。`StochRSI` 挂在 `Result.RSI` 旁(`StochRSI.K/D`),在 `fillRSI` 之后填充,用于 RSI6 钝化时重新展开极端区间(CLI `analysis.StochStagnation`、score、PERF 均引用)。
