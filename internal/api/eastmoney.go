@@ -19,9 +19,12 @@ type StockInfo struct {
 	TotalShares float64 // 总股本(股,f84)
 	FloatShares float64 // 流通股本(股,f85)
 	Industry    string  // 行业(f127)
+	Region      string  // 地区板块(f128)
 	ListedDate  string  // 上市日期 YYYYMMDD(f189)
 	TotalMC     float64 // 总市值(元,f116)
 	FloatMC     float64 // 流通市值(元,f117)
+	PE          float64 // 市盈率(f162)
+	PB          float64 // 市净率(f167)
 }
 
 // 东财反限流: 随机 User-Agent 池 + NID cookie 预取。
@@ -198,7 +201,7 @@ func FetchStockInfo(code string) (*StockInfo, error) {
 	}
 	secid := prefix + "." + rawCode
 
-	fields := "f57,f58,f84,f85,f116,f117,f127,f189"
+	fields := "f57,f58,f84,f85,f116,f117,f127,f128,f162,f167,f189"
 	url := fmt.Sprintf(
 		"https://push2.eastmoney.com/api/qt/stock/get?secid=%s&fltt=2&invt=2&fields=%s",
 		secid, fields,
@@ -218,6 +221,9 @@ func FetchStockInfo(code string) (*StockInfo, error) {
 			F116 float64 `json:"f116"` // 总市值
 			F117 float64 `json:"f117"` // 流通市值
 			F127 string  `json:"f127"` // 行业
+				F128 string  `json:"f128"` // 地区板块
+				F162 float64 `json:"f162"` // 市盈率
+				F167 float64 `json:"f167"` // 市净率
 			F189 float64 `json:"f189"` // 上市日期 YYYYMMDD(东财返回 int,不可用 string)
 		} `json:"data"`
 	}

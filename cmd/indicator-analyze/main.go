@@ -48,15 +48,10 @@ func run(args []string) error {
 	}
 
 	// Data source dispatch — 前复权口径对齐 -save 落库口径。
-	//
-	// tdx (github.com/quantbeing/tdx) 的 GetSecurityBars 只回原始不复权价，库本身不提供
-	// 复权。除权分红会在不复权序列里制造断崖（如 sh512480 2026-07-03 除权，不复权 2.70→1.33），
-	// 污染 BOLL bandwidth/ATR/SAR/CYQ 获利盘比例/PRY1 与回测 PERF 样本，违反 CLAUDE.md
-	// 「CYQ 须前复权」前置。
-	//
-	// 因此默认（含纯分析模式与 -save）统一走 HTTP 前复权（fetchDailyKline 请求腾讯 qfq），
-	// 与 snapshot 落库口径一致。-tdx 仅作显式开启不复权口径的选项：保留 tdx 精确 Amount +
-	// 本地换手率（cyq/cyc 的 VWAP 口径），但调用方须自负除权断崖污染指标的风险。
+	// 默认（含纯分析模式与 -save）统一走 HTTP 前复权（FetchDailyKline 请求腾讯 qfq），
+	// 与 snapshot 落库口径一致。TDX HTTP 网关（tdxhub.icfqs.com:7615/TQLEX）作为备选
+	// 数据源通过 -tdx 显式启用：同样返回前复权 OHLC + Amount + Volume + 换手率，
+	// 在 HTTP 主路径失败时可作独立兜底。
 	var data api.KlineData
 	var err error
 	if *useTDX {

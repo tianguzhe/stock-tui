@@ -35,35 +35,6 @@ func TestCodeToSecid(t *testing.T) {
 	}
 }
 
-func TestCodeToTDXMarket(t *testing.T) {
-	cases := []struct {
-		code    string
-		wantRaw string
-		err     bool
-	}{
-		{"sh600522", "600522", false},
-		{"sz000001", "000001", false},
-		{"bj920819", "920819", false},
-		{"usAAPL", "", true},
-	}
-	for _, tc := range cases {
-		_, raw, err := CodeToTDXMarket(tc.code)
-		if tc.err {
-			if err == nil {
-				t.Errorf("CodeToTDXMarket(%q) want error", tc.code)
-			}
-			continue
-		}
-		if err != nil {
-			t.Errorf("CodeToTDXMarket(%q) error: %v", tc.code, err)
-			continue
-		}
-		if raw != tc.wantRaw {
-			t.Errorf("CodeToTDXMarket(%q) raw = %q, want %q", tc.code, raw, tc.wantRaw)
-		}
-	}
-}
-
 func TestParseEMFloat(t *testing.T) {
 	if got := parseEMFloat("123.45"); got != 123.45 {
 		t.Errorf("parseEMFloat(%q) = %v, want 123.45", "123.45", got)

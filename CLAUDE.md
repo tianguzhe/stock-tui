@@ -1,7 +1,7 @@
 # stock-tui
 
 ## 目录结构
-- `cmd/indicator-analyze` — 单标的深度技术面分析 CLI（tdx.go 单独存放 TDX TCP 协议逻辑，-tdx 标志显式启用）
+- `cmd/indicator-analyze` — 单标的深度技术面分析 CLI（tdx.go 调用 TDX HTTP 网关，-tdx 标志显式启用）
 - `cmd/stockdb` — 数据库管理（tag/history/rs-rank/backfill/backtest/batch-save/hot/check-data）
 - `cmd/watch` — 盘中实时监控 TUI（BubbleTea，读 `.holdings` 自动展示持仓行情）
 - `main.go` — TUI 自选股行情入口（`go run .`）
@@ -42,10 +42,10 @@
 - **两套换手率（勿混）**：
   - **序列换手**（CYQ 用）：proxy `row[7]` %→小数，或东财 f61 / TDX 流通股本兜底；按日对齐 K 线。
   - **`snapshot.turnover_rate`**（落库展示）：来自 `api.FetchStocks` **实时报价**当日换手，不是 K 线序列最后一根。选股/日志读库用实时；筹码计算用序列。
-- **`-tdx` 显式启用通达信 TCP 协议**(`github.com/quantbeing/tdx` v0.1.3,`FromBestHost` 自动选服务器,tdx 失败回退 HTTP)：保留精确 Amount + 本地换手率(CYQ/CYC 的 VWAP 口径),**但价格不前复权**——库本身不提供复权(唯一相关 `GetXdxrInfo` 需调用方自算,项目未用)。除权分红在不复权序列制造断崖(sh512480 2026-07-03 不复权 2.70→1.33,前复权仅 -1.4%),污染 BOLL bandwidth/ATR/SAR/CYQ 获利盘/PRY1 与回测 PERF 样本,**仅在需精确 Amount + 本地换手率时显式使用**。
-- tdx 代码映射：`sh600522` → `model.MarketSH` + `"600522"`；`sz000001` → `model.MarketSZ` + `"000001"`。
-- tdx 日K `GetSecurityBars` 返回**按日期升序**,`bars[0]` 最旧,`bars[len-1]` 最新。
-- tdx 换手率：`GetFinanceInfo(ctx, market, code).LiutongGuben`(流通股本,单位股) → `turnover = Vol / LiutongGuben`(小数)。
+	- **`-tdx` 显式启用 TDX HTTP 网关**(`http://tdxhub.icfqs.com:7615/TQLEX`)：通过 `PBFXT` Entry 获取前复权 OHLC + Amount + Volume + 流通股本(本地算换手率)；通过 `PBHQInfo` Entry 获取流通股本(换手率兜底)。价格已前复权，不存在不复权断崖问题。作 HTTP 主路径(腾讯/东财)之外的独立备选。
+	- tdx 网关代码映射：sh→`setcode=1`(沪), sz→`setcode=0`(深), bj→`setcode=2`(北)。
+	- tdx 网关日K 返回**按日期升序**(最旧在前、最新在后)。
+	- tdx 网关换手率兜底：`PBHQInfo.ExtInfo.LTGB`(流通股本,单位万股) → `turnover = Volume(股) / (LTGB×10000)`。
 
 ## 技术指标
 - `indicator.Calculate([]Candle) []Result`(KDJ/MACD/RSI/StochRSI/WR/DMI/CMI/BIAS/CHOP/ATR/BOLL/Donchian/MFI/SAR/Keltner/SuperTrend);`WR` 为正值口径(**值越大越超卖**,与标准威廉符号相反)。`StochRSI` 挂在 `Result.RSI` 旁(`StochRSI.K/D`),在 `fillRSI` 之后填充,用于 RSI6 钝化时重新展开极端区间(CLI `analysis.StochStagnation`、score、PERF 均引用)。
@@ -197,7 +197,7 @@
 - `indicator-analyze` 数据流：
   - **纯分析模式（无 `-save` 无 `-tdx`）**：`api.FetchDailyKline`——腾讯 **proxy `newfqkline` 前复权**为主（换手/Amount/振幅口径见上「数据源优先级」），失败回退东财全日K；与落库口径一致
   - **`-save` 模式**：同上 HTTP 路径（避免批量时 TDX 握手开销）；评分走 `internal/analysis`
-  - **`-tdx` 模式**（含 `-save -tdx`）：显式启用 TDX 协议（更精确 Amount + 本地换手率），**价格不前复权**，除权日断崖会污染 BOLL/ATR/SAR/CYQ/PERF，仅在需要 Amount 精度时使用
+  - **`-tdx` 模式**（含 `-save -tdx`）：显式启用 TDX HTTP 网关（`tdxhub.icfqs.com:7615/TQLEX`），通过 `PBFXT` Entry 获取前复权 OHLC + Amount + Volume + 换手率。价格已前复权，不存在不复权断崖问题。作 HTTP 主路径(腾讯/东财)之外的独立备选数据源。
 - 快速提取关键字段：`go run ./cmd/indicator-analyze <code> 2>/dev/null | grep -E "SCORE|TD_NOW|SAR_KELT|DIVERGENCE|PERF|CYQ"`
 - 批量落库：`go run ./cmd/stockdb batch-save -P 4`（并行拉数 + 串行写库，全池约 90 秒；完整流程见「每日工作流」）
 - 多因子选股筛选：**已统一为 Go 实现**（类型安全、性能更优）

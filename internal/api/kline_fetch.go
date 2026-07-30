@@ -1,7 +1,6 @@
 package api
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -9,12 +8,8 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"time"
 
 	"stock-tui/internal/indicator"
-
-	tdx "github.com/quantbeing/tdx"
-	"github.com/quantbeing/tdx/model"
 )
 
 // KlineData 是日K数据统一容器，proxy 和东财 fallback 共用。
@@ -49,7 +44,8 @@ type emKlineResponse struct {
 	} `json:"data"`
 }
 
-// FetchDailyKline 是日K获取总入口：proxy 优先 + 换手率兜底 + 东财 fallback。
+// FetchDailyKline 是日K获取总入口：proxy 优先 + TDX 网关中间备选 + 东财终极 fallback。
+// 回退链: proxy → TDX 网关(精确 Amount + 港/美/北交所覆盖) → 东财。
 // client 传 nil 时使用包内默认 httpClient。
 func FetchDailyKline(client *http.Client, code string, bars int) (KlineData, error) {
 	c := httpClientOrDefault(client)
@@ -58,7 +54,7 @@ func FetchDailyKline(client *http.Client, code string, bars int) (KlineData, err
 		if !TurnoverUseful(data.Turnovers) {
 			turnovers := FetchEMTurnover(c, code, len(data.Candles), data.Dates)
 			if turnovers == nil {
-				turnovers = FetchTDXTurnover(code, data.Candles)
+				turnovers = FetchTDXGatewayTurnover(code, data.Candles)
 			}
 			if turnovers != nil {
 				data.Turnovers = turnovers
@@ -66,7 +62,14 @@ func FetchDailyKline(client *http.Client, code string, bars int) (KlineData, err
 		}
 		return data, nil
 	}
-	fmt.Fprintf(os.Stderr, "info: 腾讯日K失败(%v),切换到东财日K\n", err)
+	// proxy 失败 → TDX 网关备选（覆盖更广，Amount 精度更高）
+	tdxData, tdxErr := FetchTDXGatewayKline(code, bars)
+	if tdxErr == nil {
+		fmt.Fprintf(os.Stderr, "info: 腾讯日K失败(%v),切换到TDX网关日K\n", err)
+		return tdxData, nil
+	}
+	// TDX 也失败 → 东财终极 fallback
+	fmt.Fprintf(os.Stderr, "info: 腾讯日K失败(%v),TDX网关(%v),切换到东财日K\n", err, tdxErr)
 	return FetchEMKline(c, code, bars)
 }
 
@@ -253,41 +256,6 @@ func FetchEMTurnover(client *http.Client, code string, count int, dates []string
 	return alignEMTurnovers(emResp.Data.Klines, dates)
 }
 
-// FetchTDXTurnover 东财换手率失败时的 TDX 兜底: 只拉流通股本,
-// 用 HTTP 源的 Volume 本地算 turnover = Vol / LiutongGuben。
-// 失败返回 nil。
-func FetchTDXTurnover(code string, candles []indicator.Candle) []float64 {
-	marketID, rawCode, err := CodeToTDXMarket(code)
-	if err != nil {
-		return nil
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer cancel()
-
-	client, err := tdx.FromBestHost(ctx, tdx.Options{MaxAttempts: 3, Timeout: 15 * time.Second})
-	if err != nil {
-		return nil
-	}
-	defer client.Close()
-
-	fin, err := client.GetFinanceInfo(ctx, marketID, rawCode)
-	if err != nil {
-		return nil
-	}
-	if fin.LiutongGuben <= 0 {
-		return nil
-	}
-
-	turnovers := make([]float64, len(candles))
-	for i, c := range candles {
-		if c.Volume > 0 {
-			turnovers[i] = c.Volume / fin.LiutongGuben
-		}
-	}
-	return turnovers
-}
-
 // CodeToSecid 将 sh/sz/bj 代码映射为东财 secid（如 "sh600522" → "1.600522"）。
 func CodeToSecid(code string) (string, error) {
 	if len(code) < 3 {
@@ -303,22 +271,6 @@ func CodeToSecid(code string) (string, error) {
 		return "", fmt.Errorf("unsupported code prefix: %s", code)
 	}
 	return prefix + "." + code[2:], nil
-}
-
-// CodeToTDXMarket 将 sh/sz/bj 代码映射为 TDX market ID 和裸码。
-func CodeToTDXMarket(code string) (model.Market, string, error) {
-	if len(code) < 3 {
-		return 0, "", fmt.Errorf("invalid code: %s", code)
-	}
-	rawCode := code[2:]
-	switch code[:2] {
-	case "sh":
-		return model.MarketSH, rawCode, nil
-	case "sz", "bj":
-		return model.MarketSZ, rawCode, nil
-	default:
-		return 0, "", fmt.Errorf("unsupported code prefix: %s", code)
-	}
 }
 
 // httpClientOrDefault 返回 client 或包内默认 httpClient。
