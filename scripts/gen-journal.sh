@@ -30,24 +30,48 @@ PREV_JOURNAL="docs/journal/${YESTERDAY}/journal.md"
 PREV_TABLE=""
 if [[ -f "$PREV_JOURNAL" ]]; then
   in_table=0
+  seen_header=0
+  fmt=new
   while IFS= read -r line; do
-    if [[ "$line" =~ ^##.*明日预判 ]]; then in_table=1; continue; fi
+    # 锚定章节序号而非标题文字：历史上第三章标题写法多变（明日计划 / 明日预判 & 计划 /
+    # 明日（07-08）操作计划），按文字匹配会静默失效；而"明日"二字又会误中
+    # "## 二、持仓…按明日优先排序"与三级标题"### 明日重点"
+    if [[ "$line" =~ ^##[[:space:]]三、 ]]; then in_table=1; continue; fi
     if [[ $in_table -eq 1 ]]; then
       [[ "$line" =~ ^## ]] && break                         # 下一章节停止，空行跳过
       [[ "$line" =~ ^\| ]] || continue                    # 只取表格行
       [[ "$line" =~ \-\-\- ]] && continue                 # 跳过分隔行
-      [[ "$line" =~ 代码.*名称 ]] && continue             # 跳过表头
-      # 提取前3列（代码/名称/预判），补"实际/✓✗/备注"占位
-      row=$(echo "$line" | awk -F'|' '{
-        for(i=2;i<=4;i++){gsub(/^[[:space:]]+|[[:space:]]+$/,"",$i)}
-        printf "| %s | %s | %s | — | — | — |", $2, $3, $4
-      }')
+      # 表格首行必为表头：跳过它，并据其判断列布局
+      # old(2026-07-13 及以前): 代码|名称|预判|…   new(2026-07-14 起): 标的|判断|触发条件
+      if [[ $seen_header -eq 0 ]]; then
+        seen_header=1
+        [[ "$line" =~ 代码.*名称 ]] && fmt=old
+        continue
+      fi
+      # 触发条件属操作计划、不属预判，故不带入；实际/✓✗/备注留待手工填
+      if [[ "$fmt" == "old" ]]; then
+        row=$(echo "$line" | awk -F'|' '{
+          for(i=2;i<=4;i++){gsub(/^[[:space:]]+|[[:space:]]+$/,"",$i)}
+          gsub(/\*\*/,"",$2)
+          printf "| %s | %s | %s | — | — | — |", $2, $3, $4
+        }')
+      else
+        row=$(echo "$line" | awk -F'|' '{
+          for(i=2;i<=3;i++){gsub(/^[[:space:]]+|[[:space:]]+$/,"",$i)}
+          gsub(/\*\*/,"",$2)
+          printf "| %s | — | %s | — | — | — |", $2, $3
+        }')
+      fi
       PREV_TABLE+="${row}\n"
     fi
   done < "$PREV_JOURNAL"
 fi
 
-[[ -z "$PREV_TABLE" ]] && PREV_TABLE="| — | — | — | — | — | — |\n"
+if [[ -z "$PREV_TABLE" ]]; then
+  # 回填失效过一次且无人察觉（标题从"明日预判"改成"明日计划"后静默空表），故显式告警
+  [[ -f "$PREV_JOURNAL" ]] && echo "WARN: 未能从 $PREV_JOURNAL 的「三、」章节提取预判，昨日复盘表留空" >&2
+  PREV_TABLE="| — | — | — | — | — | — |\n"
+fi
 
 # ── 写文件 ────────────────────────────────────────────────────────────────────
 cat > "$OUT" << TEMPLATE
