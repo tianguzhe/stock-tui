@@ -161,6 +161,28 @@ type preservedFields struct {
 	insideVol, outsideVol       sql.NullFloat64
 }
 
+// applyPreserved 把原行的实时行情字段回填进重算出的快照。
+//
+// buildSnapshot 只从日K计算，不产出这几个字段；若直接落库会把原有值清零。
+// repair-scores 与 backfill-date 共用此函数，避免两处保留逻辑漂移。
+func applyPreserved(snap *store.Snapshot, keep preservedFields) {
+	if keep.turnoverRate.Valid {
+		snap.TurnoverRate = keep.turnoverRate.Float64
+	}
+	if keep.marketCap.Valid {
+		snap.MarketCap = keep.marketCap.Float64
+	}
+	if keep.pe.Valid {
+		snap.PE = keep.pe.Float64
+	}
+	if keep.insideVol.Valid {
+		snap.InsideVol = keep.insideVol.Float64
+	}
+	if keep.outsideVol.Valid {
+		snap.OutsideVol = keep.outsideVol.Float64
+	}
+}
+
 // repairScoresOne 重算单只标的的历史行，返回 (重算行数, 跳过行数)。
 func repairScoresOne(st *store.Store, lock *sync.Mutex, client *http.Client,
 	code string, bars int, cutoff string) (int, int, error) {
@@ -202,22 +224,7 @@ func repairScoresOne(st *store.Store, lock *sync.Mutex, client *http.Client,
 			skipped++ // 截断后末根日期不符，保守跳过
 			continue
 		}
-		// 沿用实时行情字段：历史值不可重现，重算不应把它们清零。
-		if keep.turnoverRate.Valid {
-			snap.TurnoverRate = keep.turnoverRate.Float64
-		}
-		if keep.marketCap.Valid {
-			snap.MarketCap = keep.marketCap.Float64
-		}
-		if keep.pe.Valid {
-			snap.PE = keep.pe.Float64
-		}
-		if keep.insideVol.Valid {
-			snap.InsideVol = keep.insideVol.Float64
-		}
-		if keep.outsideVol.Valid {
-			snap.OutsideVol = keep.outsideVol.Float64
-		}
+		applyPreserved(&snap, keep)
 		if err := st.SaveSnapshot(snap); err != nil {
 			return done, skipped, fmt.Errorf("save %s@%s: %w", code, date, err)
 		}

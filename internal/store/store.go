@@ -819,9 +819,8 @@ func isDuplicateColumnErr(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "duplicate column name")
 }
 
-// UpdateRSRankings reads the ret20/ret60/ret120 from the latest cross-sectional snapshot
-// (same trade_date for all codes), computes percentile ranks (0–100), and writes them back
-// as rs20/rs60/rs120. Returns the number of codes successfully updated.
+// UpdateRSRankings ranks the latest cross-sectional snapshot. See
+// UpdateRSRankingsForDate for the ranking semantics.
 func (s *Store) UpdateRSRankings() (int, error) {
 	// Get the latest trade_date that has data
 	var latestDate string
@@ -832,6 +831,20 @@ func (s *Store) UpdateRSRankings() (int, error) {
 	if latestDate == "" {
 		return 0, nil // No data to rank
 	}
+	return s.UpdateRSRankingsForDate(latestDate)
+}
+
+// UpdateRSRankingsForDate reads the ret20/ret60/ret120 from the cross-sectional snapshot
+// on a given trade_date (same date for all codes), computes percentile ranks (0–100), and
+// writes them back as rs20/rs60/rs120. Returns the number of codes successfully updated.
+//
+// Ranks are percentiles **within that date's sample**, so they are only comparable across
+// dates when the sample is comparable. A backfilled day whose stock pool differs from its
+// neighbours will produce ranks on a different basis — see backfill-date.
+func (s *Store) UpdateRSRankingsForDate(date string) (int, error) {
+	if date == "" {
+		return 0, fmt.Errorf("date is required")
+	}
 
 	// Read ret20/ret60/ret120 for all codes on that single date (cross-section)
 	rows, err := s.db.Query(`
@@ -841,7 +854,7 @@ SELECT code, trade_date,
        COALESCE(ret120,0) AS r120
 FROM snapshot
 WHERE trade_date = ?
-  AND ret20 IS NOT NULL`, latestDate)
+  AND ret20 IS NOT NULL`, date)
 	if err != nil {
 		return 0, fmt.Errorf("read returns: %w", err)
 	}

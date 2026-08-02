@@ -59,6 +59,8 @@ func run(args []string) error {
 		return cmdCheckData(rest)
 	case "batch-save":
 		return batchSaveCmd(rest)
+	case "backfill-date":
+		return backfillDateCmd(rest)
 	case "repair-volratio":
 		return repairVolRatioCmd(rest)
 	case "repair-scores":
@@ -74,7 +76,7 @@ func usageErr() error {
   stockdb tag rm  <code> <标签>
   stockdb list --tag <标签>
   stockdb history <code> [-n 15]
-  stockdb rs-rank                         compute RS20/RS60/RS120 percentile ranks
+  stockdb rs-rank [--date D]              compute RS20/RS60/RS120 percentile ranks
   stockdb backfill                        backfill decision_log outcomes from snapshots
   stockdb backtest [options]              run strategy backtest
   stockdb backtest-portfolio [options]    run portfolio backtest with position management
@@ -82,6 +84,7 @@ func usageErr() error {
   stockdb hot [--top N]                   fetch THS hot list and import into instrument table
   stockdb check-data                      data quality checks (RS coverage, continuity, backfill progress)
   stockdb batch-save [-P N] [-n N]      batch-save analysis snapshots for all instruments
+  stockdb backfill-date --date D        backfill snapshots for a missed trading day
   stockdb repair-volratio [--dry-run]   重算历史 snapshot 的 vol_ratio(修 qt[46] 误取市净率)
   stockdb repair-scores [--dry-run]     按完整日K重算历史 snapshot 的全部指标与评分
 `)
@@ -211,18 +214,32 @@ func cmdHistory(args []string) error {
 	return nil
 }
 
-func cmdRSRank(_ []string) error {
+func cmdRSRank(args []string) error {
+	fs := flag.NewFlagSet("rs-rank", flag.ContinueOnError)
+	date := fs.String("date", "", "指定交易日 YYYY-MM-DD（默认最新交易日）")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
 	st, err := openStore()
 	if err != nil {
 		return err
 	}
 	defer st.Close()
 
-	n, err := st.UpdateRSRankings()
+	// 指定日期用于补算 backfill-date 补出来的历史行——它们的 rs 列为 0。
+	var n int
+	target := "最新交易日"
+	if *date != "" {
+		target = *date
+		n, err = st.UpdateRSRankingsForDate(*date)
+	} else {
+		n, err = st.UpdateRSRankings()
+	}
 	if err != nil {
 		return fmt.Errorf("rs-rank: %w", err)
 	}
-	fmt.Printf("rs-rank: updated %d stocks\n", n)
+	fmt.Printf("rs-rank: updated %d stocks (%s)\n", n, target)
 	return nil
 }
 

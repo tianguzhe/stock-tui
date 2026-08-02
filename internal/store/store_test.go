@@ -446,6 +446,73 @@ func TestUpdateRSRankings(t *testing.T) {
 	}
 }
 
+// backfill-date 补出的历史行 rs 列为 0，需要单独补算；补算必须只作用于目标日，
+// 不能扰动已排好的最新日。
+func TestUpdateRSRankingsForDateOnlyTouchesThatDate(t *testing.T) {
+	s := openTemp(t)
+
+	const older, newer = "2026-07-20", "2026-07-21"
+	codes := []string{"sz000001", "sz000002", "sz000003"}
+	for i, c := range codes {
+		if err := s.UpsertInstrument(c, c, "sz", ""); err != nil {
+			t.Fatalf("seed instrument: %v", err)
+		}
+		for _, d := range []string{older, newer} {
+			if err := s.SaveSnapshot(Snapshot{
+				Code: c, TradeDate: d, Close: 10, Ret20: float64(i) * 5,
+			}); err != nil {
+				t.Fatalf("seed snapshot: %v", err)
+			}
+		}
+	}
+
+	// rs20 不在 SaveSnapshot 的写入列内，未排名的行为 NULL，故用 COALESCE 归零。
+	rsOn := func(code, date string) float64 {
+		t.Helper()
+		var rs float64
+		if err := s.DB().QueryRow(
+			`SELECT COALESCE(rs20, 0) FROM snapshot WHERE code=? AND trade_date=?`,
+			code, date).Scan(&rs); err != nil {
+			t.Fatalf("read rs20 %s@%s: %v", code, date, err)
+		}
+		return rs
+	}
+
+	// 默认只排最新日，历史日应保持未排名。
+	if _, err := s.UpdateRSRankings(); err != nil {
+		t.Fatalf("UpdateRSRankings: %v", err)
+	}
+	if got := rsOn("sz000003", older); got != 0 {
+		t.Errorf("older rs20 = %v after ranking newest only, want 0", got)
+	}
+	newestBefore := rsOn("sz000003", newer)
+	if newestBefore == 0 {
+		t.Fatal("newest date was not ranked")
+	}
+
+	// 补算历史日：该日被排名，最新日不受影响。
+	n, err := s.UpdateRSRankingsForDate(older)
+	if err != nil {
+		t.Fatalf("UpdateRSRankingsForDate: %v", err)
+	}
+	if n != len(codes) {
+		t.Fatalf("updated %d, want %d", n, len(codes))
+	}
+	if got := rsOn("sz000003", older); got == 0 {
+		t.Error("older rs20 still 0 after backfilling that date")
+	}
+	if got := rsOn("sz000003", newer); got != newestBefore {
+		t.Errorf("newest rs20 changed to %v, want unchanged %v", got, newestBefore)
+	}
+}
+
+func TestUpdateRSRankingsForDateRejectsEmptyDate(t *testing.T) {
+	s := openTemp(t)
+	if _, err := s.UpdateRSRankingsForDate(""); err == nil {
+		t.Error("expected an error for an empty date")
+	}
+}
+
 func TestCloseAfterUsesGlobalTradingDayAndRequiresExactCodeSnapshot(t *testing.T) {
 	s := openTemp(t)
 
