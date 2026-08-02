@@ -2,7 +2,7 @@
 
 ## 目录结构
 - `cmd/indicator-analyze` — 单标的深度技术面分析 CLI（tdx.go 调用 TDX HTTP 网关，-tdx 标志显式启用）
-- `cmd/stockdb` — 数据库管理（tag/history/rs-rank/backfill/backtest/batch-save/hot/check-data）
+- `cmd/stockdb` — 数据库管理（tag/history/rs-rank/backfill/backfill-date/backtest/batch-save/hot/check-data/repair-volratio/repair-scores）
 - `cmd/watch` — 盘中实时监控 TUI（BubbleTea，读 `.holdings` 自动展示持仓行情）
 - `main.go` — TUI 自选股行情入口（`go run .`）
 - `internal/api` — 行情 API（`FetchStocks`/`FetchMinute`/`FetchDailyKline`/`proxy_kline` 解析 + 东财反限流）
@@ -233,6 +233,26 @@
 - 已有 `low`/`high`/`amplitude`/`inside_vol`/`outside_vol` 字段(struct/CREATE TABLE/ALTER 容错/SaveSnapshot 四子处同步)；回测盘中止损/止盈读 `COALESCE(low, close)` 与 `COALESCE(high, close)`(`internal/backtest` 的 `getPriceRange`)，旧行缺失时回退 close
 - **`low20`/`obv_up3` 必须落库，禁止用 snapshot 历史反查**：snapshot 逐日累积且股票池逐步扩张，反查得到的窗口远短于 20 日。2026-07-25 实测 645 只中仅 36 只(5.6%)有满 20 日数据，58% 不足 6 日——sh513260 因此显示止损 -0.2%，真实应为 -8.1%。两列由 `-save` 从完整 800 根日K算好(`analysis.RangeLowHigh` / `analysis.OBVUp3Day`)，screener 直接读列
 - 数据是**逐日累积**的（每次 `-save`/`batch-save` 仅写当日快照），**不是**一次性回填历史 K——`stockdb backtest` 需多日 snapshot 才有 `exit_date`；数据不足时 `exit_date` 为空。个股历史信号敏感度用 CLI `PERF`（实时 800 根日K），不依赖 snapshot 长序列
+- **漏跑某天补不回来**：`batch-save` 只写日K最后一根对应的当日快照，隔天再跑也只写当天。补历史日用 **`go run ./cmd/stockdb backfill-date --date YYYY-MM-DD [-P 4] [--dry-run]`**（2026-08-01 新增；当时 07-20 全池缺失 555 只，即由此补回）
+  - 与 `repair-scores` 的分工：后者遍历 snapshot **已有行**重算，缺失日一行都没有故不会被处理；`backfill-date` 从**相邻交易日标的集合的并集**反推当日应有的股票池（不用 `instrument` 表——它反映"现在"的池子，会漏掉当时在池、之后被热榜清理的标的）
+  - 口径与当日 `batch-save` 一致：同样是 `truncateKline` 截断到目标日后调用**同一个** `buildSnapshot`，天然无前视偏差
+  - **不写 instrument**（避免把已清理的标的加回池子）；**不填 `turnover_rate`/`market_cap`/`pe`/`inside_vol`/`outside_vol`**（实时行情字段，历史不可追溯）；补"部分缺失"的日子时会经 `applyPreserved` 保留已有行的这些字段，不会清零
+  - **补完必须单独补算 RS**：`rs20/60/120` 不在 `SaveSnapshot` 写入列内，补出来的行该列为 NULL。用 `go run ./cmd/stockdb rs-rank --date YYYY-MM-DD`（不带 `--date` 时只排最新交易日，补不了历史日）
+- **2026-08-01 已补齐的残缺日**：07-20(0→555)、07-13(218→601)、07-14(242→632)、07-15(148→768)、06-22~06-30(138~229→386~490)。⚠️ **06-19 不是交易日**（端午假期，日K 从 06-18 直接跳到 06-22），此前误判为"数据空洞"，`backfill-date` 会正确跳过它
+  - **补跑只跑一轮**：股票池取相邻交易日**并集**，只增不减，多轮迭代会让池子单调膨胀（07-15 已达 768，超过相邻的 632/423），反而偏离当时真实的热榜池
+- 🔴 **前复权基准漂移：补完历史日必须跟一次 `repair-scores --all`**
+  - 前复权价是**相对最新价倒推**的，标的每次除权除息，其**全部历史前复权价整体下移**。因此"今天重算的历史行"与"当时写入的历史行"分属两套基准
+  - 只补部分日期会造成**两套基准混合**，在序列上产生**人为跳空**。2026-08-01 实测 sh600863（每股分红 0.22 元）：补跑过的 06-30 是新基准 4.48、未补的 07-01 是旧基准 4.85，序列显示 +8.3%，而真实为 4.48→4.63(+3.35%)。**`backtest` 用 snapshot 的 close 算收益，会把这个假跳空当成真实涨幅**
+  - `score_total` 不受影响（基于相对关系），受影响的是 `close` 及依赖它的一切计算
+  - 修复：`go run ./cmd/stockdb repair-scores --all -P 4`（1173 只 / 17462 行约 4 分钟）把全库统一到今日基准，**之后必须重排全部交易日的 RS**（ret20 已变）。回测本就需要连续前复权序列，全库统一才是正确终态
+  - 检测：`sqlite3 data/stock.db "ATTACH '备份.db' AS old; SELECT COUNT(*) FROM snapshot s JOIN old.snapshot o ON o.code=s.code AND o.trade_date=s.trade_date WHERE s.close != o.close;"` —— 但**只能查出重叠行**，补跑新增行引发的不一致查不到（实测备份对比只发现 6 只，全库重算实际修正了 17 只），故不要依赖检测，直接全量重算
+- **`rs-rank` 必须在 `batch-save` 之后跑，顺序反了会导致 RS 覆盖不全**：rs-rank 只排它执行时该日已存在的行，之后再写入的行 `rs20` 保持 0/NULL。2026-08-01 实测 06-18 有 354 行却只有 61 只排过名（17%）、07-16 是 184/423(43%)。排查与修复：
+  ```bash
+  # 查覆盖率异常的日子
+  sqlite3 data/stock.db "SELECT trade_date, COUNT(*) n, SUM(CASE WHEN rs20>0 THEN 1 ELSE 0 END) ranked FROM snapshot GROUP BY trade_date HAVING 100.0*ranked/n < 90;"
+  # 全量重排（幂等，纯 SQL，几秒完成）
+  for d in $(sqlite3 data/stock.db "SELECT DISTINCT trade_date FROM snapshot ORDER BY trade_date;"); do go run ./cmd/stockdb rs-rank --date "$d"; done
+  ```
 - 查看数据范围：`sqlite3 data/stock.db "SELECT MIN(trade_date), MAX(trade_date), COUNT(DISTINCT trade_date) FROM snapshot;"`
 
 ## 回测系统
@@ -289,12 +309,19 @@ go run ./cmd/stockdb batch-save -P 4
 
 # 2. 计算 RS 相对强度百分位排名（横截面 ret20 排名，全量落库当日即有效）
 go run ./cmd/stockdb rs-rank
+# ⚠️ 默认只排 MAX(trade_date) 那一天。补历史日需显式指定：rs-rank --date YYYY-MM-DD
+#    RS 是**当日样本内**的百分位，样本量不同的两天之间可比性有限。
 
 # 3. 回填决策结果（信号后满 10 个交易日的 decision_log 自动结算，输出分层胜率）
 go run ./cmd/stockdb backfill
 
 # 3.1（可选）数据质量检查——验证 RS 覆盖率、连续性、回填进度
 go run ./cmd/stockdb check-data
+# ⚠️ **盲区**：RS 覆盖率只查最新日、连续性只看最近 3 个交易日，**查不出更早的空洞**。
+#    2026-07-20 全池缺失就是这样长期未被发现的，最终靠对账单核对时才暴露。
+#    排查历史空洞用：
+#    sqlite3 data/stock.db "SELECT trade_date, COUNT(*) FROM snapshot GROUP BY trade_date ORDER BY trade_date;"
+#    快照数远低于相邻日 = 当天 batch-save 部分失败。
 
 # 4. 生成选股表（持仓置顶 + 优质候选，合计≤持仓数+7；--max 可手动指定上限）
 #    自动读取 .holdings 并按手数加权合并多账户重复持仓，无需手工拼参数
