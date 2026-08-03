@@ -221,9 +221,9 @@ func FetchStockInfo(code string) (*StockInfo, error) {
 			F116 float64 `json:"f116"` // 总市值
 			F117 float64 `json:"f117"` // 流通市值
 			F127 string  `json:"f127"` // 行业
-				F128 string  `json:"f128"` // 地区板块
-				F162 float64 `json:"f162"` // 市盈率
-				F167 float64 `json:"f167"` // 市净率
+			F128 string  `json:"f128"` // 地区板块
+			F162 float64 `json:"f162"` // 市盈率
+			F167 float64 `json:"f167"` // 市净率
 			F189 float64 `json:"f189"` // 上市日期 YYYYMMDD(东财返回 int,不可用 string)
 		} `json:"data"`
 	}

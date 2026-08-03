@@ -31,27 +31,27 @@ type tdxHQInfo struct {
 	Open    float64 `json:"Open"`
 	MaxP    float64 `json:"MaxP"`
 	MinP    float64 `json:"MinP"`
-	Volume  string  `json:"Volume"`   // 字符串如 "772258" (手)
+	Volume  string  `json:"Volume"` // 字符串如 "772258" (手)
 	Amount  float64 `json:"Amount"`
 	Yield   float64 `json:"Yield"`
 	HSL     float64 `json:"HSL"`     // 换手率%, 小数
 	LB      float64 `json:"LB"`      // 量比
-	Inside  string  `json:"Inside"`   // 字符串如 "395768" (手)
-	Outside string  `json:"Outside"`  // 字符串如 "376490" (手)
-	Jjjz    float64 `json:"Jjjz"`     // 基金单位净值(仅 ETF/基金有意义;非基金股票返回流通股本等无关值)
-	Average float64 `json:"Average"`  // 均价/VWAP
+	Inside  string  `json:"Inside"`  // 字符串如 "395768" (手)
+	Outside string  `json:"Outside"` // 字符串如 "376490" (手)
+	Jjjz    float64 `json:"Jjjz"`    // 基金单位净值(仅 ETF/基金有意义;非基金股票返回流通股本等无关值)
+	Average float64 `json:"Average"` // 均价/VWAP
 }
 
 type tdxExtInfo struct {
-	ZTPrice   float64 `json:"ZTPrice"`   // 涨停价
-	DTPrice   float64 `json:"DTPrice"`   // 跌停价
-	ZGB       float64 `json:"ZGB"`       // 总股本(万)
-	LTGB      float64 `json:"LTGB"`      // 流通股本(万)
-	ZSZ       float64 `json:"ZSZ"`       // 总市值(元)
-	SYL       float64 `json:"SYL"`       // 市盈率
-	MGSY      float64 `json:"MGSY"`      // 每股收益
-	MGJZC     float64 `json:"MGJZC"`     // 每股净资产
-	FreeLtgb  float64 `json:"FreeLtgb"`  // 自由流通股本(万)
+	ZTPrice  float64 `json:"ZTPrice"`  // 涨停价
+	DTPrice  float64 `json:"DTPrice"`  // 跌停价
+	ZGB      float64 `json:"ZGB"`      // 总股本(万)
+	LTGB     float64 `json:"LTGB"`     // 流通股本(万)
+	ZSZ      float64 `json:"ZSZ"`      // 总市值(元)
+	SYL      float64 `json:"SYL"`      // 市盈率
+	MGSY     float64 `json:"MGSY"`     // 每股收益
+	MGJZC    float64 `json:"MGJZC"`    // 每股净资产
+	FreeLtgb float64 `json:"FreeLtgb"` // 自由流通股本(万)
 }
 
 // tdxPBFXTResponse models the TdxShare.PBFXT K-line response.
@@ -74,7 +74,7 @@ type tdxAttachInfo struct {
 	MaxP     float64 `json:"MaxP"`
 	MinP     float64 `json:"MinP"`
 	Now      float64 `json:"Now"`
-	Volume   string  `json:"Volume"`  // 字符串, 如 "772258" (万? 还是手?)
+	Volume   string  `json:"Volume"` // 字符串, 如 "772258" (万? 还是手?)
 	Amount   float64 `json:"Amount"`
 	FHSL     float64 `json:"fHSL"`     // 当日换手率(%)
 	FAverage float64 `json:"fAverage"` // 当日均价
@@ -210,16 +210,16 @@ func FetchTDXGatewayStockInfo(code string) *TDXStockInfo {
 	rawCode := code[2:]
 
 	body := map[string]interface{}{
-		"Head":       map[string]interface{}{"Target": "0", "CharSet": "UTF8"},
-		"Code":       rawCode,
-		"Setcode":    setcode,
-		"HasHQInfo":  "1",
-		"HasExtInfo": "1",
-		"BspNum":     "0",
-		"HasProInfo": "0",
-		"HasCalcInfo":"0",
-		"HasCwInfo":  "0",
-		"HasStatInfo":"0",
+		"Head":        map[string]interface{}{"Target": "0", "CharSet": "UTF8"},
+		"Code":        rawCode,
+		"Setcode":     setcode,
+		"HasHQInfo":   "1",
+		"HasExtInfo":  "1",
+		"BspNum":      "0",
+		"HasProInfo":  "0",
+		"HasCalcInfo": "0",
+		"HasCwInfo":   "0",
+		"HasStatInfo": "0",
 	}
 
 	payload, err := json.Marshal(body)
