@@ -17,7 +17,8 @@
 - `docs/journal/` — 每日复盘日志
 - `docs/holdings-monitor/` — 持仓监控文档（含候选观察状态）
 - `docs/daily-decision.md` — 每日操作决策主文件（账户总览/止损红线/持仓决策矩阵/建仓闸门/执行记录），**纯手动维护、不在任何脚本自动化范围内**；持仓/成本/止损变动时需与 `docs/journal/` 当日 journal.md 同步更新，否则两处口径会不一致
-- `docs/cyq-data-source-notes.md` — CYQ 筹码指标数据源注意事项
+- `docs/monthly-review/` — 月度对账单（`YYYY-MM.md`，按月归档）
+- `docs/reference/` — 技术文档与参考资料（`data-apis.md`/`cyq-data-source-notes.md`/`eastmoney-api-mapping.md` 等）
 
 ### 盘中监控 TUI
 - 命令：`go run ./cmd/watch`（或编译后的 `./watch`）
@@ -27,7 +28,7 @@
 ## 行情数据
 - `internal/api` 封装行情 API（实时报价 `FetchStocks`、分时 `FetchMinute`、**日K获取 `FetchDailyKline`**——proxy 前复权 + 东财 fallback + TDX 换手率兜底，共享层消除 cmd 间重复）。
 - `internal/analysis` 技术面评分引擎（`ScoreResult`/`EvalSignals`/`Divergence`/`Performance`/`ApplyPerfAdaptive`/`LateStagePenalty` + 共用工具函数），从 cmd 共有逻辑中抽取。
-- 接口文档见 `docs/data-apis.md`(腾讯/东财/新浪 OHLC 字段顺序、`sh`/`sz`/`bj` 前缀映射、换手率字段均已更新)。
+- 接口文档见 `docs/reference/data-apis.md`(腾讯/东财/新浪 OHLC 字段顺序、`sh`/`sz`/`bj` 前缀映射、换手率字段均已更新)。
 - `FetchStockInfo` 通过 `push2.eastmoney.com/api/qt/stock/get` 获取基本面：f127(行业) f128(地区板块) f162(PE) f167(PB) f189(上市日期)。
 
 ### 数据源优先级与口径（2026-07 更新）
