@@ -233,6 +233,11 @@ func formatRow(label string, c *screener.Candidate, cost float64, shares int, ca
 func formatSignals(c *screener.Candidate, cost float64, shares int, capital float64) string {
 	var parts []string
 
+	// 加仓闸门排在最前：它是操作禁令，跟在十几个信号后面就等于没有。
+	if blocked, reason := screener.AddOnBlocked(c, cost); blocked {
+		parts = append(parts, reason)
+	}
+
 	// TD
 	cdwn := c.TDCountdown
 	td := cdwn

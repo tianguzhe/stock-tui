@@ -743,3 +743,135 @@ func TestTDFunctions(t *testing.T) {
 		}
 	})
 }
+
+// TestAddOnBlocked covers the add-on gate's score path: an unrealized loss with
+// both stances bearish and the score below AddOnMinScore. The deep-loss path is
+// covered separately by TestAddOnDeepLossOverride.
+func TestAddOnBlocked(t *testing.T) {
+	// blocked returns a candidate that trips the score path. The 15% loss sits
+	// clear of AddOnDeepLossPct so these cases exercise the score floor alone.
+	blocked := func() Candidate {
+		c := baseCandidate()
+		c.Close = 8.5
+		c.SARLong = false
+		c.SuperTrendLong = false
+		c.ScoreTotal = 33
+		return c
+	}
+	const cost = 10.0
+
+	tests := []struct {
+		name string
+		mod  func(*Candidate)
+		cost float64
+		want bool
+	}{
+		{"loss + double bearish + low score - blocked", func(c *Candidate) {}, cost, true},
+		{"unrealized profit - allowed", func(c *Candidate) { c.Close = 12.0 }, cost, false},
+		{"break-even is not a loss - allowed", func(c *Candidate) { c.Close = cost }, cost, false},
+		{"SAR still long - allowed", func(c *Candidate) { c.SARLong = true }, cost, false},
+		{"SuperTrend still long - allowed", func(c *Candidate) { c.SuperTrendLong = true }, cost, false},
+		{"score at threshold - allowed", func(c *Candidate) { c.ScoreTotal = AddOnMinScore }, cost, false},
+		{"score just below threshold - blocked", func(c *Candidate) { c.ScoreTotal = AddOnMinScore - 1 }, cost, true},
+		{"no cost means not a holding - allowed", func(c *Candidate) {}, 0, false},
+		{"negative cost - allowed", func(c *Candidate) {}, -1, false},
+		{"no close price - allowed", func(c *Candidate) { c.Close = 0 }, cost, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := blocked()
+			tt.mod(&c)
+			got, reason := AddOnBlocked(&c, tt.cost)
+			if got != tt.want {
+				t.Errorf("AddOnBlocked() = %v, want %v", got, tt.want)
+			}
+			if got && reason == "" {
+				t.Error("AddOnBlocked() blocked but gave no reason")
+			}
+			if !got && reason != "" {
+				t.Errorf("AddOnBlocked() allowed but returned reason %q", reason)
+			}
+		})
+	}
+}
+
+// TestAddOnBlockedHistoricalCases replays real add-on events from the 2026-06~08
+// trade log. The seven blocked cases are the deepest averaging-down trades on
+// record; the allowed ones are pullback add-ons with the trend or score intact
+// and must not be caught.
+func TestAddOnBlockedHistoricalCases(t *testing.T) {
+	tests := []struct {
+		name            string
+		cost, close     float64
+		score           int
+		sarLong, stLong bool
+		want            bool
+	}{
+		// Blocked: averaging down with trend broken and score collapsed.
+		{"06-25 泛微网络 -21.8%", 10.0, 7.82, 33, false, false, true},
+		{"07-23 半导体ETF -18.1%", 1.371, 1.123, 44, false, false, true},
+		{"07-30 华天科技 -17.0%", 20.0, 16.60, 31, false, false, true},
+		{"07-29 工业富联 -7.2%", 50.0, 46.40, 23, false, false, true},
+		// Allowed: score still healthy despite the double-bearish stance.
+		{"07-13 华安证券 -9.3% score57", 10.0, 9.07, 57, false, false, false},
+		// Allowed: trend intact.
+		{"07-07 创新药ETF -7.4% 双多", 0.766, 0.709, 69, true, true, false},
+		{"08-11 中天科技 -5.8% SAR多", 34.0, 32.03, 49, true, false, false},
+		// Allowed: adding into a winner.
+		{"06-22 中天科技 +16.7%", 10.0, 11.67, 69, true, true, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := baseCandidate()
+			c.Close = tt.close
+			c.ScoreTotal = tt.score
+			c.SARLong = tt.sarLong
+			c.SuperTrendLong = tt.stLong
+			got, _ := AddOnBlocked(&c, tt.cost)
+			if got != tt.want {
+				t.Errorf("AddOnBlocked() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestAddOnDeepLossOverride covers the deep-loss backstop: past
+// AddOnDeepLossPct the score floor is waived, but the trend exemption still
+// applies — a position that deep underwater with either stance long is a
+// post-reversal refill, not averaging down.
+func TestAddOnDeepLossOverride(t *testing.T) {
+	const cost = 10.0
+	tests := []struct {
+		name            string
+		close           float64
+		score           int
+		sarLong, stLong bool
+		want            bool
+	}{
+		// Deep loss waives the score floor.
+		{"loss 21% healthy score - blocked by backstop", 7.9, 80, false, false, true},
+		{"loss 31% healthy score - blocked by backstop", 6.9, 59, false, false, true},
+		// Exactly at the threshold is not past it; falls back to the score floor.
+		{"loss exactly 20% healthy score - allowed", 8.0, 80, false, false, false},
+		{"loss exactly 20% low score - blocked by score floor", 8.0, 33, false, false, true},
+		// Trend exemption survives the backstop.
+		{"loss 31% but SAR long - allowed", 6.9, 80, true, false, false},
+		{"loss 31% but SuperTrend long - allowed", 6.9, 33, false, true, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := baseCandidate()
+			c.Close = tt.close
+			c.ScoreTotal = tt.score
+			c.SARLong = tt.sarLong
+			c.SuperTrendLong = tt.stLong
+			got, reason := AddOnBlocked(&c, cost)
+			if got != tt.want {
+				t.Errorf("AddOnBlocked() = %v, want %v (reason %q)", got, tt.want, reason)
+			}
+			if got && reason == "" {
+				t.Error("AddOnBlocked() blocked but gave no reason")
+			}
+		})
+	}
+}

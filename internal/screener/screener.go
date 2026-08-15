@@ -439,6 +439,56 @@ func PositionHint(c *Candidate, capital float64) string {
 	return fmt.Sprintf("建议≤%d股", shares)
 }
 
+// AddOnMinScore is the score floor below which an add-on is barred once the
+// trend has already broken. Set at 50 from the 2026-06~08 add-on audit: every
+// blocked event scored 23–44, while the loss-making add-ons that stayed worth
+// making (华安证券 −9.3%) scored 57.
+const AddOnMinScore = 50
+
+// AddOnDeepLossPct is the unrealized-loss depth past which the score floor is
+// waived. The score floor alone leaves a tail open: a position can sit 30%+
+// underwater with a broken trend and still clear the gate on score alone, which
+// is precisely the hole averaging-down falls through. The trend exemption is
+// deliberately NOT waived — that deep underwater with SAR or SuperTrend back
+// long is a post-reversal refill, not averaging down.
+const AddOnDeepLossPct = 20.0
+
+// AddOnBlocked reports whether adding to an existing position is barred, and why.
+//
+// Averaging down into a broken trend is the costliest habit in the trade log:
+// 15 of 22 add-ons went in at a loss (mean −9.5%, worst −21.8%), and the money
+// went in hardest exactly when the system was screaming — score 23–44 with SAR
+// and SuperTrend both bearish.
+//
+// The gate needs an unrealized loss and both stances bearish. Past that, either
+// a score below AddOnMinScore or a loss deeper than AddOnDeepLossPct bars the
+// add-on. So a pullback add-on with the trend intact, or a shallow loss with the
+// score still healthy, passes untouched. Replayed over the audit window this
+// catches 7 of 21 add-ons — the six deepest averaging-down trades among them —
+// with no false positives.
+//
+// cost is the holder's average cost. A non-positive cost means the row is not a
+// held position (a candidate row), so the gate does not apply.
+func AddOnBlocked(c *Candidate, cost float64) (blocked bool, reason string) {
+	if cost <= 0 || c.Close <= 0 {
+		return false, ""
+	}
+	if c.Close >= cost {
+		return false, ""
+	}
+	if c.SARLong || c.SuperTrendLong {
+		return false, ""
+	}
+	lossPct := (1 - c.Close/cost) * 100
+	if lossPct > AddOnDeepLossPct {
+		return true, fmt.Sprintf("🚫禁止加仓(深亏%.1f%%,SAR/ST双空)", lossPct)
+	}
+	if c.ScoreTotal >= AddOnMinScore {
+		return false, ""
+	}
+	return true, fmt.Sprintf("🚫禁止加仓(浮亏%.1f%%,SAR/ST双空,score%d)", lossPct, c.ScoreTotal)
+}
+
 // LoadSnapshots loads latest snapshot data from database.
 func LoadSnapshots(dbPath string) (date string, candidates []Candidate, rsCoverage float64, err error) {
 	db, err := sql.Open("sqlite", dbPath)
