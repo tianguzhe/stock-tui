@@ -151,17 +151,25 @@ func diffAnalysis(label string, proxy, tdx, em api.KlineData) {
 			fmt.Printf("    ✅ OHLC 一致 (max diff=%.2f%%)\n", maxDiff)
 		}
 
-		// 换手率对比
-		tp := proxy.Turnovers[pi] * 100
-		tt := tdx.Turnovers[ti] * 100
+		// 换手率对比。Turnovers 与 Candles 长度不一定一致(部分数据源可能取不到
+		// 换手率而返回更短的切片), 越界前先校验。
+		hasProxyTR := pi >= 0 && pi < len(proxy.Turnovers)
+		hasTDXTR := ti >= 0 && ti < len(tdx.Turnovers)
+		var tp, tt float64
+		if hasProxyTR {
+			tp = proxy.Turnovers[pi] * 100
+		}
+		if hasTDXTR {
+			tt = tdx.Turnovers[ti] * 100
+		}
 		fmt.Printf("    Proxy换手=%.4f%%  TDX换手=%.4f%%", tp, tt)
-		if hasEM {
+		if hasEM && ei >= 0 && ei < len(em.Turnovers) {
 			te := em.Turnovers[ei] * 100
 			fmt.Printf("  EM换手=%.4f%%", te)
 		}
 		fmt.Printf("\n")
 
-		if tp > 0 && tt > 0 {
+		if hasProxyTR && hasTDXTR && tp > 0 && tt > 0 {
 			trDiff := abs(tp - tt)
 			if trDiff > 0.1 {
 				fmt.Printf("    ⚠️ Proxy vs TDX 换手率差异 > 0.1%%! diff=%.4f%%\n", trDiff)

@@ -181,6 +181,20 @@ func (e *PortfolioEngine) Run() error {
 					break
 				}
 
+				// 同一代码已持有一份仓位时跳过：信号可能连续多日成立，重复建仓
+				// 会让资金集中在少数标的却仍占用 MaxPositions 的"分散持仓槽"，
+				// 扭曲组合回测的分散化假设与收益/风险统计。
+				alreadyHeld := false
+				for _, pos := range positions {
+					if pos.Code == sig.Code {
+						alreadyHeld = true
+						break
+					}
+				}
+				if alreadyHeld {
+					continue
+				}
+
 				// 计算买入股数
 				positionValue := capital * e.config.PositionSize
 				shares := int(positionValue/sig.Close/100) * 100 // 向下取整到100股

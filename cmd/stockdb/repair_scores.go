@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"flag"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"sync"
@@ -31,6 +32,7 @@ import (
 // SaveSnapshot 的写入列内，天然不受影响。
 func repairScoresCmd(args []string) error {
 	fs := flag.NewFlagSet("repair-scores", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
 	dbPath := fs.String("db", "data/stock.db", "database path")
 	bars := fs.Int("n", 800, "number of daily bars to fetch per stock")
 	parallel := fs.Int("P", 4, "parallel fetch workers")
@@ -204,10 +206,12 @@ func repairScoresOne(st *store.Store, lock *sync.Mutex, client *http.Client,
 		idxByDate[d] = i
 	}
 
+	// lock 只保护 SQLite 读/写本身(与 batch-save 的 storeLock 同一粒度),不覆盖
+	// buildSnapshot 的指标重算——那是 CPU 密集操作,锁着它会让并行 worker 排队
+	// 等计算,削弱 -P 的并行度。
 	lock.Lock()
-	defer lock.Unlock()
-
 	targets, err := scoreRepairTargets(st.DB(), code, cutoff)
+	lock.Unlock()
 	if err != nil {
 		return 0, 0, err
 	}
@@ -225,7 +229,10 @@ func repairScoresOne(st *store.Store, lock *sync.Mutex, client *http.Client,
 			continue
 		}
 		applyPreserved(&snap, keep)
-		if err := st.SaveSnapshot(snap); err != nil {
+		lock.Lock()
+		err := st.SaveSnapshot(snap)
+		lock.Unlock()
+		if err != nil {
 			return done, skipped, fmt.Errorf("save %s@%s: %w", code, date, err)
 		}
 		done++

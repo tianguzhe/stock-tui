@@ -142,9 +142,27 @@ func Open(path string) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite %s: %w", path, err)
 	}
+	// PRAGMA state (foreign_keys/busy_timeout below) is per physical connection,
+	// not database-wide — database/sql may otherwise open a second connection
+	// for a concurrent caller that never gets these pragmas applied. Capping
+	// the pool at one connection guarantees every query goes through the one
+	// connection we configure here. This costs nothing in practice: SQLite is
+	// single-writer anyway, and every concurrent caller in this codebase
+	// (batch-save's worker pool, repair-scores, etc.) already serializes writes
+	// through its own mutex before touching *Store.
+	db.SetMaxOpenConns(1)
 	if _, err := db.Exec("PRAGMA foreign_keys = ON"); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("enable foreign_keys: %w", err)
+	}
+	// busy_timeout as a defensive floor: callers that write concurrently (e.g.
+	// batch-save's worker pool) already serialize with their own mutex, but
+	// nothing here stops a second process from opening the same file. Without
+	// this, SQLite's default rollback-journal locking fails a concurrent writer
+	// immediately (SQLITE_BUSY) instead of waiting for the lock to clear.
+	if _, err := db.Exec("PRAGMA busy_timeout = 5000"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("set busy_timeout: %w", err)
 	}
 	s := &Store{db: db}
 	if err := s.migrate(); err != nil {
@@ -304,7 +322,7 @@ CREATE INDEX IF NOT EXISTS idx_decision_log_pending ON decision_log(outcome_pct)
 	// the nDayReturn computation existed. All three being exactly 0 is impossible
 	// for real market data across 20/60/120 days.
 	s.db.Exec(`UPDATE snapshot SET ret20=NULL, ret60=NULL, ret120=NULL
-		WHERE ret20=0 AND ret60=0 AND ret120=0 AND COALESCE(ret20,0)=0`) //nolint:errcheck
+		WHERE ret20=0 AND ret60=0 AND ret120=0`) //nolint:errcheck
 
 	// Clear rs values ONLY if all three are 0 AND never been set by rs-rank.
 	// Check if rs20/60/120 were just zero-initialized but never computed.

@@ -61,11 +61,17 @@ type BacktestSummary struct {
 	// 按信号分层
 	SignalStats string `json:"signal_stats"` // JSON
 
-	// 按市场环境分层
+	// 按市场环境分层。单信号回测引擎(internal/backtest/engine.go)不做市场
+	// 状态(牛/熊)分类, 这两列在其写入的行里恒为 0——不代表"两种环境下都是
+	// 0 胜率"。组合回测(internal/backtest/portfolio.go)目前也不落这张表
+	// (只打印 PortfolioStats, 不调用 SaveBacktestSummary), 故当前无任何写入
+	// 路径会填充这两列。查询 backtest_summary 时不要把 0 当有效统计量读。
 	BullMarketWinRate float64 `json:"bull_market_win_rate"`
 	BearMarketWinRate float64 `json:"bear_market_win_rate"`
 
-	// 风险指标
+	// 风险指标。同上, 单信号引擎按独立交易记录收益, 没有可供计算回撤的权益
+	// 曲线, 这两列同样恒为 0。组合回测的 PortfolioStats 有对应的真实计算
+	// (calculateMaxDrawdown/夏普比率), 但结果目前不落库, 只在 CLI 打印。
 	MaxDrawdown float64 `json:"max_drawdown"`
 	SharpeRatio float64 `json:"sharpe_ratio"`
 

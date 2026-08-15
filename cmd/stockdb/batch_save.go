@@ -10,10 +10,9 @@ import (
 	"sync"
 	"time"
 
-	"stock-tui/internal/analysis"
 	"stock-tui/internal/api"
-	"stock-tui/internal/indicator"
 	"stock-tui/internal/market"
+	"stock-tui/internal/snapshot"
 	"stock-tui/internal/store"
 )
 
@@ -146,6 +145,9 @@ func saveOneStock(st *store.Store, client *http.Client, storeLock *sync.Mutex, c
 	}
 
 	snap := buildSnapshot(data)
+	if snap.TradeDate == "" {
+		return fmt.Errorf("无有效K线,跳过落库")
+	}
 
 	// 补市盈率等基本面
 	if stocks, err := api.FetchStocks([]string{ck}); err == nil && len(stocks) > 0 {
@@ -169,123 +171,11 @@ func saveOneStock(st *store.Store, client *http.Client, storeLock *sync.Mutex, c
 }
 
 // ——— Snapshot 构建 ———
+//
+// 计算逻辑已收敛到 internal/snapshot.Build，与 cmd/indicator-analyze 的
+// printAnalysis 共用同一实现——两者曾各自手工构造 ~90 字段的 Snapshot，
+// 新增列必须同步改两处，容易漏改导致落库口径分叉。
 
 func buildSnapshot(data api.KlineData) store.Snapshot {
-	candles := data.Candles
-	n := len(candles)
-	if n == 0 {
-		return store.Snapshot{Code: data.Code}
-	}
-	results := indicator.Calculate(candles)
-	tds := indicator.TDSequential(candles)
-	last := results[n-1]
-	lastCandle := candles[n-1]
-	closes := analysis.CloseSeries(candles)
-	ma5, ma10, ma20, ma60 := analysis.MeanTail(closes, 5), analysis.MeanTail(closes, 10), analysis.MeanTail(closes, 20), analysis.MeanTail(closes, 60)
-	// 量比: 优先腾讯 qt 实时值,缺失时本地重算(同一口径,见 analysis.VolRatio)
-	volRatio := data.VolRatioRT
-	if volRatio <= 0 {
-		volRatio = analysis.VolRatio(candles, n-1)
-	}
-	obv := analysis.OBVSeries(candles)
-	// 20 日最低价:止损回退线,必须来自完整日K(见 store.Snapshot.Low20 注释)。
-	low20, _ := analysis.RangeLowHigh(candles, n-20, n)
-	_, upAvgVol, _, downAvgVol := analysis.RecentVolumeHealth(candles, 5)
-	score := analysis.ScoreResult(candles, results, obv, upAvgVol, downAvgVol, volRatio)
-	div := analysis.Divergence(candles, results, n-1)
-	perfs := analysis.Performance(candles, data.Dates, results, tds, obv)
-	scoreAdj, _ := analysis.ApplyPerfAdaptive(score, perfs)
-	latePen, _, _ := analysis.LateStagePenalty(candles, results)
-	scoreAdj = analysis.ClampInt(scoreAdj+latePen, 0, 100)
-
-	changePct := 0.0
-	if n > 1 {
-		changePct = (candles[n-1].Close - candles[n-2].Close) / candles[n-2].Close * 100
-	}
-
-	lastTD := tds[n-1]
-
-	var perfTFBWin10, perfOBBWin10, perfDivBWin10 *float64
-	var perfTFBN, perfOBBN, perfDivBN *int
-	var perfTFBAvg10 *float64
-	for _, p := range perfs {
-		if p.Name == "趋势跟随多头" && p.Triggers > 0 {
-			val := float64(p.Win10) / float64(p.Triggers) * 100
-			perfTFBWin10 = &val
-			perfTFBN = &p.Triggers
-			avg := p.Sum10 / float64(p.Triggers)
-			perfTFBAvg10 = &avg
-		}
-		if p.Name == "超买反转" && p.Triggers > 0 {
-			val := float64(p.Win10) / float64(p.Triggers) * 100
-			perfOBBWin10 = &val
-			perfOBBN = &p.Triggers
-		}
-		if p.Name == "顶背离" && p.Triggers > 0 {
-			val := float64(p.Win10) / float64(p.Triggers) * 100
-			perfDivBWin10 = &val
-			perfDivBN = &p.Triggers
-		}
-	}
-
-	snap := store.Snapshot{
-		Code:      data.Code,
-		TradeDate: data.Dates[n-1],
-		Close:     lastCandle.Close,
-		ChangePct: changePct,
-		Low:       lastCandle.Low,
-		High:      lastCandle.High,
-		MA5:       ma5, MA10: ma10, MA20: ma20, MA60: ma60,
-		KDJ_J:    last.KDJ.J,
-		MACD_DIF: last.MACD.DIF, MACD_DEA: last.MACD.DEA, MACD_Hist: last.MACD.Histogram,
-		RSI6: last.RSI.RSI6, WR14: last.WR.WR14,
-		BIAS6: last.BIAS.BIAS6, BIAS24: last.BIAS.BIAS24,
-		PDI: last.DMI.PDI, MDI: last.DMI.MDI, ADX: last.DMI.ADX, ADXR: last.DMI.ADXR,
-		CMI: last.CMI, CHOP: last.CHOP,
-		ATRPct:                   last.ATR.Pct,
-		BollPB:                   last.BOLL.PercentB,
-		BollBW:                   last.BOLL.Bandwidth,
-		MFI:                      last.MFI,
-		SARLong:                  last.SAR.Long,
-		SuperTrendLong:           last.SuperTrend.Long,
-		VolRatio:                 volRatio,
-		OBVUp:                    analysis.OBVUpLast(obv),
-		ScoreTotal:               score.Total,
-		ScoreDelta:               score.Delta,
-		ScoreLabel:               score.Label,
-		ScoreAdj:                 scoreAdj,
-		SigTrendBull:             score.Signals.TrendBull,
-		SigOverbought:            score.Signals.Overbought,
-		SigOversold:              score.Signals.Oversold,
-		DivBull:                  div.Bull,
-		DivBear:                  div.Bear,
-		DivBearToday:             div.BearToday,
-		TDSetup:                  fmt.Sprintf("%s/%d", analysis.TDSignalText(lastTD.SetupSignal), lastTD.SetupCount),
-		TDCountdown:              fmt.Sprintf("%s/%d", analysis.TDSignalText(lastTD.CountdownSignal), lastTD.CountdownCount),
-		Streak:                   analysis.StreakValue(candles),
-		Ret20:                    analysis.NDayReturn(candles, 20),
-		Ret60:                    analysis.NDayReturn(candles, 60),
-		Ret120:                   analysis.NDayReturn(candles, 120),
-		PerfTrendFollowBullWin10: perfTFBWin10,
-		PerfOverboughtBearWin10:  perfOBBWin10,
-		PerfDivBearWin10:         perfDivBWin10,
-		PerfTrendFollowBullN:     perfTFBN,
-		PerfOverboughtBearN:      perfOBBN,
-		PerfDivBearN:             perfDivBN,
-		PerfTrendFollowBullAvg10: perfTFBAvg10,
-		KeltnerSqueeze:           last.Keltner.Squeeze,
-		DonchBreak20Bull:         analysis.DonchianBreak(candles, results, 20, true),
-		DonchBreak55Bull:         analysis.DonchianBreak(candles, results, 55, true),
-		SARValue:                 last.SAR.Value,
-		SuperTrendValue:          last.SuperTrend.Value,
-		Low20:                    low20,
-		OBVUp3:                   analysis.OBVUp3Day(obv),
-	}
-	// 填充振幅和内外盘(如果 proxy.qq.com 提供了)
-	if len(data.Amplitudes) == n && n > 0 {
-		snap.Amplitude = data.Amplitudes[n-1]
-	}
-	snap.InsideVol = data.InsideVol
-	snap.OutsideVol = data.OutsideVol
-	return snap
+	return snapshot.Build(data).Snap
 }

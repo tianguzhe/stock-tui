@@ -311,7 +311,7 @@ func EvalSignals(candles []indicator.Candle, results []indicator.Result, obv []f
 	r, prev := results[i], results[i-1]
 	ma5, ma20, ma60 := CloseMA(candles, i, 5), CloseMA(candles, i, 20), CloseMA(candles, i, 60)
 	vr := VolRatio(candles, i)
-	fiveAgo := MaxInt(0, i-5)
+	fiveAgo := MaxInt(0, i-obvLookback)
 	priceUp5 := candles[i].Close > candles[fiveAgo].Close
 	priceDown5 := candles[i].Close < candles[fiveAgo].Close
 	obvUp := obv[i] > obv[fiveAgo]
@@ -495,9 +495,13 @@ func NewPerf(name, direction string) PerfStat {
 	return PerfStat{Name: name, Direction: direction, Best10: math.Inf(-1), Worst10: math.Inf(1)}
 }
 
-// RecordPerf 记录信号触发日的前瞻收益。
+// RecordPerf 记录信号触发日的前瞻收益。entry<=0(脏数据)时跳过, 避免
+// Inf/NaN 静默污染 Sum5/Sum10/Best10/Worst10(同 NDayReturn 的零收盘防御)。
 func RecordPerf(p *PerfStat, candles []indicator.Candle, dates []string, i int) {
 	entry := candles[i].Close
+	if entry <= 0 {
+		return
+	}
 	ret5 := (candles[i+5].Close/entry - 1) * 100
 	ret10 := (candles[i+10].Close/entry - 1) * 100
 	adverse := 0.0
@@ -538,8 +542,12 @@ func RecordPerf(p *PerfStat, candles []indicator.Candle, dates []string, i int) 
 	p.LastDate = dates[i]
 }
 
-// ApplyPerfAdaptive 按本股 PERF 历史重算调整分。
-func ApplyPerfAdaptive(score ScoreState, perfs []PerfStat) (adjTotal, perfAdj int) {
+// ApplyPerfAdaptive 按本股 PERF 历史重算调整分。divBearToday 须与
+// "顶背离" PerfStat 样本口径一致——该样本只在 Divergence(...).BearToday 边沿
+// (d.BearToday && !prevDiv.BearToday, 见 Performance)记录, 而 score.Divergence<0
+// 还包含"非当日顶背离"(Bear 非 today, 得分 -1)这类未被采样过的情形, 用它当
+// 门槛会把胜率数据用错样本。调用方须直接传入当前 i 处 DivergenceState.BearToday。
+func ApplyPerfAdaptive(score ScoreState, perfs []PerfStat, divBearToday bool) (adjTotal, perfAdj int) {
 	obWin, obN := PerfWin10(perfs, "超买反转")
 	divWin, divN := PerfWin10(perfs, "顶背离")
 
@@ -549,7 +557,7 @@ func ApplyPerfAdaptive(score ScoreState, perfs []PerfStat) (adjTotal, perfAdj in
 			adj += PerfScale(v, obWin, obN, 35, 55) - v
 		}
 	}
-	if score.Divergence < 0 {
+	if divBearToday {
 		adj += PerfScale(score.Divergence, divWin, divN, 40, 55) - score.Divergence
 	}
 	return ClampInt(50+score.Delta+adj, 0, 100), adj

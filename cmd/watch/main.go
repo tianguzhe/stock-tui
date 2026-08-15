@@ -26,6 +26,7 @@ import (
 
 	"stock-tui/internal/api"
 	"stock-tui/internal/holdings"
+	"stock-tui/internal/market"
 	"stock-tui/internal/store"
 )
 
@@ -101,11 +102,11 @@ func main() {
 
 func run() error {
 	// 1. 读取持仓
-	holdings, err := parseHoldings()
+	hs, err := parseHoldings()
 	if err != nil {
 		return err
 	}
-	if len(holdings) == 0 {
+	if len(hs) == 0 {
 		fmt.Println("⚠️ 无可监控的持仓")
 		return nil
 	}
@@ -118,8 +119,8 @@ func run() error {
 	defer st.Close()
 
 	// 3. 实时行情
-	codes := make([]string, len(holdings))
-	for i, h := range holdings {
+	codes := make([]string, len(hs))
+	for i, h := range hs {
 		codes[i] = h.Code
 	}
 	stocks, err := api.FetchStocks(codes)
@@ -130,7 +131,7 @@ func run() error {
 	// 4. K线量能分析 (用于量比对比)
 	client := &http.Client{Timeout: 8 * time.Second}
 	klineCache := make(map[string]*klineVolResult)
-	for _, h := range holdings {
+	for _, h := range hs {
 		v, err := calcVolume(client, h.Code)
 		if err == nil {
 			klineCache[h.Code] = v
@@ -139,7 +140,7 @@ func run() error {
 
 	// 5. 拉取 SQLite 技术面快照
 	snapCache := make(map[string]*deepSnapshot)
-	for _, h := range holdings {
+	for _, h := range hs {
 		s, err := queryDeepSnapshot(st.DB(), h.Code)
 		if err == nil {
 			snapCache[h.Code] = s
@@ -148,13 +149,16 @@ func run() error {
 
 	// 6. 构建输出
 	now := time.Now()
-	bjt := now.Add(15 * time.Hour) // PDT → BJT
+	bjt := now
+	if loc, err := time.LoadLocation("Asia/Shanghai"); err == nil {
+		bjt = now.In(loc)
+	}
 	fmt.Printf("📡 盘中深度监控 · %s BJT\n", bjt.Format("15:04:05"))
 	fmt.Println(strings.Repeat("━", 54))
 
 	// code→holding map
 	hMap := make(map[string]holding)
-	for _, h := range holdings {
+	for _, h := range hs {
 		hMap[h.Code] = h
 	}
 
@@ -172,19 +176,28 @@ func run() error {
 		// ── 异动检测 ──
 		pct := s.ChangePct
 
-		// 涨跌幅异动
+		// 涨跌幅异动。涨停/跌停档按板块限幅缩放(market.PriceLimitPct,阈值=限幅-0.5,
+		// 与 screener/indicator-analyze 同一口径)——固定 ±9% 会把创业板/科创板正常
+		// 12% 波动误判涨停、把已封板的 ST ±5% 漏判。港股无限制(NoPriceLimit)时跳过
+		// 涨停/跌停档,只保留通用的大涨跌/明显波动档。
+		limit := market.PriceLimitPct(s.Code, s.Name)
+		var near, approach float64
+		if limit != market.NoPriceLimit {
+			near = limit - 0.5
+			approach = near - 2
+		}
 		switch {
-		case pct <= -9.0:
+		case limit != market.NoPriceLimit && pct <= -near:
 			alerts = append(alerts, alert{s.Code, s.Name, "💥", "跌停封死", pct, 3, ""})
-		case pct <= -7.0:
+		case limit != market.NoPriceLimit && pct <= -approach:
 			alerts = append(alerts, alert{s.Code, s.Name, "💥", "逼近跌停", pct, 3, ""})
 		case pct <= -5.0:
 			alerts = append(alerts, alert{s.Code, s.Name, "🔻", "大跌", pct, 2, ""})
 		case pct <= -3.0:
 			alerts = append(alerts, alert{s.Code, s.Name, "⬇️", "明显下跌", pct, 1, ""})
-		case pct >= 9.0:
+		case limit != market.NoPriceLimit && pct >= near:
 			alerts = append(alerts, alert{s.Code, s.Name, "🚀", "涨停", pct, 3, ""})
-		case pct >= 7.0:
+		case limit != market.NoPriceLimit && pct >= approach:
 			alerts = append(alerts, alert{s.Code, s.Name, "🚀", "逼近涨停", pct, 3, ""})
 		case pct >= 5.0:
 			alerts = append(alerts, alert{s.Code, s.Name, "⬆️", "大涨", pct, 2, ""})

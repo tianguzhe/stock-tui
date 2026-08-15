@@ -278,11 +278,11 @@ func FetchTDXGatewayStockInfo(code string) *TDXStockInfo {
 // 返回前复权 OHLC + Amount + Volume(股) + Turnovers(小数)。
 // 替代 cmd/indicator-analyze/tdx.go 中的 fetchViaTDX（TCP 版）。
 func FetchTDXGatewayKline(code string, bars int) (KlineData, error) {
-	rawCode := code[2:]
 	setcode := codeToTDXSetcodeInt(code)
 	if setcode < 0 {
 		return KlineData{}, fmt.Errorf("tdx gateway: 未知前缀 %s", code)
 	}
+	rawCode := code[2:]
 
 	body := map[string]interface{}{
 		"Head":          map[string]interface{}{"Target": 0, "CharSet": "UTF8"},
@@ -331,7 +331,7 @@ func FetchTDXGatewayKline(code string, bars int) (KlineData, error) {
 		return KlineData{}, fmt.Errorf("tdx gateway: 无K线数据 %s", code)
 	}
 
-	// Item 字段索引: [0]=日期, [1]=?, [2]=O, [3]=H, [4]=L, [5]=C, [6]=金额(元), [7]=金额dup, [8]=量(手), [9]=流通股本(万股)
+	// Item 字段索引: [0]=日期, [1]=?, [2]=O, [3]=H, [4]=L, [5]=C, [6]=金额(元), [7]=金额dup, [8]=量(股,已由网关统一为股), [9]=流通股本(万股)
 	const (
 		idxDate   = 0
 		idxOpen   = 2
@@ -341,39 +341,50 @@ func FetchTDXGatewayKline(code string, bars int) (KlineData, error) {
 		idxAmount = 6
 		idxVolume = 8
 		idxLTGB   = 9
+		minFields = idxLTGB + 1
 	)
 
-	// Item 字段: [0]=日期, [1]=?, [2]=O, [3]=H, [4]=L, [5]=C, [6]=金额(元), [7]=金额dup, [8]=量(股), [9]=流通股本(万股)
-	ltgb := parseFloat64(result.ListItem[0].Item[idxLTGB]) // 万股
-	ltgbShares := ltgb * 10000                             // 万股 → 股
+	var ltgbShares float64 // 万股 → 股
+	if first := result.ListItem[0].Item; len(first) >= minFields {
+		ltgbShares = parseFloat64(first[idxLTGB]) * 10000
+	}
 
 	n := len(result.ListItem)
-	dates := make([]string, n)
-	candles := make([]indicator.Candle, n)
-	turnovers := make([]float64, n)
+	dates := make([]string, 0, n)
+	candles := make([]indicator.Candle, 0, n)
+	turnovers := make([]float64, 0, n)
 
-	for i, item := range result.ListItem {
+	for _, item := range result.ListItem {
 		fields := item.Item
+		// 网关某行字段不全或日期格式异常时跳过该行, 不中断整批解析(与 proxy/东财路径一致)。
+		if len(fields) < minFields || len(fields[idxDate]) < 8 {
+			continue
+		}
 		date := fields[idxDate]
 		o := parseFloat64(fields[idxOpen])
 		h := parseFloat64(fields[idxHigh])
 		l := parseFloat64(fields[idxLow])
 		c := parseFloat64(fields[idxClose])
+		if o <= 0 || h <= 0 || l <= 0 || c <= 0 {
+			continue
+		}
 		amt := parseFloat64(fields[idxAmount])
-		vol := parseFloat64(fields[idxVolume]) // 股(已由网关统一为股)
+		vol := parseFloat64(fields[idxVolume])
 
-		dates[i] = fmt.Sprintf("%s-%s-%s", date[:4], date[4:6], date[6:8])
-		candles[i] = indicator.Candle{
+		dates = append(dates, fmt.Sprintf("%s-%s-%s", date[:4], date[4:6], date[6:8]))
+		candles = append(candles, indicator.Candle{
 			Open:   o,
 			High:   h,
 			Low:    l,
 			Close:  c,
 			Volume: vol,
 			Amount: amt,
-		}
+		})
+		var turnover float64
 		if ltgbShares > 0 && vol > 0 {
-			turnovers[i] = vol / ltgbShares
+			turnover = vol / ltgbShares
 		}
+		turnovers = append(turnovers, turnover)
 	}
 
 	return KlineData{

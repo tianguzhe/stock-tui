@@ -216,6 +216,7 @@ func cmdHistory(args []string) error {
 
 func cmdRSRank(args []string) error {
 	fs := flag.NewFlagSet("rs-rank", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
 	date := fs.String("date", "", "指定交易日 YYYY-MM-DD（默认最新交易日）")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -307,6 +308,7 @@ func cmdBackfill(_ []string) error {
 
 func cmdBacktest(args []string) error {
 	fs := flag.NewFlagSet("backtest", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
 	startDate := fs.String("start", "2025-01-01", "开始日期 (YYYY-MM-DD)")
 	endDate := fs.String("end", time.Now().Format("2006-01-02"), "结束日期 (YYYY-MM-DD)")
 	signals := fs.String("signals", "all", "信号类型（逗号分隔，或 all）")
@@ -367,6 +369,7 @@ func cmdBacktest(args []string) error {
 
 func cmdBacktestPortfolio(args []string) error {
 	fs := flag.NewFlagSet("backtest-portfolio", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
 	startDate := fs.String("start", "2025-01-01", "开始日期 (YYYY-MM-DD)")
 	endDate := fs.String("end", time.Now().Format("2006-01-02"), "结束日期 (YYYY-MM-DD)")
 	signals := fs.String("signals", "all", "信号类型（逗号分隔，或 all）")
@@ -473,6 +476,7 @@ func cmdHot(args []string) error {
 
 func cmdScreen(args []string) error {
 	fs := flag.NewFlagSet("screen", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
 	holdingsFlag := fs.String("holdings", "", "持仓，格式：代码:成本:手数(1手=100股),...；省略时读取 .holdings 文件")
 	holdingsFile := fs.String("holdings-file", holdings.DefaultPath, "持仓文件路径（--holdings 未指定时使用）")
 	maxResults := fs.Int("max", 0, "持仓+候选总上限（默认：持仓数+7）")

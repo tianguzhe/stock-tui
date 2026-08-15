@@ -240,9 +240,12 @@ func FetchStockInfo(code string) (*StockInfo, error) {
 		TotalShares: payload.Data.F84,
 		FloatShares: payload.Data.F85,
 		Industry:    strings.TrimSpace(payload.Data.F127),
+		Region:      strings.TrimSpace(payload.Data.F128),
 		ListedDate:  fmt.Sprintf("%.0f", payload.Data.F189),
 		TotalMC:     payload.Data.F116,
 		FloatMC:     payload.Data.F117,
+		PE:          payload.Data.F162,
+		PB:          payload.Data.F167,
 	}
 	return info, nil
 }

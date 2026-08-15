@@ -473,6 +473,9 @@ func (e *Engine) calculateSummary(results []store.BacktestResult) store.Backtest
 		returns = append(returns, r.ReturnPct)
 	}
 
+	// BullMarketWinRate/BearMarketWinRate/MaxDrawdown/SharpeRatio 留空(零值):
+	// 这个引擎按独立信号收益统计, 没有市场状态分类也没有权益曲线, 无法算出
+	// 这四项。见 store.BacktestSummary 上的字段注释。
 	summary := store.BacktestSummary{
 		Config:       e.configJSON(),
 		StartDate:    e.config.StartDate,

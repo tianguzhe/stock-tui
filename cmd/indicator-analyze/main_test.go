@@ -92,6 +92,7 @@ func TestApplyPerfAdaptive(t *testing.T) {
 		name      string
 		score     analysis.ScoreState
 		perfs     []analysis.PerfStat
+		bearToday bool
 		wantAdj   int
 		wantTotal int
 	}{
@@ -140,19 +141,31 @@ func TestApplyPerfAdaptive(t *testing.T) {
 		},
 		{
 			// Wilson 上界 34.3% < 40%
-			name:  "顶背离历史显著差(上界<40)惩罚减半",
-			score: base(false, -3),
-			perfs: []analysis.PerfStat{perfStatOf("顶背离", 100, 25)},
+			name:      "顶背离历史显著差(上界<40)惩罚减半",
+			score:     base(false, -3),
+			perfs:     []analysis.PerfStat{perfStatOf("顶背离", 100, 25)},
+			bearToday: true,
 			// -3→-1(+2), total = 50-18+2 = 34
 			wantAdj: 2, wantTotal: 34,
 		},
 		{
 			// Wilson 下界 60.4% > 55%
-			name:  "顶背离历史显著有效(下界>55)惩罚x1.5",
-			score: base(false, -3),
-			perfs: []analysis.PerfStat{perfStatOf("顶背离", 100, 70)},
+			name:      "顶背离历史显著有效(下界>55)惩罚x1.5",
+			score:     base(false, -3),
+			perfs:     []analysis.PerfStat{perfStatOf("顶背离", 100, 70)},
+			bearToday: true,
 			// -3→-4(-1), total = 50-18-1 = 31
 			wantAdj: -1, wantTotal: 31,
+		},
+		{
+			// 回归: Divergence=-1 常见于"非当日顶背离"(未过 BearToday 边沿, 不在
+			// 「顶背离」PerfStat 样本口径内)——即使传了高胜率 perfs 也不得调权。
+			name:      "非当日顶背离不在PERF样本口径内_不调整",
+			score:     base(false, -1),
+			perfs:     []analysis.PerfStat{perfStatOf("顶背离", 100, 70)},
+			bearToday: false,
+			// total = 50-15-1 = 34, adj=0(用原始 -1, 未按胜率重算)
+			wantAdj: 0, wantTotal: 34,
 		},
 		{
 			name: "底背离奖励不动",
@@ -177,16 +190,17 @@ func TestApplyPerfAdaptive(t *testing.T) {
 			wantAdj: 1, wantTotal: 50,
 		},
 		{
-			name:  "无PERF样本不调整",
-			score: base(true, -3),
-			perfs: nil,
+			name:      "无PERF样本不调整",
+			score:     base(true, -3),
+			perfs:     nil,
+			bearToday: true,
 			// total = 50-18 = 32
 			wantAdj: 0, wantTotal: 32,
 		},
 	}
 
 	for _, tc := range cases {
-		gotTotal, gotAdj := analysis.ApplyPerfAdaptive(tc.score, tc.perfs)
+		gotTotal, gotAdj := analysis.ApplyPerfAdaptive(tc.score, tc.perfs, tc.bearToday)
 		if gotAdj != tc.wantAdj || gotTotal != tc.wantTotal {
 			t.Errorf("%s: analysis.ApplyPerfAdaptive() = (total=%d, adj=%d), want (total=%d, adj=%d)",
 				tc.name, gotTotal, gotAdj, tc.wantTotal, tc.wantAdj)

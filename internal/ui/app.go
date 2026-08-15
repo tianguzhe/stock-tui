@@ -200,7 +200,7 @@ func (m *Model) moveSelection(delta int) tea.Cmd {
 		return nil
 	}
 	m.selected = next
-	m.minute = nil
+	m.clearMinute()
 	return m.startSelectedMinuteFetch()
 }
 

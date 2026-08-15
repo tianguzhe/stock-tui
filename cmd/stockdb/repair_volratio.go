@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"flag"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"sync"
@@ -30,6 +31,7 @@ import (
 // 让下游按"无数据"处理，而不是继续读到反的值。
 func repairVolRatioCmd(args []string) error {
 	fs := flag.NewFlagSet("repair-volratio", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
 	dbPath := fs.String("db", "data/stock.db", "database path")
 	bars := fs.Int("n", 800, "number of daily bars to fetch per stock")
 	parallel := fs.Int("P", 4, "parallel fetch workers")

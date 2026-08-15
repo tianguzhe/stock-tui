@@ -87,6 +87,10 @@ func runScreen(holdings []screener.Holding, maxResults int, capital float64, dry
 	breadth := screener.MarketBreadth(candidates)
 	gated := breadth < 40
 	limit := maxResults - len(holdings)
+	if limit <= 0 {
+		fmt.Fprintf(os.Stderr, "warn: --max=%d 不大于持仓数(%d)，候选栏将为空；如需候选请调大 --max\n",
+			maxResults, len(holdings))
+	}
 	if gated && limit > 0 {
 		limit = max(1, limit/2)
 	}

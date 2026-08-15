@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"flag"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"sync"
@@ -30,6 +31,7 @@ import (
 //   - 不填 turnover_rate/market_cap/pe：来自实时行情接口，历史不可追溯（同 repair-scores）
 func backfillDateCmd(args []string) error {
 	fs := flag.NewFlagSet("backfill-date", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
 	dbPath := fs.String("db", "data/stock.db", "database path")
 	date := fs.String("date", "", "目标交易日 YYYY-MM-DD（必填）")
 	bars := fs.Int("n", 800, "number of daily bars to fetch per stock")
