@@ -12,12 +12,13 @@
 - `internal/market` — 市场工具（代码规范化 `NormalizeCode`、涨跌停限幅 `PriceLimitPct`、ST 判定 `IsST`）
 - `internal/store` — SQLite 存储层（snapshot/decision_log/instrument）
 - `internal/ui` — BubbleTea UI 组件（TUI 渲染）
-- `scripts/` — 每日更新/选股/日志生成/测试脚本
+- `scripts/` — 每日更新/选股/日志生成/测试脚本；另含 `dividend-scan.py`（红利仓专用，全市场股息率扫描 + 分层筛选，`uv run` 执行，缓存在 `data/dividend-cache/`）
 - `reports/` — 组合报告与板块分析输出
 - `docs/journal/` — 每日复盘日志
 - `docs/holdings-monitor/` — 持仓监控文档（含候选观察状态）
 - `docs/daily-decision.md` — 每日操作决策主文件（账户总览/止损红线/持仓决策矩阵/建仓闸门/执行记录），**纯手动维护、不在任何脚本自动化范围内**；持仓/成本/止损变动时需与 `docs/journal/` 当日 journal.md 同步更新，否则两处口径会不一致
 - `docs/monthly-review/` — 月度对账单（`YYYY-MM.md`，按月归档）
+- `docs/dividend-portfolio.md` — **红利仓**（5 万长期股息仓，独立于短线仓本金）。**刻意不写入 `.holdings`** —— 写进去会被 `stockdb screen` 按短线纪律输出「禁止加仓」等警示，而红利仓下跌时应加仓攒股数，两套规则方向相反。卖出依据只有「每股分红下调」，与 SAR/ST 破位无关
 - `docs/reference/` — 技术文档与参考资料（`data-apis.md`/`cyq-data-source-notes.md`/`eastmoney-api-mapping.md` 等）
 
 ### 盘中监控 TUI

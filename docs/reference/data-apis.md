@@ -230,6 +230,59 @@ GET https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketDa
 
 ---
 
+## 四、东财数据中心 (datacenter-web) — 分红 / 行业
+
+与行情接口不同源：`datacenter-web.eastmoney.com` 走的是**报表**接口，通过 `reportName` 指定表。
+本项目用于红利仓的全市场股息率扫描，实现见 `scripts/dividend-scan.py`。
+
+### 4.1 分红送配 `RPT_SHAREBONUS_DET`
+
+```
+GET https://datacenter-web.eastmoney.com/api/data/v1/get
+    ?sortColumns=SECURITY_CODE&sortTypes=1&pageSize=500&pageNumber=1
+    &reportName=RPT_SHAREBONUS_DET&columns=ALL
+    &filter=(REPORT_DATE>='2025-01-01')(REPORT_DATE<='2025-12-31')
+    &source=WEB&client=WEB
+```
+
+- **必须带 `Referer: https://data.eastmoney.com/yjfp/`**。
+- `filter` 多条件用**括号并列**表示 AND，值用单引号。
+- 报表名错误时返回明确错误：`{"success":false,"message":"报表配置不存在,XXX","code":9501}` —— 探测成本低。
+
+| 字段 | 含义 | 陷阱 |
+|---|---|---|
+| `PRETAX_BONUS_RMB` | **每 10 股**税前分红 | ⚠️ **除以 10 才是每股**；`10派3.60` 时该值为 `3.6` |
+| `ASSIGN_PROGRESS` | 方案进度 | ⚠️ 须含「实施」才计入，否则会混入预案未过会与不分配 |
+| `REPORT_DATE` | 报告期 | ⚠️ 一年可能多次分红（一季/中期/三季/年报），**同年度记录必须加总**才是「上年每股分红」 |
+| `BASIC_EPS` / `PNP_YOY_RATIO` / `TOTAL_SHARES` | 每股收益 / 净利同比 / 总股本 | ⚠️ 只取 `REPORT_DATE` 以 `12-31` 结尾那条（年报口径），否则派息率会被中报 EPS 抬高 |
+| `EQUITY_RECORD_DATE` / `EX_DIVIDEND_DATE` | 股权登记日 / 除权除息日 | |
+| `DIVIDENT_RATIO` | 股息率 | ⚠️ 是**方案公布时点**的值，非当前；要当前股息率须用现价重算 |
+
+### 4.2 公司基本信息 `RPT_F10_BASIC_ORGINFO`
+
+```
+&reportName=RPT_F10_BASIC_ORGINFO
+&columns=SECURITY_CODE,SECURITY_NAME_ABBR,EM2016,INDUSTRYCSRC1,PROVINCE
+```
+
+- `EM2016`：东财三级行业，如 `金融-银行-股份制与城商行`（**推荐**）
+- `INDUSTRYCSRC1`：证监会行业 ｜ `BOARD_NAME_LEVEL`：申万风格
+
+> ⚠️ 该表含历史多版本记录，条数远多于在市股票数（实测 pages=50 × 500），按 `SECURITY_CODE` 覆盖写入即可。
+
+### 4.3 ⚠️ 不要用 `push2` 的 `clist` + `f133` 查股息率
+
+两个独立原因：
+
+1. **本机对 `push2.eastmoney.com` 的 `/api/qt/` 路径不通** —— 根路径返回 404（host 可达），但该 API 路径连接被直接关闭（`HTTP 000`）。已排除沙箱因素（`dangerouslyDisableSandbox` 同样失败）、系统代理因素（urllib 报 `RemoteDisconnected`）、cookie 因素（`quote.eastmoney.com` 预热返回 200 但无改善）。`datacenter-web` 与 `data.eastmoney.com` 均正常。
+2. **`f133` 口径不明** —— 它给南山铝业 `12.93`，而按「2025 年度每股分红 ÷ 现价」算是 8.85%。
+
+**正确做法**：用 4.1 拿每股分红原始值，自己除以现价。口径完全可控，且已三处交叉验证（伊利/招行/平安每股分红零误差、海尔 9 年轨迹逐位一致、四只相关均值 0.455 vs 人工 0.456）。
+
+> ⚠️ `clist` 接口的字段编号与 `stock/get` **不同表**：实测 `clist` 下 `f167` 返回负值（不可能是 PB）、`f127` 返回 0.53 之类的比率。跨接口不要照搬字段号。
+
+---
+
 ## 字段顺序速查(避坑)
 
 把同一根 K 的 OHLC 顺序并排，跨源时照此对应：
