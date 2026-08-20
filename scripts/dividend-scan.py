@@ -36,10 +36,19 @@ Usage:
 
 ═══ 筛选层级 ═══
 
-L1「连续 N 年分红不下调」是最狠的一刀（实测 189 → 45），因为高股息绝大
-多数是股价跌出来的或一次性的。但它有个盲区：会把「腰斩后从低点重新增长」
-也算成优质（宇通客车 2020 年分红 10.0→5.0，其 no_cut 仍为 5）。故额外
-输出 max_cut（9 年内最大同比降幅）用于区分「从未下调」与「曾腰斩」。
+L1 是最狠的一刀（实测 189 → 43），因为高股息绝大多数是股价跌出来的或
+一次性的。判据经过一次修正，两版的差异值得记住：
+
+- ❌ 旧版「连续 N 年不下调」是**二元判据**：一次下调就把计数器清零，不看
+  长期增长质量。实测矛盾——上海银行 no_cut=6 通过（9 年分红只增 4%，
+  2019~2022 连续四年零增长），兴业银行 no_cut=2 被拦（9 年增 **64%**，
+  仅 2023 年降 12.5% 且已连续两年恢复增长）。**长期增长明显更好的被拦掉。**
+  它还有第二个盲区：把「腰斩后从低点重新增长」算成优质（宇通客车 2020 年
+  分红 10.0→5.0，no_cut 仍为 5）。
+- ✅ 现版「**近 N 年不下调 + 历史最大降幅 ≤ X%**」把「最近是否恶化」与
+  「历史是否腰斩」拆成两个独立条件。近 2 年管前者（北京银行 2025 年降
+  13.1% 被拦），最大降幅管后者（川恒 −100%、东阿阿胶 −79.9%、汾酒
+  −77.8%、宇通 −50% 全部被拦——这些在旧版下反而合法通过）。
 
 L1~L5 全部基于**已实现的历史**，年报数据最长可滞后 15 个月。中创智领
 2025 年报净利 +9.14% 顺利通过 L5，而它 2026Q1 归母已 −18.06%、扣非
@@ -291,9 +300,13 @@ def fetch_closes(tcode: str) -> list[float]:
 
 
 def streak_no_cut(series: dict, end_year: int) -> int:
-    """从 end_year 往回数，分红未下调（≥上一年）的连续年数。"""
+    """从 end_year 往回数，分红未下调（≥上一年）的连续年数。
+
+    ⚠️ **仅作展示，不再作为 L1 判据**——它是二元的，一次下调即清零，
+    分不出「长期高增长中的一次小幅回调」与「长期停滞」。见模块 docstring。
+    """
     n = 0
-    for y in range(end_year, min(map(int, series)) , -1):
+    for y in range(end_year, min(map(int, series)), -1):
         cur, prev = series.get(str(y), 0), series.get(str(y - 1), 0)
         if cur <= 0:
             break
@@ -315,8 +328,24 @@ def streak_growth(series: dict, end_year: int) -> int:
     return n
 
 
+def recent_no_cut(series: dict, end_year: int, years: int) -> bool:
+    """最近 `years` 个年度是否均未下调。L1 的前半条，管「当下是否在恶化」。
+
+    与 streak_no_cut 的区别：只看固定窗口，不因窗口外的一次下调而清零。
+    """
+    for y in range(end_year, end_year - years, -1):
+        cur, prev = series.get(str(y), 0), series.get(str(y - 1), 0)
+        if prev > 0 and cur < prev - 1e-9:
+            return False
+    return True
+
+
 def max_cut(series: dict) -> float:
-    """9 年内最大同比降幅(%)。0 = 从未下调。用于识别「腰斩后重新增长」。"""
+    """全序列内最大同比降幅(%)。0 = 从未下调。
+
+    L1 的后半条，管「历史是否腰斩」——把「小幅回调后恢复增长」与
+    「腰斩后从低点重新计数」区分开。宇通客车 2020 年 10.0→5.0 即由此拦下。
+    """
     years = sorted(map(int, series))
     worst = 0.0
     for y in years[1:]:
@@ -371,7 +400,9 @@ def div_ocf_ok(r: dict, cap: float) -> bool:
 
 def make_layers(args):
     return [
-        ("L1 连续≥5年不下调", lambda r: r["no_cut"] >= 5),
+        (f"L1 近{args.recent_years:g}年不降+降幅≤{abs(args.max_cut):g}%",
+         lambda r: r["recent_ok"] and r["max_cut"] >= -abs(args.max_cut)
+         and r["per_share"] > 0),
         ("L2 近9年≥7年分红", lambda r: r["pay_years"] >= 7),
         ("L3 派息率≤100%", lambda r: r["payout"] is not None and r["payout"] <= 100),
         ("L4 市值≥100亿", lambda r: r["mcap"] is not None and r["mcap"] >= 100),
@@ -414,6 +445,7 @@ def build(args) -> list[dict]:
             "per_share": per_share, "yield": round(per_share / price * 100, 3),
             "series": e["series"], "annual": e["annual"],
             "no_cut": streak_no_cut(e["series"], y_to),
+            "recent_ok": recent_no_cut(e["series"], y_to, args.recent_years),
             "growth": streak_growth(e["series"], y_to),
             "max_cut": max_cut(e["series"]),
             "pay_years": sum(1 for v in e["series"].values() if v > 0),
@@ -467,7 +499,9 @@ def report(rows: list[dict], args) -> list[dict]:
     print(hdr + "  行业")
     for r in clean:
         print(line(r))
-    print(f"\n🟡 B 组 · 曾下调（{len(cut)} 只）—— 「不下调 N 年」是从低点重新计起")
+    print(f"\n🟡 B 组 · 曾小幅下调但已恢复（{len(cut)} 只）")
+    print(f"   降幅在 {abs(args.max_cut):g}% 以内且近 {args.recent_years} 年未再降；"
+          f"腰斩型已由 L1 拦在池外")
     print(hdr + f"{'最大降幅':>9}  行业")
     for r in cut:
         print(line(r, f"{r['max_cut']:>8.1f}%"))
@@ -520,6 +554,10 @@ def main() -> None:
     p.add_argument("--year", type=int, default=date.today().year - 1,
                    help="分红年度（默认去年，即最近一个已公布年报的年份）")
     p.add_argument("--min-yield", type=float, default=5.0, help="股息率门槛%%，默认 5.0")
+    p.add_argument("--recent-years", type=int, default=2,
+                   help="L1 前半条：最近 N 个年度不得下调，默认 2")
+    p.add_argument("--max-cut", type=float, default=15.0,
+                   help="L1 后半条：历史最大同比降幅上限%%，默认 15（超过视为曾腰斩）")
     p.add_argument("--min-q-yoy", type=float, default=-10.0,
                    help="L6 最近一期季报归母同比下限%%，默认 −10（数据缺失判否）")
     p.add_argument("--max-div-ocf", type=float, default=80.0,
