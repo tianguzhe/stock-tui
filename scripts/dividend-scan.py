@@ -101,9 +101,16 @@ PRICE_BATCH = 50       # 腾讯批量行情每批只数
 KLINE_WINDOW = 254     # 波动率/相关性的交易日窗口
 TRADING_DAYS = 252     # 年化因子
 
+# 复合排序时对分红增速的截断区间(%)。总回报 ≈ 股息率 + 分红增速，但增速
+# 必须截断：芭田股份近 3 年 CAGR +265.1%（派息率 11.0%→77.3%、EPS +591%），
+# 是低基数上的一次性暴涨，不截断会让它以复合分 271.6 霸占榜首，把稳定
+# 增长的标的全挤到后面。下界 -10% 同理，避免单只崩塌标的把排序拉到极端。
+CAGR_CLAMP = (-10.0, 15.0)
+
 # 缓存有效期：分红与行业变化慢，价格必须当日
 TTL_SLOW = timedelta(days=7)
 TTL_PRICE = timedelta(hours=12)
+TTL_FORECAST = timedelta(hours=12)  # 业绩预告逐日发布，7 天缓存会重新引入滞后
 
 UA_POOL = [
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
@@ -255,6 +262,42 @@ def fetch_fundamentals(year: int) -> dict:
     return dict(out)
 
 
+def fetch_forecasts(year: int) -> dict:
+    """{year+1} 年内的**业绩预告**，按报告期取最新一期。
+
+    🔑 **补的是 L6 的一个致命盲区：业绩预告早于正式财报数月发布。**
+    2026-07-15 久立特材公告中报预减 50~55%，而 `RPT_LICO_FN_CPD` 里它
+    最新一期仍是 2026Q1 的 **+1.43%**——正式中报要到 8 月底才披露。只看
+    季报的筛选会让这只在长达 6 周的窗口里持续显示「季报健康」。
+
+    取 `INCREASEL`（同比增幅**下限**）作为判据：预告给的是区间，风控
+    闸门一律取悲观端。久立该字段为 **−55**，与公告「下降 50%~55%」吻合。
+
+    ⚠️ A 股仅在净利大幅变动（±50%、亏损、扭亏等）时强制预告，故**多数
+    标的没有预告，这不是缺陷**——无预告即业绩无重大变动，按放行处理，
+    与 q_yoy_ok 的「缺失判否」相反（那里缺失代表查不到，这里代表没有）。
+    """
+    out: dict[str, dict] = {}
+    latest: dict[str, str] = {}
+    cols = ("SECURITY_CODE,SECURITY_NAME_ABBR,NOTICE_DATE,REPORTDATE,"
+            "INCREASEL,INCREASET,FORECASTTYPE,FORECASTCONTENT")
+    for page in _em_pages("RPT_PUBLIC_OP_PREDICT", cols,
+                          f"(REPORTDATE>='{year + 1}-01-01')", "业绩预告"):
+        for r in page:
+            code, rd = r["SECURITY_CODE"], (r.get("REPORTDATE") or "")[:10]
+            if not rd or rd < latest.get(code, ""):
+                continue
+            # 同一报告期可能多次修正，NOTICE_DATE 更晚的覆盖
+            if rd == latest.get(code) and (r.get("NOTICE_DATE") or "") < out[code].get("notice", ""):
+                continue
+            latest[code] = rd
+            out[code] = {"fc_date": rd, "notice": (r.get("NOTICE_DATE") or "")[:10],
+                         "fc_lower": r.get("INCREASEL"), "fc_upper": r.get("INCREASET"),
+                         "fc_type": r.get("FORECASTTYPE"),
+                         "fc_text": (r.get("FORECASTCONTENT") or "")[:120]}
+    return out
+
+
 def to_tencent(secucode: str) -> str | None:
     """000001.SZ → sz000001"""
     if not secucode or "." not in secucode:
@@ -355,6 +398,112 @@ def max_cut(series: dict) -> float:
     return worst
 
 
+def div_cagr(series: dict, end_year: int, years: int) -> float | None:
+    """近 `years` 年每股分红复合增速(%)。数据不足或首尾非正返回 None。
+
+    🔑 **这是 L1 两个判据都盖不住的维度。** L1 的 recent_no_cut 是二元的
+    （降没降）、max_cut 是极值的（有没有腰斩），两者可以同时成立而分红
+    仍在缓慢阴跌——兴业银行 1.188→1.04→1.06→1.066 即是：近 2 年确实
+    没降、最大降幅 12.5% 也在 15% 以内，七层全部放行，而近 3 年 CAGR
+    是 **−3.5%**。
+
+    ⚠️ **窗口取 3 年而非全序列**：兴业 9 年 CAGR 仍有 +6.4%（正！），
+    远期基数会把近期恶化稀释掉。长周期健康、近周期恶化正是要抓的形态。
+    """
+    if years < 1:
+        return None
+    beg = series.get(str(end_year - years), 0)
+    end = series.get(str(end_year), 0)
+    if beg <= 0 or end <= 0:
+        return None
+    return ((end / beg) ** (1 / years) - 1) * 100
+
+
+def implied_pb(price: float, eps: float | None, roe: float | None) -> float | None:
+    """由 ROE 与 EPS 反推市净率，避开额外拉一次行情接口。
+
+    推导：ROE = EPS / BPS ⟹ BPS = EPS / ROE ⟹ PB = price × ROE / EPS。
+    实测与腾讯 qt 的 PB 吻合（兴业 0.479 vs 0.47、招行 0.92 vs 0.89）。
+
+    有了 PB，股息率就能做**三因子分解**（见 yield_driver）：
+        股息率 ≡ 派息率 × ROE ÷ PB
+    这个恒等式在 14 只终选上还原误差为 0.00pct。
+    """
+    if not eps or eps <= 0 or not roe or roe <= 0 or price <= 0:
+        return None
+    return price * (roe / 100) / eps
+
+
+def eps_series(annual: dict, years: int) -> list[float]:
+    """近 `years` 个年度的 EPS 序列（按年份升序，跳过缺失）。"""
+    out = [v["eps"] for _, v in sorted(annual.items())
+           if isinstance(v, dict) and v.get("eps")]
+    return out[-years:]
+
+
+def earnings_vol(annual: dict, years: int) -> float | None:
+    """净利同比增速的标准差(%)，即**盈利波动率**。
+
+    MSCI Quality 指数的三大因子之一（另两个是 ROE 与负债率）：盈利越
+    平稳，未来分红越可预测。实测区分度极佳——银行 4~12%，而芭田股份
+    **75%**、三七互娱 41%。
+
+    🔑 **它抓的是「周期股伪装成红利股」**：周期顶的高股息率看起来与
+    优质红利股毫无区别，差别只在盈利的稳定性上。
+    """
+    yoys = [v["yoy"] for _, v in sorted(annual.items())
+            if isinstance(v, dict) and v.get("yoy") is not None][-years:]
+    if len(yoys) < 3:
+        return None
+    m = sum(yoys) / len(yoys)
+    return math.sqrt(sum((x - m) ** 2 for x in yoys) / (len(yoys) - 1))
+
+
+def earnings_position(annual: dict, eps_now: float | None, years: int) -> float | None:
+    """当前 EPS ÷ 近 `years` 年均值 EPS。**Shiller CAPE 的正常化思想。**
+
+    周期股的当期盈利不能直接用来算股息率——分子（分红）会随周期回落，
+    而买入时看到的高股息率是周期顶的产物。用多年均值平滑后才是可持续的
+    盈利中枢。
+
+    实测把唯一的伪装者一刀切出：芭田股份 **3.24x**（正常化股息率仅
+    **2.01%**，远低于 5% 门槛），其余 13 只终选全部落在 0.98~1.33x。
+
+    ⚠️ **对高成长公司会系统性偏高**（招行 1.16x 只是因为 EPS 九年翻倍），
+    故阈值取 1.5x/2.0x 这类宽口径，不作精细判别。
+    """
+    hist = eps_series(annual, years)
+    if not eps_now or len(hist) < 5:
+        return None
+    avg = sum(hist) / len(hist)
+    return eps_now / avg if avg > 0 else None
+
+
+def normalized_yield(r: dict, years: int) -> float | None:
+    """用**均值 EPS**（而非当期）还原的股息率(%)，即周期平滑后的可持续股息率。
+
+    ＝ 近 N 年均值EPS × 当前派息率 ÷ 现价。回答的是「如果盈利回到中枢，
+    这只还剩多少股息率」——芭田由 6.50% 塌到 **2.01%**。
+    """
+    hist = eps_series(r["annual"], years)
+    if len(hist) < 5 or not r["payout"] or r["price"] <= 0:
+        return None
+    return sum(hist) / len(hist) * (r["payout"] / 100) / r["price"] * 100
+
+
+def payout_of(series: dict, annual: dict, year: int) -> float | None:
+    """指定年度的派息率(%)。口径与 build() 中的 payout 一致（每股分红÷EPS）。
+
+    抽成函数是为了给 div_quality 比较首尾两年的派息率变化——判断分红
+    增长究竟来自利润还是来自派息率抬升。
+    """
+    div = series.get(str(year), 0)
+    eps = (annual.get(str(year)) or {}).get("eps")
+    if div <= 0 or not eps or eps <= 0:
+        return None
+    return div / eps * 100
+
+
 # ─────────────────────────── 组合指标 ───────────────────────────
 
 
@@ -383,10 +532,33 @@ def correlation(a: list[float], b: list[float]) -> float:
 
 # ─────────────────────────── 主流程 ───────────────────────────
 
+def latest_earnings_signal(r: dict) -> tuple[float | None, str]:
+    """最新的盈利方向信号，返回 (同比%, 来源)。
+
+    **业绩预告优先于正式季报**——前者早数月发布。仅当预告报告期比季报
+    报告期更新时才接管；否则沿用季报（预告是老报告期的、季报已出正式值）。
+    """
+    q, qd = r.get("q_np_yoy"), (r.get("q_date") or "")
+    lo, fd = r.get("fc_lower"), (r.get("fc_date") or "")
+    if lo is None or not fd:
+        return q, "季报"
+    # q_date 形如 2026Q1，转成可比的日期串
+    qmap = {"Q1": "-03-31", "Q2": "-06-30", "Q3": "-09-30", "Q4": "-12-31"}
+    qdate = (qd[:4] + qmap.get(qd[4:], "-01-01")) if len(qd) >= 6 else ""
+    if qdate and fd <= qdate:
+        return q, "季报"
+    return lo, f"预告{fd[:7]}"
+
+
 def q_yoy_ok(r: dict, floor: float) -> bool:
-    """最近一期季报归母同比。数据缺失一律判否——这是风控闸门，
-    信息最少时必须向保护侧失败，不能因为「查不到」就放行。"""
-    return r["q_np_yoy"] is not None and r["q_np_yoy"] > floor
+    """最近一期盈利同比（**业绩预告优先**）。
+
+    季报缺失一律判否——这是风控闸门，信息最少时必须向保护侧失败，不能
+    因为「查不到」就放行。但**预告缺失属正常**（A 股仅大幅变动才强制
+    预告），此时回落到季报判断。
+    """
+    val, _ = latest_earnings_signal(r)
+    return val is not None and val > floor
 
 
 def div_ocf_ok(r: dict, cap: float) -> bool:
@@ -396,6 +568,164 @@ def div_ocf_ok(r: dict, cap: float) -> bool:
     if r["ind1"] == "金融":
         return True
     return r["div_ocf"] is not None and r["div_ocf"] <= cap
+
+
+# 派息率抬升多少算「靠缓冲垫买增长」。1pct 以内属正常年度波动。
+PAYOUT_SHIFT_MIN = 1.0
+
+# ── 红利质量分 DQ 的阈值（实测于 2026-08 终选 14 只，见文档「专业维度」）──
+EPS_NORM_YEARS = 7      # 盈利正常化窗口，覆盖一轮完整周期
+DQ_PAYOUT_MAX = 70.0    # 派息率上限：>70% 缓冲垫已薄
+DQ_ROE_MIN = 10.0       # ROE 下限：银行股低于此普遍伴随 PB 深度折价
+DQ_EVOL_MAX = 30.0      # 盈利波动率上限（MSCI Quality 口径）
+DQ_OCF_MAX = 60.0       # 分红/经营现金流上限（非金融）
+DQ_FIN_PAYOUT_MAX = 40.0  # 金融行业改用派息率，其 OCF 含存贷不可比
+DQ_EPOS_WARN = 1.5      # 盈利位置：>1.5x 偏高
+DQ_EPOS_FATAL = 2.0     # >2.0x 判为周期高位，当期股息率不可持续
+DQ_TRAP_PB = 0.8        # 价值陷阱形态：PB 低于此
+DQ_TRAP_ROE = 10.0      # 且 ROE 低于此
+DQ_DIVERGE_MAX = 20.0   # 净利同比 − 营收同比 的背离上限(pct)
+DQ_DIVERGE_REV = -10.0  # 且营收同比低于此才算红旗（营收在涨则背离无害）
+
+
+def rev_np_diverge(r: dict) -> float | None:
+    """净利同比 − 营收同比(pct)。**盈利质量的前瞻信号。**
+
+    🔑 **营收塌了而净利没塌，利润来源必然存疑**——可能是一次性收益、
+    高毛利订单结构、或会计口径。它不可持续，下一期往往就是业绩拐点。
+
+    实测久立特材 2026Q1：净利 **+1.43%** 而营收 **−29.79%**，背离
+    31.2pct。三个月后（2026-07-15）中报预告净利腰斩 **−50%~−55%**。
+    **信号早就在数据里**——`q_rev_yoy` 一直被拉取，只是 L6 从没用过它。
+
+    ⚠️ 只在**营收下滑**时才是红旗：营收增长时的正背离多为经营杠杆
+    （华夏银行营收 +35% / 净利 −1.5% 是反向，属另一类问题，不由此判据管）。
+    """
+    np_, rev = r.get("q_np_yoy"), r.get("q_rev_yoy")
+    if np_ is None or rev is None:
+        return None
+    return np_ - rev
+
+
+def yield_driver(r: dict) -> str:
+    """高股息率的**主导来源**，基于恒等式 股息率 ≡ 派息率 × ROE ÷ PB。
+
+    同样是 5%+ 的股息率，三个来源的风险性质完全不同：
+
+    - **低 PB 驱动**：市场给净资产打折。若 ROE 也低，折价往往是**对盈利
+      能力的合理定价而非错杀**——华夏 PB 0.34/ROE 8.3%、兴业 0.48/9.2%
+    - **高 ROE 驱动**：真实盈利能力支撑，最健康
+    - **高派息率驱动**：靠分掉更大比例的利润换来，派息率有上限，走不远
+    """
+    pb, roe, payout = r.get("pb"), r.get("roe"), r.get("payout")
+    src = []
+    if pb is not None and pb < DQ_TRAP_PB:
+        src.append(f"低PB{pb:.2f}")
+    if roe is not None and roe > 15:
+        src.append(f"高ROE{roe:.0f}%")
+    if payout is not None and payout > DQ_PAYOUT_MAX:
+        src.append(f"高派息{payout:.0f}%")
+    return "＋".join(src) if src else "均衡"
+
+
+def dq_score(r: dict) -> tuple[int, int, list[str]]:
+    """红利质量分（仿 Piotroski F-Score 的**等权加总**），返回 (得分, 满分, 未通过项)。
+
+    等权是刻意的：加权需要拟合历史收益，而本仓样本只有几十只、持有期
+    以年计，任何权重都是过拟合。等权加总可解释、可手算复核。
+
+    八项各 1 分，覆盖红利投资的三支柱——**能力**（ROE、现金流覆盖）、
+    **意愿**（分红增速、派息率）、**可持续性**（盈利波动、盈利位置、
+    价值陷阱形态、当期盈利方向）。
+    """
+    fin = r["ind1"] == "金融"
+    checks = {
+        "分红增速": r["div_cagr"] is not None and r["div_cagr"] >= 0,
+        "派息率": r["payout"] is not None and r["payout"] <= DQ_PAYOUT_MAX,
+        "ROE": r["roe"] is not None and r["roe"] >= DQ_ROE_MIN,
+        "盈利波动": r["evol"] is not None and r["evol"] <= DQ_EVOL_MAX,
+        "季报": r["q_np_yoy"] is not None and r["q_np_yoy"] >= 0,
+        "非陷阱形态": not (r["pb"] is not None and r["pb"] < DQ_TRAP_PB
+                       and (r["roe"] or 0) < DQ_TRAP_ROE),
+        "营收匹配": not ((d := rev_np_diverge(r)) is not None
+                     and d > DQ_DIVERGE_MAX
+                     and (r.get("q_rev_yoy") or 0) < DQ_DIVERGE_REV),
+        "分红覆盖": ((r["payout"] is not None and r["payout"] <= DQ_FIN_PAYOUT_MAX)
+                 if fin else
+                 (r["div_ocf"] is not None and r["div_ocf"] <= DQ_OCF_MAX)),
+        "盈利位置": r["epos"] is not None and r["epos"] <= DQ_EPOS_WARN,
+    }
+    return sum(checks.values()), len(checks), [k for k, v in checks.items() if not v]
+
+
+def dq_alerts(r: dict) -> list[str]:
+    """结构性警示。**命中不影响入选**（与 L6/L7 的准入分工一致），但意味着
+    「这只的高股息率能否延续」存在可名状的机制性疑问，需在文档中单独交代。
+
+    三条都不是「某个指标偏低」，而是**分红与其盈利基础脱钩的三种形态**。
+    """
+    out = []
+    if r["epos"] is not None and r["epos"] > DQ_EPOS_FATAL:
+        ny = r.get("norm_yield")
+        tail = f"，正常化股息率仅 {ny:.2f}%" if ny is not None else ""
+        out.append(f"周期高位 {r['epos']:.2f}x{tail}")
+    if r["pb"] is not None and r["pb"] < DQ_TRAP_PB and (r["roe"] or 0) < DQ_TRAP_ROE:
+        out.append(f"价值陷阱形态 PB{r['pb']:.2f}/ROE{r['roe']:.1f}%")
+    if r["div_cagr"] is not None and r["div_cagr"] < 0:
+        out.append(f"分红负增 {r['div_cagr']:+.1f}%/年")
+    d = rev_np_diverge(r)
+    if d is not None and d > DQ_DIVERGE_MAX and (r.get("q_rev_yoy") or 0) < DQ_DIVERGE_REV:
+        out.append(f"营收背离 净利{r['q_np_yoy']:+.1f}%/营收{r['q_rev_yoy']:+.1f}%")
+    if r.get("fc_lower") is not None and r["fc_lower"] < 0:
+        out.append(f"业绩预告 {r['fc_date'][:7]} 同比{r['fc_lower']:+.0f}%~{r['fc_upper']:+.0f}%")
+    return out
+
+
+def div_quality(r: dict, end_year: int, years: int) -> tuple[str, str]:
+    """分红增长的**来源**分解，返回 (标记, 原因)。仅标注，不参与筛选。
+
+    依据近似分解「分红增速 ≈ EPS 增速 + 派息率增速」，分三档：
+
+    - 🔴 分红实际在降（CAGR < 0）——L1 放行的缓慢阴跌，如兴业 −3.5%/年
+    - 🟡 分红在涨但 **EPS 在降且派息率在抬**——增长来自缓冲垫而非利润。
+      比 🔴 更隐蔽：三七互娱分红 3 年 +8.8%、9 年从未下调、稳居 A 组，
+      而 EPS 同期 −1.5%、派息率 59.7%→78.0%。派息率是有上限的，靠它
+      买来的增长不可持续。
+    - 🟢 利润驱动，或派息率抬升有 EPS 增长支撑
+
+    🔴/🟡 **不构成卖出依据**——红利仓的唯一硬信号是每股分红下调
+    （见 docs/dividend-portfolio.md「分红体检红线」）。这里只回答
+    「同样 5.9% 的股息率，哪一只更可能在三年后还是 5.9%」。
+    """
+    cagr = r.get("div_cagr")
+    if cagr is None:
+        return "—", "分红序列不足"
+    if cagr < 0:
+        return "🔴", f"分红{years}年负增 {cagr:+.1f}%/年"
+    eps_beg = (r["annual"].get(str(end_year - years)) or {}).get("eps")
+    eps_end = (r["annual"].get(str(end_year)) or {}).get("eps")
+    pay_beg = payout_of(r["series"], r["annual"], end_year - years)
+    pay_end = payout_of(r["series"], r["annual"], end_year)
+    if (eps_beg and eps_end and eps_end < eps_beg
+            and pay_beg is not None and pay_end is not None
+            and pay_end > pay_beg + PAYOUT_SHIFT_MIN):
+        return "🟡", f"派息率驱动 {pay_beg:.0f}%→{pay_end:.0f}%，EPS 同期降"
+    return "🟢", "利润驱动"
+
+
+def sort_score(r: dict) -> float:
+    """复合排序分 ＝ 当期股息率 + 截断后的分红增速。
+
+    只按当期股息率排会系统性地把「分红正在下滑的公司」顶到最前——它的
+    分子是已实现的历史分红、分母是当前价格，价格跌得越狠排得越靠前。
+    兴业以 5.87% 排全池第 3 即由此而来，而它分红三年 −3.5%/年。
+
+    CAGR 缺失按 0 计（中性），**不套用 q_yoy_ok 的「缺失判否」原则**——
+    那是风控闸门，此处只是排序，判否会把数据不全的正常标的误沉到底。
+    """
+    lo, hi = CAGR_CLAMP
+    cagr = r.get("div_cagr")
+    return r["yield"] + (0.0 if cagr is None else max(lo, min(hi, cagr)))
 
 
 def make_layers(args):
@@ -419,6 +749,8 @@ def build(args) -> list[dict]:
                    lambda: fetch_dividends(y_from, y_to))
     inds = _cached("industry", TTL_SLOW, fetch_industry)
     fund = _cached(f"fundamentals-{y_to}", TTL_SLOW, lambda: fetch_fundamentals(y_to))
+    # 业绩预告逐日发布，缓存不能用 7 天——那正是本判据要消除的滞后
+    fcst = _cached(f"forecasts-{y_to + 1}", TTL_FORECAST, lambda: fetch_forecasts(y_to))
 
     paying = {c: e for c, e in divs.items() if e["series"].get(str(y_to), 0) > 0}
     tmap = {t: c for c, e in paying.items() if (t := to_tencent(e["secucode"]))}
@@ -436,6 +768,7 @@ def build(args) -> list[dict]:
         eps, shares = a.get("eps"), a.get("shares")
         em = (inds.get(code, {}) or {}).get("em2016") or "—"
         f = fund.get(code, {})
+        fc = fcst.get(code, {})
         ocf_ps = f.get("ocf_ps")
         # 分红对经营现金流的覆盖率。ocf_ps<=0（现金流为负）记为 None 而非
         # 无穷大——负现金流下这个比率没有意义，交给 L7 按缺失处理。
@@ -448,15 +781,22 @@ def build(args) -> list[dict]:
             "recent_ok": recent_no_cut(e["series"], y_to, args.recent_years),
             "growth": streak_growth(e["series"], y_to),
             "max_cut": max_cut(e["series"]),
+            "div_cagr": div_cagr(e["series"], y_to, args.cagr_years),
             "pay_years": sum(1 for v in e["series"].values() if v > 0),
             "eps": eps, "yoy": a.get("yoy"),
             "payout": (per_share / eps * 100) if eps and eps > 0 else None,
             "mcap": (shares * price / 1e8) if shares else None,
             "ind_full": em, "ind1": em.split("-")[0],
+            "pb": implied_pb(price, eps, f.get("roe")),
+            "evol": earnings_vol(e["annual"], EPS_NORM_YEARS),
+            "epos": earnings_position(e["annual"], eps, EPS_NORM_YEARS),
             "ocf_ps": ocf_ps, "div_ocf": div_ocf, "roe": f.get("roe"),
             "q_date": f.get("q_date"), "q_np_yoy": f.get("q_np_yoy"),
             "q_rev_yoy": f.get("q_rev_yoy"),
+            **{k: fc.get(k) for k in ("fc_date", "fc_lower", "fc_upper", "fc_type", "fc_text")},
         })
+        # norm_yield 依赖同一行的 payout，故在字典构造完成后补算
+        rows[-1]["norm_yield"] = normalized_yield(rows[-1], EPS_NORM_YEARS)
     return sorted(rows, key=lambda r: -r["yield"])
 
 
@@ -474,37 +814,79 @@ def report(rows: list[dict], args) -> list[dict]:
         note = ""
         if name.startswith("L6"):
             miss = sum(1 for r in before if r["q_np_yoy"] is None)
+            byfc = [r for r in before if r not in cur
+                    and latest_earnings_signal(r)[1].startswith("预告")]
             note = f"（其中 {miss} 只因无季报数据被拦）" if miss else ""
+            if byfc:
+                note += f" 🔴 {len(byfc)} 只由业绩预告拦下：" + "、".join(
+                    f"{r['name']}({r['fc_lower']:+.0f}%)" for r in byfc[:5])
         elif name.startswith("L7"):
             fin = sum(1 for r in cur if r["ind1"] == "金融")
             note = f"（{fin} 只金融豁免）" if fin else ""
         print(f"  {name:<26} → {len(cur):>4} 只 {note}")
 
     ys = sorted(map(int, rows[0]["series"])) if rows else []
-    clean = sorted([r for r in cur if r["max_cut"] >= -0.01], key=lambda x: -x["yield"])
-    cut = sorted([r for r in cur if r["max_cut"] < -0.01], key=lambda x: x["max_cut"])
+    quality = {r["code"]: div_quality(r, args.year, args.cagr_years) for r in cur}
+    n_red = sum(1 for m, _ in quality.values() if m == "🔴")
+    n_yellow = sum(1 for m, _ in quality.values() if m == "🟡")
+    print(f"  {'分红质量标注（不筛除）':<24} → 🔴 {n_red} 只分红负增、"
+          f"🟡 {n_yellow} 只派息率驱动")
+
+    # A/B 组仍按「是否曾下调」分，但两组排序键统一为复合分：只按当期股息率
+    # 排会把分红正在下滑的顶到最前（见 sort_score）。max_cut 仍作 B 组列保留。
+    clean = sorted([r for r in cur if r["max_cut"] >= -0.01], key=lambda x: -sort_score(x))
+    cut = sorted([r for r in cur if r["max_cut"] < -0.01], key=lambda x: -sort_score(x))
 
     def line(r, extra=""):
         tag = " ⬅持仓" if r["code"] in held else ""
         q = f"{r['q_np_yoy']:>7.1f}%" if r["q_np_yoy"] is not None else f"{'—':>8}"
         ocf = "  金融豁免" if r["ind1"] == "金融" else (
             f"{r['div_ocf']:>7.1f}%" if r["div_ocf"] is not None else f"{'—':>8}")
-        return (f"{r['code']:<8}{r['name']:<9}{r['yield']:>6.2f}%{r['payout']:>6.1f}%"
-                f"{r['mcap']:>7.0f}亿{r['growth']:>4}{r['yoy']:>7.1f}%{q}{ocf}{extra}"
-                f"  {r['ind_full']}{tag}")
+        cg = f"{r['div_cagr']:>+7.1f}%" if r["div_cagr"] is not None else f"{'—':>8}"
+        mark, why = quality[r["code"]]
+        s, tot, miss = dq_score(r)
+        pb = f"{r['pb']:>5.2f}" if r["pb"] is not None else f"{'—':>5}"
+        ev = f"{r['evol']:>5.0f}%" if r["evol"] is not None else f"{'—':>6}"
+        ep = f"{r['epos']:>5.2f}x" if r["epos"] is not None else f"{'—':>6}"
+        return (f"{r['code']:<8}{r['name']:<9}{r['yield']:>6.2f}%{cg}{r['payout']:>6.1f}%"
+                f"{r['mcap']:>7.0f}亿{r['growth']:>4}{q}{ocf}{extra}"
+                f"{pb}{ev}{ep}{s:>3}/{tot}  {mark}{r['ind_full']}{tag}")
 
-    hdr = (f"{'代码':<8}{'名称':<9}{'股息率':>7}{'派息率':>7}{'市值':>9}{'连增':>4}"
-           f"{'年报净利':>9}{'季报净利':>9}{'分红/现金流':>10}")
+    hdr = (f"{'代码':<8}{'名称':<9}{'股息率':>7}{f'{args.cagr_years}年增速':>8}"
+           f"{'派息率':>7}{'市值':>9}{'连增':>4}"
+           f"{'季报净利':>9}{'分红/现金流':>10}{'PB':>6}{'盈利σ':>7}{'盈利位置':>8}{'DQ':>5}")
     print(f"\n🟢 A 组 · {len(ys)} 年从未下调（{len(clean)} 只）")
-    print(hdr + "  行业")
+    print(f"   按「股息率 + {args.cagr_years}年分红增速」排序，"
+          f"增速截断于 [{CAGR_CLAMP[0]:g}%, {CAGR_CLAMP[1]:g}%]")
+    print(hdr + "  质量  行业")
     for r in clean:
         print(line(r))
     print(f"\n🟡 B 组 · 曾小幅下调但已恢复（{len(cut)} 只）")
     print(f"   降幅在 {abs(args.max_cut):g}% 以内且近 {args.recent_years} 年未再降；"
           f"腰斩型已由 L1 拦在池外")
-    print(hdr + f"{'最大降幅':>9}  行业")
+    print(hdr + f"{'最大降幅':>9}  质量  行业")
     for r in cut:
         print(line(r, f"{r['max_cut']:>8.1f}%"))
+
+    print("\n=== 高股息的来源分解（股息率 ≡ 派息率 × ROE ÷ PB）===")
+    print("   同样 5%+ 的股息率，三个来源风险性质完全不同：低PB＝市场给净资产打折")
+    print("   （若 ROE 也低则多为合理定价而非错杀）｜高ROE＝盈利能力支撑｜高派息＝透支缓冲")
+    for r in sorted(cur, key=lambda x: (x["pb"] if x["pb"] is not None else 99)):
+        ny = f"{r['norm_yield']:>5.2f}%" if r.get("norm_yield") is not None else f"{'—':>6}"
+        print(f"  {r['name']:<9}{r['yield']:>6.2f}% → 正常化 {ny}"
+              f"   {yield_driver(r)}")
+
+    alerts = [(r, a) for r in cur if (a := dq_alerts(r))]
+    print(f"\n=== ⚠️ 结构性警示（{len(alerts)} 只，**不影响入选**，需在文档中单独交代）===")
+    if not alerts:
+        print("  无")
+    for r, a in sorted(alerts, key=lambda x: -len(x[1])):
+        print(f"  🔴 {r['name']:<9}{'；'.join(a)}")
+
+    weak = sorted(((dq_score(r), r) for r in cur), key=lambda x: x[0][0])[:3]
+    print("\n=== DQ 最低的 3 只与其失分项 ===")
+    for (s, tot, miss), r in weak:
+        print(f"  {r['name']:<9}{s}/{tot}  失分：{'、'.join(miss)}")
 
     print("\n=== 行业分布 ===")
     by_ind = defaultdict(list)
@@ -556,6 +938,10 @@ def main() -> None:
     p.add_argument("--min-yield", type=float, default=5.0, help="股息率门槛%%，默认 5.0")
     p.add_argument("--recent-years", type=int, default=2,
                    help="L1 前半条：最近 N 个年度不得下调，默认 2")
+    p.add_argument("--cagr-years", type=int, default=3,
+                   help="分红增速与质量分解的回看年数，默认 3。"
+                        "取 3 而非全序列：兴业 9 年 CAGR +6.4%% 是正的，"
+                        "3 年才是 -3.5%%，远期基数会稀释近期恶化")
     p.add_argument("--max-cut", type=float, default=15.0,
                    help="L1 后半条：历史最大同比降幅上限%%，默认 15（超过视为曾腰斩）")
     p.add_argument("--min-q-yoy", type=float, default=-10.0,
