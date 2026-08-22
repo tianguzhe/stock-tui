@@ -2,14 +2,18 @@
 
 ## 目录结构
 - `cmd/indicator-analyze` — 单标的深度技术面分析 CLI（tdx.go 调用 TDX HTTP 网关，-tdx 标志显式启用）
-- `cmd/stockdb` — 数据库管理（tag/history/rs-rank/backfill/backfill-date/backtest/batch-save/hot/check-data/repair-volratio/repair-scores）
+- `cmd/stockdb` — 数据库管理（screen/batch-save/rs-rank/backfill/backfill-date/backtest/backtest-portfolio/check-data/repair-volratio/repair-scores/tag/list/history/hot）
 - `cmd/watch` — 盘中实时监控 TUI（BubbleTea，读 `.holdings` 自动展示持仓行情）
+- `cmd/verify-apis` — 行情接口连通性与字段校验工具
 - `main.go` — TUI 自选股行情入口（`go run .`）
 - `internal/api` — 行情 API（`FetchStocks`/`FetchMinute`/`FetchDailyKline`/`proxy_kline` 解析 + 东财反限流）
 - `internal/analysis` — 技术面评分/信号/背离/PERF 引擎（cmd 共享，勿在 cmd 内再复制一套）
 - `internal/backtest` — 回测引擎（`engine.go` 单信号回测 + `portfolio.go` 组合回测）
 - `internal/indicator` — 技术指标计算引擎（`Calculate` 核心集 + CYQ 筹码分布 / CYC 成本均线 / TD Sequential 衍生指标）
 - `internal/market` — 市场工具（代码规范化 `NormalizeCode`、涨跌停限幅 `PriceLimitPct`、ST 判定 `IsST`）
+- `internal/holdings` — `.holdings` 解析与多账户按手数加权合并（`Load`/`Parse`/`Merge`，screen 与 watch 共用）
+- `internal/screener` — 选股筛选引擎（Go screen 实现；末端降级、加仓闸门、止损与仓位口径都在此）
+- `internal/snapshot` — `buildSnapshot` 快照构建。**batch-save / repair-scores / backfill-date 三者共用同一实现**，是「口径逐字段一致、无前视偏差」的来源
 - `internal/store` — SQLite 存储层（snapshot/decision_log/instrument）
 - `internal/ui` — BubbleTea UI 组件（TUI 渲染）
 - `scripts/` — 每日更新/选股/日志生成/测试脚本；另含 `dividend-scan.py`（红利仓专用，全市场股息率扫描 + 分层筛选，`uv run` 执行，缓存在 `data/dividend-cache/`）
@@ -33,14 +37,14 @@
 - `FetchStockInfo` 通过 `push2.eastmoney.com/api/qt/stock/get` 获取基本面：f127(行业) f128(地区板块) f162(PE) f167(PB) f189(上市日期)。
 
 ### 数据源优先级与口径（2026-07 更新）
-- **默认 / `-save`**：**HTTP 前复权主力**——腾讯 **proxy `newfqkline` 前复权**为主（量单位**手**×100 转股；`row[7]`=**换手率%**→小数；`row[8]`=**成交额万元**→×10000 转元；`row[6]` 恒为 `{}` 无业务值；**振幅**不在 K 行，本地 `(H-L)/昨收×100`）。换手优先用 proxy `row[7]`，全 0 时才东财 f61 / TDX 流通股本兜底。**腾讯失败 → 东财全日 K fallback**（`push2his`，Amount 已是元 + 换手 + 振幅 f58）。东财请求需带 `Referer` + 完整 UA + 反限流重试；批量 worker 建议 `DisableKeepAlives: true`。字段布局与实测见 `docs/data-apis.md`。
+- **默认 / `-save`**：**HTTP 前复权主力**——腾讯 **proxy `newfqkline` 前复权**为主（量单位**手**×100 转股；`row[7]`=**换手率%**→小数；`row[8]`=**成交额万元**→×10000 转元；`row[6]` 恒为 `{}` 无业务值；**振幅**不在 K 行，本地 `(H-L)/昨收×100`）。换手优先用 proxy `row[7]`，全 0 时才东财 f61 / TDX 流通股本兜底。**腾讯失败 → 东财全日 K fallback**（`push2his`，Amount 已是元 + 换手 + 振幅 f58）。东财请求需带 `Referer` + 完整 UA + 反限流重试；批量 worker 建议 `DisableKeepAlives: true`。字段布局与实测见 `docs/reference/data-apis.md`。
 - **量比 `vol_ratio`**：优先腾讯 proxy qt 实时量比（`VolRatioRT`，**qt 索引 49**）；`<=0` 或缺 qt（东财 fallback）时回退 `analysis.VolRatio`。**两条路径现为同一口径**（不再是"接近但非同一指标"）；score/screener 用落库 `vol_ratio`。阈值不变（0.8 / 1.5）。
   - **口径定义**：`量比 = 当日成交量 / 前 5 日（不含当日）平均成交量`。经实测反解腾讯 qt[49]，5 只标的全部吻合到小数点后两位（东材 0.767/0.77、工行 0.694/0.69、农行 0.792/0.79、华安 1.081/1.08、华天 0.958/0.96）
   - ⚠️ **不是 `Volume/MA20`**：窗口是 5 不是 20，且**不含当日**。旧实现用 MA20（含当日），工行实测 0.758 vs 真值 0.69 差 10%。所有量比判断（`batch-save` / CLI 顶部 / `EvalSignals` / CLI 近15日行的放量缩量标签）统一走 `analysis.VolRatio`，改一处即全体同步
   - **历史脏数据回填**（两步，顺序不可颠倒）：
     1. `go run ./cmd/stockdb repair-volratio [--dry-run]` —— 重算历史 `vol_ratio`。`inside_vol`/`outside_vol` 是当日实时盘口、历史不可追溯，受影响历史行一律置 NULL（不保留方向颠倒的值）
     2. `go run ./cmd/stockdb repair-scores [--dry-run] [--all]` —— **按完整日K重算历史行的全部指标与评分**。仅修 `vol_ratio` 不够：score 的 Volume 分项、`EvalSignals` 的 BreakBull/BreakBear、以及派生的 PERF 与 `score_adj` 都基于量比。实现上把 KlineData 截断到目标交易日后调用**同一个** `buildSnapshot`，故口径与当日 batch-save 逐字段一致，且天然无前视偏差。`turnover_rate`/`market_cap`/`pe`/`inside_vol`/`outside_vol` 沿用原值（实时数据不可重现），`rs20/60/120` 不在写入列内故不受影响。幂等，可重复执行
-  - ⚠️ **索引 46 是市净率 PB，不是量比**（2026-07-25 修正，此前一直取错）。个股 PB 在 1~7 量级，远高于 `VolSurge`=1.5 / `VolStrong`=2.0，导致几乎所有个股被判成"放量"；ETF 无 PB 返回 `0.00` 恰好触发本地回退而显示正常，使错误只出现在个股上、长期隐蔽。字段定位锚点：`[47]`/`[48]` 精确等于昨收×1.1/×0.9。已由东财 `f50`(量比)/`f167`(市净率)/`f49`(外盘)/`f161`(内盘) 逐位交叉验证，见 `docs/data-apis.md`
+  - ⚠️ **索引 46 是市净率 PB，不是量比**（2026-07-25 修正，此前一直取错）。个股 PB 在 1~7 量级，远高于 `VolSurge`=1.5 / `VolStrong`=2.0，导致几乎所有个股被判成"放量"；ETF 无 PB 返回 `0.00` 恰好触发本地回退而显示正常，使错误只出现在个股上、长期隐蔽。字段定位锚点：`[47]`/`[48]` 精确等于昨收×1.1/×0.9。已由东财 `f50`(量比)/`f167`(市净率)/`f49`(外盘)/`f161`(内盘) 逐位交叉验证，见 `docs/reference/data-apis.md`
   - ⚠️ **内外盘方向**：`qt[7]` 是**外盘(主动买)**、`qt[8]` 是**内盘(主动卖)**，此前两者颠倒（东财 `f49`/`f161` 已验证）
 - **两套换手率（勿混）**：
   - **序列换手**（CYQ 用）：proxy `row[7]` %→小数，或东财 f61 / TDX 流通股本兜底；按日对齐 K 线。
@@ -285,6 +289,7 @@
 
 ## 测试
 - Go：`go test ./...`；提交前对改动的 Go 文件跑 `gofmt -w`
+- Python：`uv run scripts/dividend-scan-test.py`（26 条判据单元测试，含 L1 回归）；改动 `dividend-scan.py` 的筛选判据后必跑
 
 ## 每日复盘日志
 日志目录：`docs/journal/YYYY-MM-DD/journal.md`，四段结构：
