@@ -570,6 +570,41 @@ def div_ocf_ok(r: dict, cap: float) -> bool:
     return r["div_ocf"] is not None and r["div_ocf"] <= cap
 
 
+# 年度分红「已公告未实施」的识别阈值：较上年降幅超过此值即疑为口径残缺。
+# 30% 取自「中期分红通常占全年三成到一半」——只剩中期的序列必然跌破它。
+STALE_DIV_DROP = 30.0
+
+
+def stale_dividend_suspects(rows: list[dict], year: int, min_yield: float) -> list[dict]:
+    """年度分红「已公告未实施」导致 `year` 序列残缺、因而可能被误拦的标的。
+
+    A 股多数公司的年度分红在 6~8 月才除息，而数据源按**已实施**口径统计。
+    在此窗口内跑扫描，这批公司的序列只含中期分红，表现为「大幅降分红」，
+    于是同时栽在 L0（股息率被低估）与 L1（近年下降 + 降幅超限）上。
+
+    实证：格力电器 2025 年度实为 30 元/10股（中期 10 元已于 2026-01-23 除息
+    ＋ 年度 20 元于 2026-04-28 公告预案待股东会审议），序列却只记 1.0 ——
+    股息率由 7.28% 塌到 2.42%，最大降幅由 −42.9% 夸大为 −66.7%。
+
+    判据取「较上年降幅 ≥STALE_DIV_DROP 且按上年分红补全后可过 min_yield」。
+    ⚠️ **只标注不筛除**：真降分红与口径残缺在数据上无法区分（中远海控净利
+    −37%，它的降分红很可能是真的），定性需逐只核实公告。
+    """
+    out = []
+    for r in rows:
+        prev = r["series"].get(str(year - 1), 0)
+        now = r["series"].get(str(year), 0)
+        price = r.get("price") or 0
+        if prev <= 0 or now <= 0 or price <= 0:
+            continue
+        if now / prev > 1 - STALE_DIV_DROP / 100:
+            continue
+        # 已过门槛的无需提示；补全后仍不够门槛的也不影响筛选结果
+        if r["yield"] < min_yield <= prev / price * 100:
+            out.append(r)
+    return sorted(out, key=lambda r: -(r["series"][str(year - 1)] / r["price"]))
+
+
 # 派息率抬升多少算「靠缓冲垫买增长」。1pct 以内属正常年度波动。
 PAYOUT_SHIFT_MIN = 1.0
 
@@ -807,7 +842,9 @@ def report(rows: list[dict], args) -> list[dict]:
 
     print("\n=== 分层筛选 ===")
     cur = hi
-    print(f"  {'L0 股息率门槛':<26} → {len(cur):>4} 只")
+    stale = stale_dividend_suspects(rows, args.year, args.min_yield)
+    note0 = f"⚠️ 另有 {len(stale)} 只疑因年度分红未实施而低估" if stale else ""
+    print(f"  {'L0 股息率门槛':<26} → {len(cur):>4} 只 {note0}")
     for name, fn in make_layers(args):
         before = cur
         cur = [r for r in cur if fn(r)]
@@ -831,6 +868,21 @@ def report(rows: list[dict], args) -> list[dict]:
     n_yellow = sum(1 for m, _ in quality.values() if m == "🟡")
     print(f"  {'分红质量标注（不筛除）':<24} → 🔴 {n_red} 只分红负增、"
           f"🟡 {n_yellow} 只派息率驱动")
+
+    if stale:
+        print(f"\n=== ⚠️ 疑似分红口径残缺（{len(stale)} 只，**不影响筛选**）===")
+        print(f"   {args.year} 年度分红「已公告未实施」时数据源只统计到中期，序列表现为"
+              "大幅降分红，\n   会同时栽在 L0（股息率低估）与 L1（近年下降）上。"
+              "6~8 月跑扫描时该窗口最宽。")
+        print(f"   ⚠️ 真降分红与口径残缺在数据上无法区分，**定性需逐只核实公告**。")
+        for r in stale[:10]:
+            prev = r["series"][str(args.year - 1)]
+            now = r["series"][str(args.year)]
+            print(f"  {r['name']:<8} {r['yield']:>5.2f}% → 按{args.year - 1}年"
+                  f"({prev:g})补全≈{prev / r['price'] * 100:>5.2f}%"
+                  f"   {prev:g}→{now:g} ({now / prev - 1:+.0%})")
+        if len(stale) > 10:
+            print(f"  …… 另 {len(stale) - 10} 只")
 
     # A/B 组仍按「是否曾下调」分，但两组排序键统一为复合分：只按当期股息率
     # 排会把分红正在下滑的顶到最前（见 sort_score）。max_cut 仍作 B 组列保留。
