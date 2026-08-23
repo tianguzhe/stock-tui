@@ -59,6 +59,60 @@ BEIJING = {  # 601169 北京银行：2024→2025 降 13.1%，近 2 年恶化
     "2022": 0.31, "2023": 0.32, "2024": 0.32, "2025": 0.278,
 }
 
+# ── 2026-08 新增：派息率与扣非口径的 fixture（真实年报值）──
+WENXUAN = {  # 601811 新华文轩：2023 年派息率 30%→45% 一次性重定
+    "2017": 0.30, "2018": 0.30, "2019": 0.30, "2020": 0.31, "2021": 0.32,
+    "2022": 0.34, "2023": 0.58, "2024": 0.60, "2025": 0.61,
+}
+WENXUAN_ANN = {y: {"eps": e} for y, e in zip(
+    map(str, range(2017, 2026)),
+    [0.75, 0.76, 0.92, 1.02, 1.06, 1.13, 1.28, 1.25, 1.27])}
+
+MEIDI = {  # 000333 美的集团：派息率 41%→74%，EPS 在涨而分红涨得更快
+    "2017": 1.20, "2018": 1.304, "2019": 1.60, "2020": 1.6006, "2021": 1.7009,
+    "2022": 2.50, "2023": 3.00, "2024": 3.50, "2025": 4.30,
+}
+MEIDI_ANN = {y: {"eps": e} for y, e in zip(
+    map(str, range(2017, 2026)),
+    [2.66, 3.08, 3.60, 3.93, 4.17, 4.34, 4.93, 5.44, 5.80])}
+
+HAIER = {  # 600690 海尔智家：与美的同模式，派息率 27%→55%
+    "2017": 0.342, "2018": 0.351, "2019": 0.375, "2020": 0.366, "2021": 0.4614,
+    "2022": 0.5669, "2023": 0.8013, "2024": 0.965, "2025": 1.1607,
+}
+HAIER_ANN = {y: {"eps": e} for y, e in zip(
+    map(str, range(2017, 2026)),
+    [1.136, 1.21, 1.286, 1.337, 1.41, 1.58, 1.79, 2.02, 2.12])}
+
+YILI = {  # 600887 伊利股份：2024 派息率 92% 是分母塌陷（商誉减值），非分红激进
+    "2017": 0.70, "2018": 0.70, "2019": 0.81, "2020": 0.82, "2021": 0.96,
+    "2022": 1.04, "2023": 1.20, "2024": 1.22, "2025": 1.38,
+}
+YILI_ANN = {y: {"eps": e} for y, e in zip(
+    map(str, range(2017, 2026)),
+    [0.99, 1.06, 1.15, 1.17, 1.43, 1.48, 1.64, 1.33, 1.83])}
+
+ZHAOHANG_ANN_FULL = {y: {"eps": e} for y, e in zip(
+    map(str, range(2017, 2026)),
+    [2.78, 3.13, 3.62, 3.79, 4.61, 5.26, 5.63, 5.66, 5.70])}
+
+# 扣非/归母每股收益（2024→2025），取自 RPT_LICO_FN_CPD 年报
+DEDUCT = {  # name: (basic_prev, basic, deduct_prev, deduct)
+    "新华文轩": (1.25, 1.27, 1.34, 1.18),   # 归母 +1.6% / 扣非 -11.9% → L8 拦
+    "兴业银行": (3.51, 3.46, 3.49, 3.44),   # 归母 -1.4% / 扣非 -1.4% → 归母也负，放行
+    "美的集团": (5.44, 5.80, 5.04, 5.44),   # 双正 → 放行
+    "海尔智家": (2.02, 2.12, 1.93, 2.02),   # 双正 → 放行
+    "伊利股份": (1.33, 1.83, 0.95, 1.75),   # 双正且扣非更强 → 放行
+    "招商银行": (5.66, 5.70, 5.65, 5.70),   # 扣非/归母=100%，L8 盲区
+}
+
+
+def deduct_row(name: str) -> dict:
+    bp, b, dp, d = DEDUCT[name]
+    return {"basic_eps_prev": bp, "basic_eps": b,
+            "deduct_eps_prev": dp, "deduct_eps": d}
+
+
 _fails: list[str] = []
 
 
@@ -218,6 +272,68 @@ check("季报缺失且无预告 → 判否（风控向保护侧失败）",
       ds.q_yoy_ok(dict(q_np_yoy=None, q_date=""), -10.0), False)
 check("预告为正不拦", ds.q_yoy_ok(dict(q_np_yoy=1.0, q_date="2026Q1", fc_lower=20.0,
                                   fc_upper=30.0, fc_date="2026-06-30"), -10.0), True)
+
+print("\n=== cagr_median：多窗口中位数（对基期不敏感）===")
+check("文轩分红 3 年窗口 +21.5%（被 2023 跳升污染）",
+      ds.div_cagr(WENXUAN, 2025, 3), 21.51, 0.1)
+check("文轩分红 2 年窗口 +2.6%（跳升后的真实速度）",
+      ds.div_cagr(WENXUAN, 2025, 2), 2.55, 0.1)
+check("🔑 多窗口中位数 +11.6%，落在两者之间、不被单一基期主导",
+      ds.cagr_median(WENXUAN, 2025), 11.61, 0.1)
+check("文轩 EPS 多窗口中位数 +4.55%",
+      ds.eps_cagr_median(WENXUAN_ANN, 2025), 4.55, 0.1)
+check("兴业 3 年 -3.5% 但多窗口为正（8 窗口中 7 正）",
+      ds.cagr_median(XINGYE, 2025) > 0, True)
+check("序列不足返回 None", ds.cagr_median({"2025": 1.0}, 2025), None)
+
+print("\n=== deduct_ok（L8）：归母正增长而扣非负增长即拦 ===")
+check("🔑 新华文轩被拦（归母 +1.6% / 扣非 -11.9%，七层全放行的盲区）",
+      ds.deduct_ok(deduct_row("新华文轩")), False)
+check("文轩归母 EPS 同比", ds.parent_eps_yoy(deduct_row("新华文轩")), 1.60, 0.05)
+check("文轩扣非 EPS 同比", ds.deduct_eps_yoy(deduct_row("新华文轩")), -11.94, 0.05)
+check("伊利放行（归母 +37.6% / 扣非 +84.2%，扣非更强）",
+      ds.deduct_ok(deduct_row("伊利股份")), True)
+check("美的放行（双正 +6.6%/+7.9%）", ds.deduct_ok(deduct_row("美的集团")), True)
+check("海尔放行（双正 +5.0%/+4.7%）", ds.deduct_ok(deduct_row("海尔智家")), True)
+check("🔑 兴业放行——归母 EPS 本身为负(-1.4%)，与扣非同向，非粉饰形态",
+      ds.deduct_ok(deduct_row("兴业银行")), True)
+# 用 SJLTZ（净利总额同比 +0.34%）会得出相反结论：兴业转债转股摊薄股本，
+# 总额与每股口径方向相反。判据必须两边都用 EPS，否则测的是股本变动。
+check("兴业总额口径为正而每股为负 → 证明口径必须统一",
+      ds.parent_eps_yoy(deduct_row("兴业银行")) < 0, True)
+check("🔴 招行放行 = L8 对银行的已知盲区（扣非/归母 100.0%）",
+      ds.deduct_ok(deduct_row("招商银行")), True)
+# 招行真实问题是拨备释放：营收 +0.01%、拨备前利润 -1.6%、归母 +1.21%。
+# 拨备计提属经常性损益，扣非扣不掉，本判据结构上无法覆盖，只能人工核查。
+check("缺扣非数据 → 判否（准入宁可错杀，与 L6 一致）",
+      ds.deduct_ok({"basic_eps": 1.0, "basic_eps_prev": 0.9}), False)
+check("上年为 0 → 判否（负基数同比无方向）",
+      ds.deduct_ok({"basic_eps": 1.0, "basic_eps_prev": 0,
+                    "deduct_eps": 1.0, "deduct_eps_prev": 0}), False)
+
+print("\n=== payout_jump：派息率一次性重定 ===")
+check("文轩 2023 跳升 30%→45%",
+      ds.payout_jump(WENXUAN, WENXUAN_ANN, 2025)[0], 2023)
+check("美的 2022 跳升 41%→58%",
+      ds.payout_jump(MEIDI, MEIDI_ANN, 2025)[0], 2022)
+check("伊利 2024 跳升（分母塌陷所致，仍应标注供人工判读）",
+      ds.payout_jump(YILI, YILI_ANN, 2025)[0], 2024)
+check("招行无跳升（30%→35% 九年缓慢抬升）",
+      ds.payout_jump(ZHAOHANG, ZHAOHANG_ANN_FULL, 2025), None)
+check("兴业无跳升（24%→31%）",
+      ds.payout_jump(XINGYE, {y: {"eps": e} for y, e in zip(
+          map(str, range(2017, 2026)),
+          [2.74, 2.85, 3.10, 3.08, 3.77, 4.20, 3.51, 3.51, 3.46])}, 2025), None)
+
+print("\n=== payout_driven：分红增速靠抬派息率（补 div_quality 🟡 的盲区）===")
+check("🔑 美的命中（分红 +19.8% / EPS +8.5%，EPS 在涨故 🟡 不触发）",
+      ds.payout_driven({"series": MEIDI, "annual": MEIDI_ANN}) is not None, True)
+check("🔑 海尔命中（分红 +20.5% / EPS +8.8%，与美的同模式）",
+      ds.payout_driven({"series": HAIER, "annual": HAIER_ANN}) is not None, True)
+check("美的仍是 🟢（EPS 在涨，div_quality 确实抓不到）",
+      ds.div_quality(row(MEIDI, MEIDI_ANN), 2025, 3)[0], "🟢")
+check("招行不命中（分红与 EPS 增速接近）",
+      ds.payout_driven({"series": ZHAOHANG, "annual": ZHAOHANG_ANN_FULL}), None)
 
 print("\n=== L1 回归：既有筛选行为不得改变 ===")
 check("招行 max_cut = 0（从未下调）", ds.max_cut(ZHAOHANG), 0.0, 0.01)

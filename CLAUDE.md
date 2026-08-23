@@ -289,7 +289,7 @@
 
 ## 测试
 - Go：`go test ./...`；提交前对改动的 Go 文件跑 `gofmt -w`
-- Python：`uv run scripts/dividend-scan-test.py`（26 条判据单元测试，含 L1 回归）；改动 `dividend-scan.py` 的筛选判据后必跑
+- Python：`uv run scripts/dividend-scan-test.py`（91 条判据单元测试，含 L1 回归）；改动 `dividend-scan.py` 的筛选判据后必跑
 
 ## 每日复盘日志
 日志目录：`docs/journal/YYYY-MM-DD/journal.md`，四段结构：

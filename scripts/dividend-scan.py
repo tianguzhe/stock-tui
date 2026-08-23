@@ -78,6 +78,7 @@ import json
 import math
 import random
 import re
+import statistics
 import sys
 import time
 from collections import defaultdict
@@ -231,22 +232,37 @@ def fetch_industry() -> dict:
 
 
 def fetch_fundamentals(year: int) -> dict:
-    """拉年报现金流 + 最近一期季报同比。
+    """拉年报现金流 + 扣非口径 + 最近一期季报同比。
 
-    两组数据用途不同：
+    三组数据用途不同：
     - 年报（{year}-12-31）的 MGJYXJJE 每股经营现金流 → 算分红覆盖率，
       须与年度分红同口径，不能用季报的累计值
+    - {year} 与 {year-1} 两年的 BASIC_EPS / DEDUCT_BASIC_EPS → 算 L8 的
+      扣非背离。**两年都要拉**，接口不提供扣非同比，只能自行相除
     - {year+1} 年内最新一期季报的 SJLTZ 归母同比 → 前瞻预警
+
+    ⚠️ **扣非与归母必须同为 EPS 口径**：美的 2024 年 H 股发行摊薄股本，
+    扣非总额 +15.46% 而扣非 EPS 仅 +7.9%。若拿总额同比减 EPS 同比，
+    股本变动会被误读成盈利质量背离。
     """
     out = defaultdict(dict)
 
     cols = ("SECURITY_CODE,SECURITY_NAME_ABBR,REPORTDATE,QDATE,SJLTZ,YSTZ,"
-            "MGJYXJJE,PARENT_NETPROFIT,WEIGHTAVG_ROE")
+            "MGJYXJJE,PARENT_NETPROFIT,WEIGHTAVG_ROE,BASIC_EPS,DEDUCT_BASIC_EPS")
     for page in _em_pages("RPT_LICO_FN_CPD", cols,
                           f"(REPORTDATE='{year}-12-31')", "年报现金流"):
         for r in page:
-            out[r["SECURITY_CODE"]]["ocf_ps"] = r.get("MGJYXJJE")
-            out[r["SECURITY_CODE"]]["roe"] = r.get("WEIGHTAVG_ROE")
+            out[r["SECURITY_CODE"]].update(
+                ocf_ps=r.get("MGJYXJJE"), roe=r.get("WEIGHTAVG_ROE"),
+                basic_eps=r.get("BASIC_EPS"), deduct_eps=r.get("DEDUCT_BASIC_EPS"))
+
+    # 上年年报：仅为算扣非/归母的同比，不覆盖本年任何字段
+    for page in _em_pages("RPT_LICO_FN_CPD", cols,
+                          f"(REPORTDATE='{year - 1}-12-31')", "上年扣非"):
+        for r in page:
+            out[r["SECURITY_CODE"]].update(
+                basic_eps_prev=r.get("BASIC_EPS"),
+                deduct_eps_prev=r.get("DEDUCT_BASIC_EPS"))
 
     # 次年至今的季报，按 REPORTDATE 取最新一期（中报披露期内 Q1/H1 会并存）
     latest: dict[str, str] = {}
@@ -417,6 +433,80 @@ def div_cagr(series: dict, end_year: int, years: int) -> float | None:
     if beg <= 0 or end <= 0:
         return None
     return ((end / beg) ** (1 / years) - 1) * 100
+
+
+def cagr_median(series: dict, end_year: int, max_years: int = 8) -> float | None:
+    """1~max_years 各窗口 CAGR 的**中位数**。数据不足返回 None。
+
+    🔑 **单窗口对基期极度敏感，方向可以完全相反**：新华文轩 2023 年把
+    派息率从 30% 一次性抬到 45%，分红 0.34→0.58（+70.6%）。以 2022 为
+    基期的 3 年 CAGR 是 **+21.5%**，而跳升之后的真实速度只有 **+2.6%**。
+    反向的例子是兴业：3 年 CAGR −3.5% 是把 2022 峰值当基期的产物，
+    8 个窗口里 7 个为正。
+
+    中位数对两端的一次性事件都不敏感，故用于「分红增长是否由 EPS 支撑」
+    这类**趋势性**判断；`div_cagr` 的单窗口口径仍保留给 L1 与排序使用
+    （那里要的正是「近周期是否恶化」的敏感性）。
+    """
+    vals = [c for n in range(1, max_years + 1)
+            if (c := div_cagr(series, end_year, n)) is not None]
+    return statistics.median(vals) if vals else None
+
+
+def eps_cagr_median(annual: dict, end_year: int, max_years: int = 8) -> float | None:
+    """EPS 的多窗口 CAGR 中位数，口径与 `cagr_median` 一致，用于与分红增速对比。"""
+    def eps_of(y: int) -> float:
+        return (annual.get(str(y)) or {}).get("eps") or 0.0
+
+    vals = []
+    for n in range(1, max_years + 1):
+        beg, end = eps_of(end_year - n), eps_of(end_year)
+        if beg > 0 and end > 0:
+            vals.append(((end / beg) ** (1 / n) - 1) * 100)
+    return statistics.median(vals) if vals else None
+
+
+def _yoy_pct(cur: float | None, prev: float | None) -> float | None:
+    """同比(%)。prev<=0 时返回 None——负基数的同比没有可解释的方向。"""
+    if cur is None or prev is None or prev <= 0:
+        return None
+    return (cur / prev - 1) * 100
+
+
+def parent_eps_yoy(r: dict) -> float | None:
+    """归母每股收益同比(%)。与 `deduct_eps_yoy` 同口径，二者方可相减。"""
+    return _yoy_pct(r.get("basic_eps"), r.get("basic_eps_prev"))
+
+
+def deduct_eps_yoy(r: dict) -> float | None:
+    """扣非每股收益同比(%)。"""
+    return _yoy_pct(r.get("deduct_eps"), r.get("deduct_eps_prev"))
+
+
+def deduct_ok(r: dict) -> bool:
+    """L8：**归母正增长而扣非负增长即拦下**。数据缺失判否。
+
+    🔑 **L1~L7 全部建立在归母口径上，主业塌陷可以完全不留痕迹地穿过。**
+    新华文轩 2025 年归母 +1.53%、扣非 **−12.2%**（EPS 1.34→1.18），
+    三大主业营收分别 −10.2%/−2.6%/−11.6%，靠非经常性损益把归母做成
+    正增长，七层逐层放行，还以 DQ 8/9 拿到建仓清单第一大权重。
+
+    判据刻意做成**无阈值的方向判断**（正 vs 负），不设「背离超过 N
+    个百分点」——阈值需要样本拟合，而本仓候选池只有几十只。方向相反
+    本身已是确定事实，不需要再校准强度。
+
+    ⚠️ **对银行无效，且这是结构性的**：招商银行 2025 营收 +0.01%、
+    拨备前利润 **−1.6%**、归母 +1.21%，靠拨备释放（覆盖率 411.98%
+    →391.79%）撑住增长；而它的扣非/归母 = **100.0%**，本判据必然放行。
+    银行的利润平滑发生在**经常性损益之内**，扣非扣不掉。金融股的盈利
+    质量只能人工核查拨备与净息差，见 docs/dividend-portfolio.md。
+
+    缺失判否与 L6 `q_yoy_ok` 一致——它是准入闸门，宁可错杀。
+    """
+    p, d = parent_eps_yoy(r), deduct_eps_yoy(r)
+    if p is None or d is None:
+        return False
+    return not (p > 0 and d < 0)
 
 
 def implied_pb(price: float, eps: float | None, roe: float | None) -> float | None:
@@ -621,6 +711,49 @@ DQ_TRAP_PB = 0.8        # 价值陷阱形态：PB 低于此
 DQ_TRAP_ROE = 10.0      # 且 ROE 低于此
 DQ_DIVERGE_MAX = 20.0   # 净利同比 − 营收同比 的背离上限(pct)
 DQ_DIVERGE_REV = -10.0  # 且营收同比低于此才算红旗（营收在涨则背离无害）
+PAYOUT_JUMP_MIN = 10.0  # 派息率单年跳升多少 pct 算「一次性重定」而非趋势
+PAYOUT_DRIVEN_GAP = 5.0  # 分红多窗口增速超出 EPS 多窗口增速多少 pct 算抬派息率驱动
+
+
+def payout_jump(series: dict, annual: dict, end_year: int,
+                lookback: int = 8) -> tuple[int, float, float] | None:
+    """近 `lookback` 年内**最大的一次派息率单年跳升**，返回 (年份, 前值, 后值)。
+
+    🔑 **一次性重定与趋势性增长在分红序列上长得一模一样。** 新华文轩
+    2023 年派息率 30.1%→45.3%，每股分红 0.34→0.58（+70.6%），此后
+    +3.4%、+1.7%。若不识别这一跳，`div_cagr` 的 3 年窗口会读出
+    **+21.5%/年** 的「高增长」——而它是一次会计政策变化，不会重演。
+
+    只标注不筛除：抬派息率本身是股东友好的，问题只在于**别把它当成
+    可外推的增长**。
+    """
+    best = None
+    for y in range(end_year - lookback + 1, end_year + 1):
+        cur, prev = payout_of(series, annual, y), payout_of(series, annual, y - 1)
+        if cur is None or prev is None:
+            continue
+        if cur - prev > PAYOUT_JUMP_MIN and (best is None or cur - prev > best[2] - best[1]):
+            best = (y, prev, cur)
+    return best
+
+
+def payout_driven(r: dict) -> tuple[float, float] | None:
+    """分红增速显著快于 EPS 增速时返回 (分红多窗口增速, EPS多窗口增速)，否则 None。
+
+    🔑 **补 `div_quality` 🟡 档的盲区**：那一档要求「EPS 在降」，只能抓
+    三七互娱式的衰退型。而**美的（派息率 41%→74%）与海尔（27%→55%）
+    EPS 都在涨**（多窗口 +8.5% / +8.8%），分红却涨 +19.8% / +20.5%
+    —— 增长的一半以上来自抬派息率，EPS 在涨故 🟡 完全不触发。
+
+    派息率有上限（伊利 75%、神华 75.6% 已近顶），靠它买来的增速必然
+    收敛到 EPS 增速。两只家电龙头是同一模式的两个阶段：美的已抬到 74%
+    几乎无空间，海尔 55% 尚有承诺中的 5pct。
+    """
+    d = cagr_median(r["series"], max(map(int, r["series"])))
+    e = eps_cagr_median(r["annual"], max(map(int, r["series"])))
+    if d is None or e is None or d - e <= PAYOUT_DRIVEN_GAP:
+        return None
+    return (d, e)
 
 
 def rev_np_diverge(r: dict) -> float | None:
@@ -713,6 +846,14 @@ def dq_alerts(r: dict) -> list[str]:
         out.append(f"营收背离 净利{r['q_np_yoy']:+.1f}%/营收{r['q_rev_yoy']:+.1f}%")
     if r.get("fc_lower") is not None and r["fc_lower"] < 0:
         out.append(f"业绩预告 {r['fc_date'][:7]} 同比{r['fc_lower']:+.0f}%~{r['fc_upper']:+.0f}%")
+    # 下面两条需要完整的分红/EPS 序列；dq_alerts 也被只带指标字段的精简 row
+    # 调用（见测试），故缺序列时静默跳过而非报错
+    if r.get("series") and r.get("annual"):
+        end = max(map(int, r["series"]))
+        if (j := payout_jump(r["series"], r["annual"], end)):
+            out.append(f"派息率跳升 {j[0]} {j[1]:.0f}%→{j[2]:.0f}%")
+        if (pd_ := payout_driven(r)):
+            out.append(f"分红增速靠抬派息率（分红{pd_[0]:+.1f}%/EPS{pd_[1]:+.1f}%）")
     return out
 
 
@@ -774,6 +915,7 @@ def make_layers(args):
         ("L5 年报净利>-20%", lambda r: r["yoy"] is not None and r["yoy"] > -20),
         (f"L6 最新季报净利>{args.min_q_yoy:g}%", lambda r: q_yoy_ok(r, args.min_q_yoy)),
         (f"L7 分红/经营现金流≤{args.max_div_ocf:g}%", lambda r: div_ocf_ok(r, args.max_div_ocf)),
+        ("L8 扣非不得负增长", deduct_ok),
     ]
 
 
@@ -783,7 +925,9 @@ def build(args) -> list[dict]:
     divs = _cached(f"dividends-{y_from}-{y_to}", TTL_SLOW,
                    lambda: fetch_dividends(y_from, y_to))
     inds = _cached("industry", TTL_SLOW, fetch_industry)
-    fund = _cached(f"fundamentals-{y_to}", TTL_SLOW, lambda: fetch_fundamentals(y_to))
+    # v2：2026-08 增加 BASIC_EPS/DEDUCT_BASIC_EPS（L8 扣非背离）。版本后缀让
+    # 旧缓存自动作废——靠 TTL 自然过期会让 L8 在最长 7 天内静默按缺失判否。
+    fund = _cached(f"fundamentals-{y_to}-v2", TTL_SLOW, lambda: fetch_fundamentals(y_to))
     # 业绩预告逐日发布，缓存不能用 7 天——那正是本判据要消除的滞后
     fcst = _cached(f"forecasts-{y_to + 1}", TTL_FORECAST, lambda: fetch_forecasts(y_to))
 
@@ -828,6 +972,10 @@ def build(args) -> list[dict]:
             "ocf_ps": ocf_ps, "div_ocf": div_ocf, "roe": f.get("roe"),
             "q_date": f.get("q_date"), "q_np_yoy": f.get("q_np_yoy"),
             "q_rev_yoy": f.get("q_rev_yoy"),
+            # L8 扣非背离用；与上面的 "eps"（来自分红接口的 annual）同为基本
+            # 每股收益，但两年配对必须取自同一接口，故单独存
+            **{k: f.get(k) for k in
+               ("basic_eps", "deduct_eps", "basic_eps_prev", "deduct_eps_prev")},
             **{k: fc.get(k) for k in ("fc_date", "fc_lower", "fc_upper", "fc_type", "fc_text")},
         })
         # norm_yield 依赖同一行的 payout，故在字典构造完成后补算
@@ -860,6 +1008,20 @@ def report(rows: list[dict], args) -> list[dict]:
         elif name.startswith("L7"):
             fin = sum(1 for r in cur if r["ind1"] == "金融")
             note = f"（{fin} 只金融豁免）" if fin else ""
+        elif name.startswith("L8"):
+            # 缺数据被拦与真背离被拦必须分开报：前者是数据问题（大量出现说明
+            # 拉取有误），后者才是判据在起作用。混在一起无法判断闸门是否健康。
+            blocked = [r for r in before if r not in cur]
+            miss = [r for r in blocked
+                    if parent_eps_yoy(r) is None or deduct_eps_yoy(r) is None]
+            real = [r for r in blocked if r not in miss]
+            note = f"（其中 {len(miss)} 只因缺扣非数据被拦）" if miss else ""
+            if real:
+                note += " 🔴 " + "、".join(
+                    f"{r['name']}(归母{parent_eps_yoy(r):+.1f}%/扣非{deduct_eps_yoy(r):+.1f}%)"
+                    for r in real[:5])
+                if len(real) > 5:
+                    note += f" 等 {len(real)} 只"
         print(f"  {name:<26} → {len(cur):>4} 只 {note}")
 
     ys = sorted(map(int, rows[0]["series"])) if rows else []
