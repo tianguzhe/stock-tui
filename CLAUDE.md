@@ -263,7 +263,13 @@
   - `score_total` 不受影响（基于相对关系），受影响的是 `close` 及依赖它的一切计算
   - 修复：`go run ./cmd/stockdb repair-scores --all -P 4`（1173 只 / 17462 行约 4 分钟）把全库统一到今日基准，**之后必须重排全部交易日的 RS**（ret20 已变）。回测本就需要连续前复权序列，全库统一才是正确终态
   - 检测：`sqlite3 data/stock.db "ATTACH '备份.db' AS old; SELECT COUNT(*) FROM snapshot s JOIN old.snapshot o ON o.code=s.code AND o.trade_date=s.trade_date WHERE s.close != o.close;"` —— 但**只能查出重叠行**，补跑新增行引发的不一致查不到（实测备份对比只发现 6 只，全库重算实际修正了 17 只），故不要依赖检测，直接全量重算
-  - **免备份检测**（无需旧库、可覆盖全部行，适用于"验证某期间有无除权、市值法是否可靠"）：`LAG(close) OVER (PARTITION BY code ORDER BY trade_date)` 算出的环比涨幅与 `change_pct` 相减，差值即漂移量；全为 0 则该期间无除权
+  - **免备份检测**（无需旧库、可覆盖全部行）：`LAG(close) OVER (PARTITION BY code ORDER BY trade_date)` 算出的环比涨幅与 `change_pct` 相减，差值即漂移量。⚠️ **它测的是「基准是否一致」，不是「有没有除权」**——全为 0 只能说明该期间**没有混合基准**，**不能推出无除权**。原因：若 close 是统一基准的前复权序列，除权日的历史价整体下移 D，`(close[i]−close[i−1])/close[i−1]` 与交易所口径的 `change_pct` **恒等**，drift 天然为 0。2026-08-25 曾据此误判「大唐 8 月无除权」，属方法误用
+  - **验证有无除权用不复权 vs 前复权对比**（腾讯 proxy，`qfq` 与 `bfq` 各拉一次，比较同日收盘价之差；差额发生跳变的那天即除权日，跳变量 ＝ 每股分红/送转影响）：
+    ```bash
+    for fq in qfq bfq; do curl -s "https://proxy.finance.qq.com/ifzqgtimg/appstock/app/newfqkline/get?_var=k&param=sh601991,day,,,60,${fq}" | sed 's/^[^=]*=//' > /tmp/tx_$fq.json; done
+    # qfq 取 data.<code>.qfqday，bfq 取 data.<code>.day，row[2] 为收盘价；差额恒定＝无除权
+    ```
+    实测 2026-08-25：大唐 sh601991 在 2026-06-02~08-25 共 60 个交易日内差额恒为 0.0000，确认无除权
 - **`rs-rank` 必须在 `batch-save` 之后跑，顺序反了会导致 RS 覆盖不全**：rs-rank 只排它执行时该日已存在的行，之后再写入的行 `rs20` 保持 0/NULL。2026-08-01 实测 06-18 有 354 行却只有 61 只排过名（17%）、07-16 是 184/423(43%)。排查与修复：
   ```bash
   # 查覆盖率异常的日子
