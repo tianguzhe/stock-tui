@@ -422,6 +422,10 @@ func cmdBacktestPortfolio(args []string) error {
 	return engine.Run()
 }
 
+// minHotStocksForImport 是热榜导入的最小样本数。低于它视为接口异常，
+// 跳过整次导入以免 hot_score 衰减误清股票池。取值约为正常返回量（50~60）的一半。
+const minHotStocksForImport = 30
+
 func cmdHot(args []string) error {
 	fs := flag.NewFlagSet("hot", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
@@ -433,6 +437,17 @@ func cmdHot(args []string) error {
 	stocks, err := api.FetchHotStocks()
 	if err != nil {
 		return fmt.Errorf("hot: %w", err)
+	}
+	// 接口健康度闸门：ImportHotStocks 会执行每日 hot_score-1 衰减并删除归零的
+	// 标的。热榜返回数异常偏低时（接口故障或改版）照常衰减，会让在榜标的拿不到
+	// 热度重置而逐日老化——连续几天就能把股票池蚕食干净，且过程无任何症状。
+	// 信息最少时向保护侧失败：整次跳过，池子与 hot_score 原样保留。
+	// 判断基于接口原始返回数，不受 -top 影响——它检测的是接口是否正常，
+	// 而 -top 是调用者的显式意图。
+	if len(stocks) < minHotStocksForImport {
+		fmt.Printf("⚠️  热榜仅返回 %d 只（正常 50~60），疑似接口异常，本次跳过导入与热度衰减\n", len(stocks))
+		fmt.Println("    股票池与 hot_score 保持不变；接口恢复后重跑本命令即可正常衰减")
+		return nil
 	}
 	if *topN > 0 && len(stocks) > *topN {
 		stocks = stocks[:*topN]
