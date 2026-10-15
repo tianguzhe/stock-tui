@@ -129,12 +129,14 @@ func (e *Engine) Run() (string, error) {
 
 	// 2. 对每个信号计算 T+N 收益
 	results := []store.BacktestResult{}
+	outcomes := map[tradeOutcome]int{}
 	for i, sig := range signals {
 		if e.config.Verbose && (i+1)%100 == 0 {
 			fmt.Printf("处理中... %d/%d\n", i+1, len(signals))
 		}
 
-		result := e.simulateTrade(sig)
+		result, outcome := e.simulateTrade(sig)
+		outcomes[outcome]++
 		result.BacktestRunID = runID
 		result.Config = e.configJSON()
 
@@ -158,6 +160,14 @@ func (e *Engine) Run() (string, error) {
 
 	// 5. 打印结果
 	e.printSummary(summary)
+	if n := outcomes[outcomeDataGap]; n > 0 {
+		fmt.Printf("注: %d/%d 笔在持有窗口内行情中断(掉出热榜或停牌),已按最后一条收盘平仓并计入统计\n",
+			n, summary.TotalSignals)
+	}
+	if n := outcomes[outcomePending] + outcomes[outcomeNoData]; n > 0 {
+		fmt.Printf("注: 未计入 %d 笔(待结算 %d、窗口内无行情 %d)\n",
+			n, outcomes[outcomePending], outcomes[outcomeNoData])
+	}
 
 	return runID, nil
 }
@@ -321,7 +331,19 @@ func (e *Engine) appendSignals(signals *[]Signal, s Signal) {
 }
 
 // simulateTrade 模拟单次交易
-func (e *Engine) simulateTrade(sig Signal) store.BacktestResult {
+// tradeOutcome 区分平仓方式。outcomeDataGap 不写入 backtest_result(表无此列)，
+// 只在汇总时计数提示——它是「掉出热榜/停牌后按末次行情平仓」的近似值。
+type tradeOutcome int
+
+const (
+	outcomePending tradeOutcome = iota // 全市场交易日不足 N 天，尚未到期
+	outcomeNoData                      // 信号日后窗口内该标的一条行情也没有，无法定价
+	outcomeStop                        // 盘中触发止损
+	outcomeExpired                     // 持有满 N 个交易日按收盘平仓
+	outcomeDataGap                     // 窗口内行情中断(出池/停牌)，按最后一条收盘平仓
+)
+
+func (e *Engine) simulateTrade(sig Signal) (store.BacktestResult, tradeOutcome) {
 	result := store.BacktestResult{
 		EntryDate:  sig.Date,
 		Code:       sig.Code,
@@ -335,7 +357,17 @@ func (e *Engine) simulateTrade(sig Signal) store.BacktestResult {
 		TDSetup:    sig.TDSetup,
 	}
 
-	// 查询后续 N 个交易日的价格。用盘中 low/high（而非仅收盘）量回撤与止损，
+	// 持有窗口按**全市场**交易日计，而非该标的的行数：snapshot 只覆盖热榜池，
+	// 标的掉出热榜后不再有行情。旧实现按标的行数 LIMIT N，掉出热榜的标的凑不满
+	// N 行就被当作「数据不足」整笔丢弃——掉榜的多半是走弱的票，于是亏损从统计里
+	// 系统性消失(幸存者偏差)。
+	windowEnd, complete, err := e.marketWindowEnd(sig.Date)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: 查询交易日失败 %s %s: %v\n", sig.Code, sig.Date, err)
+		return result, outcomeNoData
+	}
+
+	// 查询窗口内的价格。用盘中 low/high（而非仅收盘）量回撤与止损，
 	// 与 recordPerf 的 MaxAdverse 口径一致；缺失的旧行 low/high 为 NULL，
 	// COALESCE 回退到 close 以保持向后兼容。
 	query := `
@@ -343,35 +375,28 @@ func (e *Engine) simulateTrade(sig Signal) store.BacktestResult {
 		       COALESCE(low, close)  AS low,
 		       COALESCE(high, close) AS high
 		FROM snapshot
-		WHERE code = ? AND trade_date > ?
+		WHERE code = ? AND trade_date > ? AND trade_date <= ?
 		ORDER BY trade_date ASC
-		LIMIT ?
 	`
 
-	rows, err := e.db.Query(query, sig.Code, sig.Date, e.config.HoldingDays)
+	rows, err := e.db.Query(query, sig.Code, sig.Date, windowEnd)
 	if err != nil {
-		if e.config.Verbose {
-			fmt.Printf("查询失败: %s %s: %v\n", sig.Code, sig.Date, err)
-		}
-		return result
+		fmt.Fprintf(os.Stderr, "warning: 查询失败 %s %s: %v\n", sig.Code, sig.Date, err)
+		return result, outcomeNoData
 	}
 	defer rows.Close()
 
 	dayCount := 0
 	maxAdverse := 0.0
-
-	// Debug: 检查是否有数据
-	hasData := false
+	var lastDate string
+	var lastClose float64
 
 	for rows.Next() {
-		hasData = true
 		var date string
 		var close, low, high float64
 		if err := rows.Scan(&date, &close, &low, &high); err != nil {
-			if e.config.Verbose {
-				fmt.Printf("扫描失败: %s: %v\n", sig.Code, err)
-			}
-			continue
+			fmt.Fprintf(os.Stderr, "warning: 扫描失败 %s: %v\n", sig.Code, err)
+			return result, outcomeNoData
 		}
 
 		if e.config.Verbose && dayCount == 0 {
@@ -379,14 +404,7 @@ func (e *Engine) simulateTrade(sig Signal) store.BacktestResult {
 		}
 
 		dayCount++
-
-		// 当日收盘收益
-		var returnPct float64
-		if sig.Direction == "多头" {
-			returnPct = (close - sig.Close) / sig.Close * 100
-		} else {
-			returnPct = (sig.Close - close) / sig.Close * 100
-		}
+		lastDate, lastClose = date, close
 
 		// 盘中最大不利波动：多头看当日最低、空头看当日最高（真实日内回撤）
 		var adverse float64
@@ -411,45 +429,64 @@ func (e *Engine) simulateTrade(sig Signal) store.BacktestResult {
 			}
 			result.MaxAdversePct = maxAdverse
 			result.Win = 0
-			return result
-		}
-
-		// 到达持有天数，正常退出（收盘价）
-		if dayCount == e.config.HoldingDays {
-			result.ExitDate = date
-			result.ExitPrice = close
-			result.HoldingDays = dayCount
-			result.ReturnPct = returnPct
-			result.MaxAdversePct = maxAdverse
-
-			// 判断胜负
-			result.Win = 0
-			if result.ReturnPct > 0 {
-				result.Win = 1
-			}
-
-			return result
+			return result, outcomeStop
 		}
 	}
-
-	// 检查迭代是否因错误中断
 	if err := rows.Err(); err != nil {
-		return result // 返回空 ExitDate，等价于数据不足
+		fmt.Fprintf(os.Stderr, "warning: 迭代失败 %s: %v\n", sig.Code, err)
+		return result, outcomeNoData
 	}
 
-	// Debug: 检查是否没有数据
-	if !hasData && e.config.Verbose {
-		fmt.Printf("警告: %s %s 没有后续数据\n", sig.Code, sig.Date)
-	}
-
-	// 数据不足（股票停牌或退市）
-	result.ExitDate = ""
-	result.ExitPrice = 0
 	result.HoldingDays = dayCount
 	result.MaxAdversePct = maxAdverse
-	result.Win = 0
+	switch {
+	case !complete:
+		return result, outcomePending
+	case dayCount == 0:
+		if e.config.Verbose {
+			fmt.Printf("警告: %s %s 窗口内没有后续数据\n", sig.Code, sig.Date)
+		}
+		return result, outcomeNoData
+	}
 
-	return result
+	outcome := outcomeExpired
+	if lastDate != windowEnd {
+		outcome = outcomeDataGap
+	}
+	result.ExitDate = lastDate
+	result.ExitPrice = lastClose
+	if sig.Direction == "多头" {
+		result.ReturnPct = (lastClose - sig.Close) / sig.Close * 100
+	} else {
+		result.ReturnPct = (sig.Close - lastClose) / sig.Close * 100
+	}
+	if result.ReturnPct > 0 {
+		result.Win = 1
+	}
+	return result, outcome
+}
+
+// marketWindowEnd 返回信号日之后第 HoldingDays 个全市场交易日；不足 N 天时返回
+// 已有的最后一天且 complete=false。
+func (e *Engine) marketWindowEnd(signalDate string) (end string, complete bool, err error) {
+	rows, err := e.db.Query(`
+		SELECT DISTINCT trade_date FROM snapshot
+		WHERE trade_date > ?
+		ORDER BY trade_date ASC
+		LIMIT ?
+	`, signalDate, e.config.HoldingDays)
+	if err != nil {
+		return "", false, err
+	}
+	defer rows.Close()
+	n := 0
+	for rows.Next() {
+		if err := rows.Scan(&end); err != nil {
+			return "", false, err
+		}
+		n++
+	}
+	return end, n == e.config.HoldingDays, rows.Err()
 }
 
 // calculateSummary 计算汇总统计

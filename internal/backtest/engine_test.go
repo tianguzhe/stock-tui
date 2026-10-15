@@ -32,7 +32,7 @@ func TestSimulateTradeIntradayStop(t *testing.T) {
 	}
 
 	e := NewEngine(st.DB(), st, Config{StopLoss: 5, HoldingDays: 10})
-	res := e.simulateTrade(Signal{Date: "2026-06-10", Code: "sh600000", SignalType: "test", Direction: "多头", Close: 100})
+	res, _ := e.simulateTrade(Signal{Date: "2026-06-10", Code: "sh600000", SignalType: "test", Direction: "多头", Close: 100})
 
 	if res.ExitDate != "2026-06-11" {
 		t.Fatalf("ExitDate = %q, want 2026-06-11 (intraday stop day)", res.ExitDate)
@@ -72,7 +72,7 @@ func TestSimulateTradeNoStopHoldsToExpiry(t *testing.T) {
 	}
 
 	e := NewEngine(st.DB(), st, Config{StopLoss: 5, HoldingDays: 2})
-	res := e.simulateTrade(Signal{Date: "2026-06-10", Code: "sh600000", SignalType: "test", Direction: "多头", Close: 100})
+	res, _ := e.simulateTrade(Signal{Date: "2026-06-10", Code: "sh600000", SignalType: "test", Direction: "多头", Close: 100})
 
 	if res.ExitDate != "2026-06-12" {
 		t.Fatalf("ExitDate = %q, want 2026-06-12 (expiry)", res.ExitDate)

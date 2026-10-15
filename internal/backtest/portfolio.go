@@ -2,6 +2,7 @@ package backtest
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"time"
 
@@ -15,7 +16,8 @@ type PortfolioConfig struct {
 	MaxPositions   int     // 最大持仓数
 	PositionSize   float64 // 每笔仓位大小（百分比，如 0.1 = 10%）
 	TakeProfit     float64 // 止盈百分比（0=不止盈）
-	Commission     float64 // 手续费率（如 0.0003 = 万3）
+	Commission     float64 // 手续费率（如 0.0003 = 万3），买卖双边
+	StampTax       float64 // 卖出印花税率（默认 0.0005），基金/ETF 免征
 }
 
 // Position 持仓
@@ -39,8 +41,13 @@ type Trade struct {
 	Shares     int
 	PnL        float64
 	ReturnPct  float64
-	ExitReason string // "止损" | "止盈" | "到期"
+	ExitReason string // "止损" | "止盈" | "到期" | exitReasonDataGap | "回测结束"
 }
+
+// exitReasonDataGap: snapshot 只覆盖热榜池，持仓标的掉出热榜后不再有行情。
+// 旧实现在缺行时 continue，止损失效、持仓被冻结，回测结束再按入场价结算且
+// 不计入交易——掉榜的多半是走弱的票，亏损于是从统计里消失。现按最后一条收盘平仓。
+const exitReasonDataGap = "出池平仓"
 
 // PortfolioEngine 组合回测引擎
 type PortfolioEngine struct {
@@ -67,6 +74,9 @@ func NewPortfolioEngine(db *sql.DB, st *store.Store, config PortfolioConfig) *Po
 	if config.Commission == 0 {
 		config.Commission = 0.0003 // 默认万3
 	}
+	if config.StampTax == 0 {
+		config.StampTax = 0.0005
+	}
 
 	return &PortfolioEngine{
 		db:     db,
@@ -85,21 +95,56 @@ func (e *PortfolioEngine) Run() error {
 	fmt.Printf("仓位大小: %.0f%%\n", e.config.PositionSize*100)
 	fmt.Printf("时间范围: %s ~ %s\n", e.config.StartDate, e.config.EndDate)
 	fmt.Printf("持有天数: %d\n", e.config.HoldingDays)
-	fmt.Printf("止损: %.1f%% | 止盈: %.1f%% | 手续费: %.4f%%\n\n",
-		e.config.StopLoss, e.config.TakeProfit, e.config.Commission*100)
+	fmt.Printf("止损: %.1f%% | 止盈: %.1f%% | 手续费: %.4f%% | 印花税(卖出,基金免): %.4f%%\n\n",
+		e.config.StopLoss, e.config.TakeProfit, e.config.Commission*100, e.config.StampTax*100)
 
-	capital := e.config.InitialCapital
-	positions := []Position{}
-	trades := []Trade{}
-	dailyEquity := []float64{} // 每日权益
-
-	// 获取交易日列表
-	tradingDays, err := e.getTradingDays()
+	trades, dailyEquity, capital, err := e.simulate()
 	if err != nil {
 		return err
 	}
 
+	totalReturn := (capital - e.config.InitialCapital) / e.config.InitialCapital * 100
+
+	// 5. 计算统计指标
+	stats := e.calculateStats(trades, dailyEquity)
+
+	// 6. 打印结果（所有持仓已在 simulate 中平仓，capital 即最终权益）
+	e.printResults(totalReturn, capital, stats, trades, nil)
+
+	fmt.Printf("\n耗时: %d ms\n", time.Since(startTime).Milliseconds())
+	return nil
+}
+
+// simulate 逐日推进组合，返回全部已平仓交易、每日权益与最终资金。
+func (e *PortfolioEngine) simulate() (trades []Trade, dailyEquity []float64, capital float64, err error) {
+	capital = e.config.InitialCapital
+	positions := []Position{}
+
+	// 获取交易日列表
+	tradingDays, err := e.getTradingDays()
+	if err != nil {
+		return nil, nil, 0, err
+	}
+
 	fmt.Printf("总交易日: %d 天\n", len(tradingDays))
+
+	closePosition := func(pos Position, exitDate string, exitPrice float64, reason string) {
+		revenue := float64(pos.Shares) * exitPrice
+		fees := revenue * sellCostRate(e.config, pos.Code)
+		capital += revenue - fees
+		trades = append(trades, Trade{
+			EntryDate:  pos.EntryDate,
+			ExitDate:   exitDate,
+			Code:       pos.Code,
+			SignalType: pos.SignalType,
+			EntryPrice: pos.EntryPrice,
+			ExitPrice:  exitPrice,
+			Shares:     pos.Shares,
+			PnL:        revenue - pos.Cost - fees,
+			ReturnPct:  (exitPrice - pos.EntryPrice) / pos.EntryPrice * 100,
+			ExitReason: reason,
+		})
+	}
 
 	// 按日期遍历
 	for i, date := range tradingDays {
@@ -111,13 +156,31 @@ func (e *PortfolioEngine) Run() error {
 		for j := len(positions) - 1; j >= 0; j-- {
 			pos := positions[j]
 			closePrice, low, high, err := e.getPriceRange(pos.Code, date)
-			if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				// 当日无行情：之后再无行情 = 已掉出热榜，按最后一条收盘平仓；
+				// 之后还有行情 = 停牌/暂时出池，继续持有。
+				later, err := e.hasRowAfter(pos.Code, date)
+				if err != nil {
+					return nil, nil, 0, err
+				}
+				if later {
+					continue
+				}
+				lastDate, lastClose, err := e.lastClose(pos.Code, date)
+				if err != nil {
+					return nil, nil, 0, err
+				}
+				closePosition(pos, lastDate, lastClose, exitReasonDataGap)
+				positions = append(positions[:j], positions[j+1:]...)
 				continue
+			}
+			if err != nil {
+				return nil, nil, 0, fmt.Errorf("查询 %s@%s 行情: %w", pos.Code, date, err)
 			}
 
 			daysHeld, err := e.countTradingDays(pos.EntryDate, date)
 			if err != nil {
-				continue
+				return nil, nil, 0, fmt.Errorf("统计 %s 持有天数: %w", pos.Code, err)
 			}
 
 			// 退出条件按优先级：盘中止损（看当日最低）> 盘中止盈（看当日最高）> 到期（收盘）。
@@ -141,44 +204,26 @@ func (e *PortfolioEngine) Run() error {
 				exitPrice = closePrice
 			}
 
-			returnPct := (exitPrice - pos.EntryPrice) / pos.EntryPrice * 100
-
 			if shouldExit {
-				// 平仓
-				revenue := float64(pos.Shares) * exitPrice
-				commission := revenue * e.config.Commission
-				pnl := revenue - pos.Cost - commission
-
-				capital += revenue - commission
-
-				trades = append(trades, Trade{
-					EntryDate:  pos.EntryDate,
-					ExitDate:   date,
-					Code:       pos.Code,
-					SignalType: pos.SignalType,
-					EntryPrice: pos.EntryPrice,
-					ExitPrice:  exitPrice,
-					Shares:     pos.Shares,
-					PnL:        pnl,
-					ReturnPct:  returnPct,
-					ExitReason: exitReason,
-				})
-
-				// 移除持仓
+				closePosition(pos, date, exitPrice, exitReason)
 				positions = append(positions[:j], positions[j+1:]...)
 			}
 		}
-
 		// 2. 检查新信号（如果有空闲仓位）
 		if len(positions) < e.config.MaxPositions {
 			signals, err := e.getSignals(date)
 			if err != nil {
-				continue
+				return nil, nil, 0, fmt.Errorf("查询 %s 信号: %w", date, err)
 			}
 
 			for _, sig := range signals {
 				if len(positions) >= e.config.MaxPositions {
 					break
+				}
+				// 组合只做多（A 股无法融券做空）。getSignals 与单信号回测共用
+				// findSignals，会带出超买反转空头/顶背离空头等看空信号，不能拿来建仓。
+				if sig.Direction != "多头" {
+					continue
 				}
 
 				// 同一代码已持有一份仓位时跳过：信号可能连续多日成立，重复建仓
@@ -219,61 +264,71 @@ func (e *PortfolioEngine) Run() error {
 			}
 		}
 
-		// 3. 记录当日权益
+		// 3. 记录当日权益。当日无行情(停牌/暂时出池)的持仓按最近一条收盘估值，
+		// 不能按 0 计，否则权益曲线出现假回撤。
 		equity := capital
 		for _, pos := range positions {
-			currentPrice, err := e.getPrice(pos.Code, date)
-			if err == nil {
-				equity += float64(pos.Shares) * currentPrice
+			_, price, err := e.lastClose(pos.Code, date)
+			if err != nil {
+				return nil, nil, 0, err
 			}
+			equity += float64(pos.Shares) * price
 		}
 		dailyEquity = append(dailyEquity, equity)
 	}
 
-	// 4. 关闭剩余持仓（按收盘价强制平仓，记录为 Trade 以纳入胜率统计）
-	dataMissing := 0 // 持仓在 EndDate 无快照：capital 仍按入场价近似结算，但不计入胜率统计
+	// 4. 关闭剩余持仓（按截至 EndDate 的最后一条收盘平仓，纳入胜率统计）
 	for _, pos := range positions {
-		exitPrice, err := e.getPrice(pos.Code, e.config.EndDate)
+		lastDate, lastClose, err := e.lastClose(pos.Code, e.config.EndDate)
 		if err != nil {
-			// EndDate 缺数据(停牌/数据不足):真实收益不可得,用入场价保守近似结算
-			// capital,但跳过该笔的 Trade 记录——否则伪 0% 收益会污染胜率/收益统计。
-			dataMissing++
-			capital += float64(pos.Shares)*pos.EntryPrice - float64(pos.Shares)*pos.EntryPrice*e.config.Commission
-			continue
+			return nil, nil, 0, err
 		}
-		revenue := float64(pos.Shares) * exitPrice
-		commission := revenue * e.config.Commission
-		pnl := revenue - pos.Cost - commission
-		capital += revenue - commission
-		trades = append(trades, Trade{
-			EntryDate:  pos.EntryDate,
-			ExitDate:   e.config.EndDate,
-			Code:       pos.Code,
-			SignalType: pos.SignalType,
-			EntryPrice: pos.EntryPrice,
-			ExitPrice:  exitPrice,
-			Shares:     pos.Shares,
-			PnL:        pnl,
-			ReturnPct:  (exitPrice - pos.EntryPrice) / pos.EntryPrice * 100,
-			ExitReason: "回测结束",
-		})
+		closePosition(pos, lastDate, lastClose, "回测结束")
 	}
-	positions = nil // all closed above; avoid misleading "未平仓" display
+	return trades, dailyEquity, capital, nil
+}
 
-	totalReturn := (capital - e.config.InitialCapital) / e.config.InitialCapital * 100
-
-	// 5. 计算统计指标
-	stats := e.calculateStats(trades, dailyEquity)
-
-	// 6. 打印结果（所有持仓已在步骤4平仓，capital 即最终权益）
-	e.printResults(totalReturn, capital, stats, trades, positions)
-
-	fmt.Printf("\n耗时: %d ms\n", time.Since(startTime).Milliseconds())
-	if dataMissing > 0 {
-		fmt.Printf("注: %d 笔持仓在回测结束日无快照(停牌/数据不足),已按入场价结算权益但未计入胜率统计\n", dataMissing)
+// sellCostRate 卖出费率：佣金 + 印花税。基金/ETF/LOF 免征印花税。
+func sellCostRate(cfg PortfolioConfig, code string) float64 {
+	if isFund(code) {
+		return cfg.Commission
 	}
+	return cfg.Commission + cfg.StampTax
+}
 
-	return nil
+// isFund 按代码段判定场内基金(ETF/LOF)：沪 51/56/58，深 15/16。
+func isFund(code string) bool {
+	if len(code) < 4 {
+		return false
+	}
+	switch code[:4] {
+	case "sh51", "sh56", "sh58", "sz15", "sz16":
+		return true
+	}
+	return false
+}
+
+// hasRowAfter 判断标的在 date 之后是否还有快照(用于区分停牌与掉出热榜)。
+func (e *PortfolioEngine) hasRowAfter(code, date string) (bool, error) {
+	var n int
+	err := e.db.QueryRow(`SELECT COUNT(*) FROM snapshot WHERE code = ? AND trade_date > ?`, code, date).Scan(&n)
+	return n > 0, err
+}
+
+// lastClose 返回标的在 date(含)之前最后一条快照的日期与收盘价。持仓标的至少
+// 有建仓日那一行，故正常情况下不会 ErrNoRows。
+func (e *PortfolioEngine) lastClose(code, date string) (string, float64, error) {
+	var d string
+	var c float64
+	err := e.db.QueryRow(`
+		SELECT trade_date, close FROM snapshot
+		WHERE code = ? AND trade_date <= ?
+		ORDER BY trade_date DESC LIMIT 1
+	`, code, date).Scan(&d, &c)
+	if err != nil {
+		return "", 0, fmt.Errorf("查询 %s 截至 %s 的最后收盘价: %w", code, date, err)
+	}
+	return d, c, nil
 }
 
 // getTradingDays 获取交易日列表
@@ -466,6 +521,7 @@ func (e *PortfolioEngine) printResults(totalReturn, finalEquity float64, stats P
 	stopLoss := 0
 	takeProfit := 0
 	expire := 0
+	dataGap := 0
 	for _, t := range trades {
 		switch t.ExitReason {
 		case "止损":
@@ -474,6 +530,8 @@ func (e *PortfolioEngine) printResults(totalReturn, finalEquity float64, stats P
 			takeProfit++
 		case "到期":
 			expire++
+		case exitReasonDataGap:
+			dataGap++
 		}
 	}
 
@@ -481,6 +539,7 @@ func (e *PortfolioEngine) printResults(totalReturn, finalEquity float64, stats P
 	fmt.Printf("止损: %d (%.1f%%)\n", stopLoss, float64(stopLoss)/float64(stats.TotalTrades)*100)
 	fmt.Printf("止盈: %d (%.1f%%)\n", takeProfit, float64(takeProfit)/float64(stats.TotalTrades)*100)
 	fmt.Printf("到期: %d (%.1f%%)\n", expire, float64(expire)/float64(stats.TotalTrades)*100)
+	fmt.Printf("出池平仓(掉出热榜后按末次收盘): %d (%.1f%%)\n", dataGap, float64(dataGap)/float64(stats.TotalTrades)*100)
 
 	// 持仓明细
 	if len(positions) > 0 {

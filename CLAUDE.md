@@ -62,6 +62,7 @@
 - `indicator.Calculate([]Candle) []Result`(KDJ/MACD/RSI/StochRSI/WR/DMI/CMI/BIAS/CHOP/ATR/BOLL/Donchian/MFI/SAR/Keltner/SuperTrend);`WR` 为正值口径(**值越大越超卖**,与标准威廉符号相反)。`StochRSI` 挂在 `Result.RSI` 旁(`StochRSI.K/D`),在 `fillRSI` 之后填充,用于 RSI6 钝化时重新展开极端区间(CLI `analysis.StochStagnation`、score、PERF 均引用)。
 - `indicator.CalcCYC([]Candle) []CYCResult` 成本均线(N 日 VWAP = sum(Amount,N)/sum(Volume,N),非收盘价等权 MA):`CYC5`/`CYC13`/`CYC34`/`CYCInf`(全量历史加权)。Volume=0 该日跳出不参与加权,回退收盘价;前置依赖 `Amount`(元)/`Volume`(股数)。**纯展示指标**:仅 `cmd/indicator-analyze` 的 `printAnalysis` 打印 `CYC CYC5/13/34/∞` 一行,不进 score/screener/snapshot/PERF。
 - `Candle` 结构体字段: `Open`、`High`、`Low`、`Close`、`Volume`(股数)、`Amount`(元)。CYQ 的 avgPrice 优先 VWAP(`Amount/Volume`),Volume=0 时回退 `(H+L)/2`——VWAP 在暴跌日比 `(H+L)/2` 低最多 1.44%,修正系统性偏差。
+- ⚠️ **三个日K源(腾讯/东财/TDX)的前复权都只复权 OHLC,`Amount`/`Volume` 是原始值**,直接相除得到**不复权** VWAP。2026-10 实测 9 只标的 419~771/801 日 VWAP 落在前复权 [L,H] 外;512480(2026-07-03 一拆二)CYC∞ 偏高 82%、富联偏高 3.9%。CLI 因此额外拉一次腾讯不复权收盘价,经 `api.QfqAmountCandles` 把**成交额**折算到前复权价位(`Amount×前复权收盘/不复权收盘`,成交量不动)后再算 CYC/CYQ;取不到不复权价时**跳过** CYC/CYQ 而非输出错位值。不折算成交量是因为分红远比拆分常见、分红不改变股数;代价是跨拆分日的 CYC34/CYC∞ 窗口内拆分前日子按旧份额加权(单日 VWAP 与 CYQ 不受影响)
 - `indicator.CalcCYQ([]Candle, []float64) []CYQResult` 计算筹码衍生指标(持仓成本衰减模型):
   - `WinnerClose`/`WinnerOpen`/`WinnerHigh`/`WinnerLow` = 该价格的获利盘比例(0~1)
   - `ASR` = 活动筹码(收盘±10%区间筹码量,0~100)
@@ -70,11 +71,12 @@
   - 前置依赖:至少 60 根日K(推荐 250+),换手率用小数(0.0646=6.46%),价格须前复权
   - **模型差异(影响解读)**:通达信把每日成交量按三角/均匀分布铺开在 `[Low,High]` 区间上,本实现压成 `avgPrice`(VWAP,无量时 `(H+L)/2`)上的**点质量**。故 WINNER 在价格穿越某日 avgPrice 时**阶跃跳变**而非连续爬升,`ASR` 受影响最重(呈离散台阶,"筹码密集/稀疏"标签会在临界点抖动)。**只读量级**(深度套牢/全民获利/大致密集度),**不读日间细微变化、不当连续趋势线**
   - 序列**无前视偏差**:第 i 项只用 `[0,i]` 的换手与成本重算权重,可安全用于回测/历史比对(旧版对全序列只算一套权重,历史各日混入未来交易日筹码,仅末日正确)
-- `MFI` 读取 `Candle.Volume`;其他核心价格指标不依赖成交量。ATR14 用 Wilder RMA;BOLL 为 20 日 ±2σ;Donchian 输出 20/55 日通道。
+- `MFI` 读取 `Candle.Volume`;其他核心价格指标不依赖成交量。ATR14 用 Wilder RMA(通达信为 `MA(TR,14)`,实测平均绝对偏差约 10%);BOLL 为 20 日 ±2σ(总体标准差,通达信 `STD` 为样本标准差,带宽约窄 2.6%);Donchian 输出 20/55 日通道。
 - `SAR` 为 Wilder 抛物线转向(AF 0.02→0.20,触破翻转),输出 `Value`(止损/翻转价)、`Long`(多空 stance)、`Reversed`(本根是否刚翻转)。`Keltner` 为 EMA20±1.5×ATR20 通道,`Squeeze` = BOLL(20,2σ) 完全收进 Keltner 内(波动压缩、突破临近);`Keltner` 读取已算好的 `BOLL`,故 `Calculate` 内在 `fillBOLL` 之后填充。
 - `SuperTrend` 为 ATR 通道趋势跟踪(ATR10×3),输出 `Value`(趋势线:多头=下轨支撑/空头=上轨压力)、`Long`(趋势 stance)、`Reversed`(本根是否刚翻转);比 `SAR` 更平滑、噪音更低,适合作"当前趋势态"总览。与 SAR/Keltner 同属 ATR 系趋势工具,解读时注意三者不要互相当独立证据(见下「指标分工」)。
 
 多数指标按维度高度相关。解读与评分时**每个维度只计一次票**,不要把同源指标当独立证据制造"虚假共振":
+- **DMI 为通达信/同花顺口径**(2026-10 起,与 app 一致):`PDI/MDI = SUM(DM,14)/SUM(TR,14)×100`、`ADX = MA(DX,6)`、`ADXR = (ADX+REF(ADX,6))/2`。此前为 Wilder RMA(14),实测比 app 平均低 9.7 点、ADX>25/>38 判定有 33~35% 的天数与 app 相反。阈值 20/25/35/38 数值未改,改为按 app 刻度读(闸门因此比旧口径宽松)。⚠️ **库内历史行的 `adx`/`adxr`/`pdi`/`mdi` 及依赖 ADX 的 `score_total`/`score_adj`/`sig_trend_bull` 仍是旧口径,须跑 `repair-scores --all` 统一,之后重排全部交易日 RS**
 - **趋势方向/强度**:主用 `DMI`(ADX 强度 + PDI/MDI 方向)+ MA 排列;`CMI`/`CHOP` 仅作趋势效率/震荡度印证(三者相关:ADX 高≈CHOP 低≈CMI 高)。**`SAR`/`SuperTrend`/`Keltner` 同属 ATR 系趋势跟踪,方向几乎总是一致——三者一致才算趋势确认,仅作 stance 印证与移动止损参考,不叠加计分。**
 - **SAR vs SuperTrend 止损口径(不同翻空节奏,日志/选股统一用此标准)**:`SAR`(抛物线、AF 0.02→0.20 紧贴价格)**翻空最早、最灵敏**,宜作移动止损;`SuperTrend`(ATR×3 通道、翻转慢)**滞后于 SAR**,宜作大趋势 stance 总览。**只盯 ST 止损会扛过整段下跌**(SAR 先报警、ST 慢承认)。正确用法:
   - **移动止损用 SAR**(贴身,破位即跑,回撤小)
@@ -294,7 +296,10 @@
 - 命令：`go run ./cmd/stockdb backtest [--start YYYY-MM-DD] [--days N] [--signals "类型1,类型2"]`（基础回测）
 - 命令：`go run ./cmd/stockdb backtest-portfolio [--capital 100000] [--max-positions 5]`（组合回测）
 - 表结构：`backtest_result`（单次信号结果）、`backtest_summary`（汇总统计）
-- 有效结果过滤：`WHERE exit_date IS NOT NULL AND exit_date != ''`（数据不足时为空）
+- 有效结果过滤：`WHERE exit_date IS NOT NULL AND exit_date != ''`（全市场交易日不足 N 天的待结算、或窗口内该标的无任何行情时为空）
+- **持有窗口按全市场交易日计**（2026-10 起）：snapshot 只覆盖热榜池，标的掉出热榜后不再有行情。旧实现按标的行数凑 N 天，掉榜标的凑不满就整笔丢弃（单信号）或冻结持仓、按入场价结算且不计入交易（组合）——掉榜多为走弱标的，亏损从统计中消失。现两者都按**最后一条收盘平仓并计入**，单信号回测末尾打印「行情中断」笔数，组合回测退出原因单列「出池平仓」
+- 组合回测费用：佣金双边（默认万3）+ **卖出印花税 0.05%**（基金/ETF/LOF 按代码段 `sh51/56/58`、`sz15/16` 免征）；单信号回测衡量信号本身，不计费用
+- 组合回测**只做多**：`getSignals` 与单信号回测共用 `findSignals`，会带出「超买反转空头」「顶背离空头」等看空信号，2026-10 前这些信号被当作买入建仓（方向未过滤），此前的组合回测结果均受污染，需重跑
 - 信号字段映射：`sig_trend_bull`（趋势跟随多头）、`sig_overbought`（超买）、`sig_oversold`（超卖）、`div_bull`/`div_bear`（背离）
 - 每日更新脚本：`./scripts/daily-update.sh`（批量保存快照 → 更新RS → 回填决策 → 选股表，约90秒）
 
