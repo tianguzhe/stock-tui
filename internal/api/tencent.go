@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -37,6 +38,48 @@ type Stock struct {
 
 var reStock = regexp.MustCompile(`v_([a-z]{2}\d+)="([^"]+)"`)
 
+// IncompleteQuotesError 表示部分代码没拿到行情。FetchStocks 返回它时仍附带已解析
+// 的行情：盯盘界面应照常显示拿到的部分，同时把缺失清单提示出来——静默丢掉一只
+// 持仓会让组合少算一笔且没有任何症状。
+type IncompleteQuotesError struct {
+	Missing map[string]string // 代码 → 原因
+}
+
+func (e *IncompleteQuotesError) Error() string {
+	codes := make([]string, 0, len(e.Missing))
+	for c := range e.Missing {
+		codes = append(codes, c)
+	}
+	sort.Strings(codes)
+	parts := make([]string, len(codes))
+	for i, c := range codes {
+		parts[i] = fmt.Sprintf("%s(%s)", c, e.Missing[c])
+	}
+	return fmt.Sprintf("%d 只行情缺失: %s", len(codes), strings.Join(parts, ", "))
+}
+
+// incompleteQuotes 汇总解析失败与请求了却未返回的代码；全部到齐时返回 nil。
+func incompleteQuotes(requested []string, stocks []Stock, failed map[string]string) error {
+	missing := make(map[string]string, len(failed))
+	for c, reason := range failed {
+		missing[c] = reason
+	}
+	got := make(map[string]bool, len(stocks))
+	for _, s := range stocks {
+		got[s.Code] = true
+	}
+	for _, c := range requested {
+		if !got[c] && missing[c] == "" {
+			missing[c] = "无返回"
+		}
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+	return &IncompleteQuotesError{Missing: missing}
+}
+
+// FetchStocks 批量拉实时报价。部分代码缺失时返回已拿到的行情 + *IncompleteQuotesError。
 func FetchStocks(codes []string) ([]Stock, error) {
 	url := fmt.Sprintf("https://qt.gtimg.cn/q=%s", strings.Join(codes, ","))
 
@@ -59,12 +102,15 @@ func FetchStocks(codes []string) ([]Stock, error) {
 		return nil, fmt.Errorf("解码失败: %w", err)
 	}
 
-	return parseStocksPayload(string(body)), nil
+	stocks, failed := parseStocksPayload(string(body))
+	return stocks, incompleteQuotes(codes, stocks, failed)
 }
 
-func parseStocksPayload(body string) []Stock {
+// parseStocksPayload 解析响应；解析失败的代码连同原因放进 failed。
+func parseStocksPayload(body string) (stocks []Stock, failed map[string]string) {
 	matches := reStock.FindAllStringSubmatch(body, -1)
-	stocks := make([]Stock, 0, len(matches))
+	stocks = make([]Stock, 0, len(matches))
+	failed = map[string]string{}
 
 	for _, m := range matches {
 		if len(m) < 3 {
@@ -72,12 +118,13 @@ func parseStocksPayload(body string) []Stock {
 		}
 		s, err := parseStock(m[1], m[2])
 		if err != nil {
+			failed[m[1]] = err.Error()
 			continue
 		}
 		stocks = append(stocks, s)
 	}
 
-	return stocks
+	return stocks, failed
 }
 
 func parseStock(code, raw string) (Stock, error) {

@@ -562,3 +562,19 @@ func TestBKeyOnlyInSimpleMode(t *testing.T) {
 		t.Errorf("simple 模式下 b 键应切到 sys: got %q", sm2.labelMode)
 	}
 }
+
+// 部分行情缺失：拿到的照常刷新，缺失提示要显示出来，不能静默少一只。
+func TestUpdatePartialStocksKeepsDataAndShowsWarning(t *testing.T) {
+	warn := errors.New("1 只行情缺失: sz000001(字段不足: 2)")
+	m := Model{simpleMode: true}
+
+	updated, _ := m.Update(stocksPartialMsg{
+		stocks: []api.Stock{{Code: "sh600519", Name: "贵州茅台"}},
+		err:    warn,
+	})
+	got := updated.(Model)
+
+	if len(got.stocks) != 1 || got.err != warn {
+		t.Fatalf("stocks=%v err=%v, want data kept and warning set", got.stocks, got.err)
+	}
+}

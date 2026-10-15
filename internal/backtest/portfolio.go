@@ -184,7 +184,7 @@ func (e *PortfolioEngine) simulate() (trades []Trade, dailyEquity []float64, cap
 			}
 
 			// 退出条件按优先级：盘中止损（看当日最低）> 盘中止盈（看当日最高）> 到期（收盘）。
-			// 持仓为多头，成交价取触发价（止损/止盈线）或到期收盘价。
+			// 持仓为多头，成交价取触发价（止损线，跳空穿越时见 stopFillPrice；止盈线）或到期收盘价。
 			shouldExit := false
 			exitReason := ""
 			exitPrice := closePrice
@@ -193,7 +193,7 @@ func (e *PortfolioEngine) simulate() (trades []Trade, dailyEquity []float64, cap
 			case e.config.StopLoss > 0 && (low-pos.EntryPrice)/pos.EntryPrice*100 <= -e.config.StopLoss:
 				shouldExit = true
 				exitReason = "止损"
-				exitPrice = pos.EntryPrice * (1 - e.config.StopLoss/100)
+				exitPrice = stopFillPrice(pos.EntryPrice, e.config.StopLoss, low, high, true)
 			case e.config.TakeProfit > 0 && (high-pos.EntryPrice)/pos.EntryPrice*100 >= e.config.TakeProfit:
 				shouldExit = true
 				exitReason = "止盈"
@@ -223,6 +223,9 @@ func (e *PortfolioEngine) simulate() (trades []Trade, dailyEquity []float64, cap
 				// 组合只做多（A 股无法融券做空）。getSignals 与单信号回测共用
 				// findSignals，会带出超买反转空头/顶背离空头等看空信号，不能拿来建仓。
 				if sig.Direction != "多头" {
+					continue
+				}
+				if entryBlocked(sig) {
 					continue
 				}
 

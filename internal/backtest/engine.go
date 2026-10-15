@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"stock-tui/internal/market"
 	"stock-tui/internal/store"
 )
 
@@ -36,9 +37,11 @@ type Config struct {
 type Signal struct {
 	Date       string
 	Code       string
+	Name       string // 判 ST 限幅用；已掉出热榜的标的 instrument 行已删，为空时按非 ST 处理
 	SignalType string
 	Direction  string
 	Close      float64
+	ChangePct  float64
 
 	// 快照数据
 	ScoreTotal int
@@ -164,9 +167,9 @@ func (e *Engine) Run() (string, error) {
 		fmt.Printf("注: %d/%d 笔在持有窗口内行情中断(掉出热榜或停牌),已按最后一条收盘平仓并计入统计\n",
 			n, summary.TotalSignals)
 	}
-	if n := outcomes[outcomePending] + outcomes[outcomeNoData]; n > 0 {
-		fmt.Printf("注: 未计入 %d 笔(待结算 %d、窗口内无行情 %d)\n",
-			n, outcomes[outcomePending], outcomes[outcomeNoData])
+	if n := outcomes[outcomePending] + outcomes[outcomeNoData] + outcomes[outcomeLimitLocked]; n > 0 {
+		fmt.Printf("注: 未计入 %d 笔(待结算 %d、窗口内无行情 %d、信号日封板无法成交 %d)\n",
+			n, outcomes[outcomePending], outcomes[outcomeNoData], outcomes[outcomeLimitLocked])
 	}
 
 	return runID, nil
@@ -177,7 +180,8 @@ func (e *Engine) findSignals() ([]Signal, error) {
 	// 构建查询（字段名对应实际数据库列名）
 	query := `
 		SELECT
-			trade_date, code, close,
+			trade_date, code, close, COALESCE(change_pct, 0),
+			COALESCE((SELECT name FROM instrument i WHERE i.code = snapshot.code), ''),
 			COALESCE(score_total, 0), COALESCE(adx, 0), 0 as rs_rank_pct,
 			CASE WHEN sar_long = 1 THEN '多' ELSE '空' END as sar_stance,
 			COALESCE(td_setup, ''),
@@ -232,7 +236,7 @@ func (e *Engine) findSignals() ([]Signal, error) {
 		var breakBull, breakBear, divBull, divBear int
 
 		err := rows.Scan(
-			&s.Date, &s.Code, &s.Close,
+			&s.Date, &s.Code, &s.Close, &s.ChangePct, &s.Name,
 			&s.ScoreTotal, &s.ADX, &s.RSRankPct,
 			&sarStance, &tdSetup,
 			&trendBull, &trendBear, &oversold, &overbought,
@@ -336,12 +340,40 @@ func (e *Engine) appendSignals(signals *[]Signal, s Signal) {
 type tradeOutcome int
 
 const (
-	outcomePending tradeOutcome = iota // 全市场交易日不足 N 天，尚未到期
-	outcomeNoData                      // 信号日后窗口内该标的一条行情也没有，无法定价
-	outcomeStop                        // 盘中触发止损
-	outcomeExpired                     // 持有满 N 个交易日按收盘平仓
-	outcomeDataGap                     // 窗口内行情中断(出池/停牌)，按最后一条收盘平仓
+	outcomePending     tradeOutcome = iota // 全市场交易日不足 N 天，尚未到期
+	outcomeNoData                          // 信号日后窗口内该标的一条行情也没有，无法定价
+	outcomeStop                            // 盘中触发止损
+	outcomeExpired                         // 持有满 N 个交易日按收盘平仓
+	outcomeDataGap                         // 窗口内行情中断(出池/停牌)，按最后一条收盘平仓
+	outcomeLimitLocked                     // 信号日封板(多头涨停/空头跌停)，按收盘价无法成交
 )
+
+// entryBlocked 判断信号日收盘价能否成交：多头遇涨停买不到、空头遇跌停卖不出。
+// 阈值与选股闸门同口径(板块限幅 - 0.5，见 market.PriceLimitPct)，港股无限幅不拦。
+func entryBlocked(sig Signal) bool {
+	limit := market.PriceLimitPct(sig.Code, sig.Name)
+	if limit == market.NoPriceLimit {
+		return false
+	}
+	near := limit - 0.5
+	if sig.Direction == "多头" {
+		return sig.ChangePct >= near
+	}
+	return sig.ChangePct <= -near
+}
+
+// stopFillPrice 返回触发止损当日的成交价。盘中才穿过止损价时按止损价成交；
+// 整日都在止损价外侧(跳空穿越)时实际成交在开盘价，按止损价会低估亏损。
+// snapshot 无 open 列，多头取当日最高价、空头取最低价——它们是开盘价的边界，
+// 结果仍略偏乐观，但比止损价接近真实成交。
+func stopFillPrice(entry, stopPct, low, high float64, long bool) float64 {
+	if long {
+		stop := entry * (1 - stopPct/100)
+		return math.Min(stop, high)
+	}
+	stop := entry * (1 + stopPct/100)
+	return math.Max(stop, low)
+}
 
 func (e *Engine) simulateTrade(sig Signal) (store.BacktestResult, tradeOutcome) {
 	result := store.BacktestResult{
@@ -355,6 +387,9 @@ func (e *Engine) simulateTrade(sig Signal) (store.BacktestResult, tradeOutcome) 
 		RSRankPct:  sig.RSRankPct,
 		SARStance:  sig.SARStance,
 		TDSetup:    sig.TDSetup,
+	}
+	if entryBlocked(sig) {
+		return result, outcomeLimitLocked
 	}
 
 	// 持有窗口按**全市场**交易日计，而非该标的的行数：snapshot 只覆盖热榜池，
@@ -417,15 +452,16 @@ func (e *Engine) simulateTrade(sig Signal) (store.BacktestResult, tradeOutcome) 
 			maxAdverse = adverse
 		}
 
-		// 盘中止损：用日内极值判定（而非收盘），触发则按止损价成交
+		// 盘中止损：用日内极值判定（而非收盘），成交价见 stopFillPrice
 		if e.config.StopLoss > 0 && adverse <= -e.config.StopLoss {
+			long := sig.Direction == "多头"
 			result.ExitDate = date
 			result.HoldingDays = dayCount
-			result.ReturnPct = -e.config.StopLoss
-			if sig.Direction == "多头" {
-				result.ExitPrice = sig.Close * (1 - e.config.StopLoss/100)
+			result.ExitPrice = stopFillPrice(sig.Close, e.config.StopLoss, low, high, long)
+			if long {
+				result.ReturnPct = (result.ExitPrice - sig.Close) / sig.Close * 100
 			} else {
-				result.ExitPrice = sig.Close * (1 + e.config.StopLoss/100)
+				result.ReturnPct = (sig.Close - result.ExitPrice) / sig.Close * 100
 			}
 			result.MaxAdversePct = maxAdverse
 			result.Win = 0

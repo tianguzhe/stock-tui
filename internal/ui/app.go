@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"errors"
 	"fmt"
 	"math"
 	"slices"
@@ -97,6 +98,12 @@ var simpleSysLabels = []string{
 type tickMsg struct{}
 type stocksMsg []api.Stock
 type stocksErrMsg struct{ err error }
+
+// stocksPartialMsg 是部分代码缺失时的行情：拿到的照常刷新，缺失清单作为提示显示。
+type stocksPartialMsg struct {
+	stocks []api.Stock
+	err    error
+}
 type minuteMsg struct {
 	code   string
 	result *api.MinuteResult
@@ -236,6 +243,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		// 刷新选中股票的分时数据
 		return m, m.startSelectedMinuteFetch()
+
+	case stocksPartialMsg:
+		updated, cmd := m.Update(stocksMsg(msg.stocks))
+		next := updated.(Model)
+		next.err = msg.err
+		return next, cmd
 
 	case stocksErrMsg:
 		m.err = msg.err
@@ -1102,6 +1115,10 @@ func tableCell(s string, c tableColumn) string {
 func fetchStocks(codes []string) tea.Cmd {
 	return func() tea.Msg {
 		stocks, err := api.FetchStocks(codes)
+		var inc *api.IncompleteQuotesError
+		if errors.As(err, &inc) {
+			return stocksPartialMsg{stocks: stocks, err: err}
+		}
 		if err != nil {
 			return stocksErrMsg{err}
 		}

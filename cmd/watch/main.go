@@ -16,6 +16,7 @@ package main
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"math"
 	"net/http"
@@ -124,7 +125,10 @@ func run() error {
 		codes[i] = h.Code
 	}
 	stocks, err := api.FetchStocks(codes)
-	if err != nil {
+	var inc *api.IncompleteQuotesError
+	if errors.As(err, &inc) {
+		fmt.Printf("⚠️ %v\n", err)
+	} else if err != nil {
 		return fmt.Errorf("获取实时行情失败: %w", err)
 	}
 
