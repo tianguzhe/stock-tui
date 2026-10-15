@@ -23,6 +23,7 @@
 - `docs/daily-decision.md` — 每日操作决策主文件（账户总览/止损红线/持仓决策矩阵/建仓闸门/执行记录），**纯手动维护、不在任何脚本自动化范围内**；持仓/成本/止损变动时需与 `docs/journal/` 当日 journal.md 同步更新，否则两处口径会不一致
 - `docs/monthly-review/` — 月度对账单（`YYYY-MM.md`，按月归档）
 - `docs/dividend-portfolio.md` — **红利仓**（5 万长期股息仓，独立于短线仓本金）。**刻意不写入 `.holdings`** —— 写进去会被 `stockdb screen` 按短线纪律输出「禁止加仓」等警示，而红利仓下跌时应加仓攒股数，两套规则方向相反。卖出依据只有「每股分红下调」，与 SAR/ST 破位无关
+- `docs/review-2026-10-followup.md` — 2026-10 系统审查后的**数据侧待办**（全库按新 DMI 口径重算、重跑回测、真实热榜池有效性检验）与未处理问题清单；全部完成后删除
 - `docs/reference/` — 技术文档与参考资料（`data-apis.md`/`cyq-data-source-notes.md`/`eastmoney-api-mapping.md` 等）
 
 ### 盘中监控 TUI
