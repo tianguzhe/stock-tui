@@ -98,6 +98,39 @@ func TestCalculateUptrendSignalsPositiveMomentum(t *testing.T) {
 	}
 }
 
+// DMI 采用通达信口径(与 app 一致): PDI/MDI = SUM(DM,14)/SUM(TR,14)×100,
+// ADX = MA(DX,6), ADXR = (ADX + REF(ADX,6))/2。期望值由独立 Python 按同一公式
+// 计算(窗口不足时取已有数据,与项目预热约定一致)。涨跌交替序列才能检验 MA6 与 ADXR。
+func TestDMIMatchesTDXFormula(t *testing.T) {
+	candles := []Candle{
+		{High: 10.25, Low: 9.88, Close: 10.0},
+		{High: 10.69, Low: 10.29, Close: 10.51},
+		{High: 10.9, Low: 10.51, Close: 10.66},
+		{High: 10.6, Low: 10.17, Close: 10.38},
+		{High: 10.09, Low: 9.72, Close: 9.89},
+		{High: 9.86, Low: 9.41, Close: 9.61},
+		{High: 9.94, Low: 9.59, Close: 9.78},
+		{High: 10.53, Low: 10.11, Close: 10.29},
+		{High: 11.01, Low: 10.59, Close: 10.8},
+		{High: 11.15, Low: 10.78, Close: 10.94},
+		{High: 10.89, Low: 10.43, Close: 10.65},
+		{High: 10.34, Low: 10.04, Close: 10.17},
+		{High: 10.14, Low: 9.67, Close: 9.89},
+		{High: 10.25, Low: 9.93, Close: 10.06},
+		{High: 10.81, Low: 10.36, Close: 10.58},
+		{High: 11.31, Low: 10.92, Close: 11.08},
+		{High: 11.41, Low: 11.01, Close: 11.22},
+		{High: 11.17, Low: 10.74, Close: 10.92},
+		{High: 10.61, Low: 10.25, Close: 10.44},
+		{High: 10.41, Low: 9.97, Close: 10.17},
+	}
+	last := Calculate(candles)[len(candles)-1].DMI
+	assertNear(t, "TDX PDI", last.PDI, 33.3768, 1e-4)
+	assertNear(t, "TDX MDI", last.MDI, 28.0313, 1e-4)
+	assertNear(t, "TDX ADX", last.ADX, 8.4534, 1e-4)
+	assertNear(t, "TDX ADXR", last.ADXR, 10.8210, 1e-4)
+}
+
 func TestCalculateSampleValues(t *testing.T) {
 	candles := []Candle{
 		{High: 10.5, Low: 9.8, Close: 10.0},
@@ -117,7 +150,7 @@ func TestCalculateSampleValues(t *testing.T) {
 	assertNear(t, "sample DIF", last.MACD.DIF, 0.5482, 1e-4)
 	assertNear(t, "sample RSI6", last.RSI.RSI6, 80.5201, 1e-4)
 	assertNear(t, "sample WR10", last.WR.WR10, 20.0000, 1e-4)
-	assertNear(t, "sample PDI", last.DMI.PDI, 30.5731, 1e-4)
+	assertNear(t, "sample PDI", last.DMI.PDI, 31.5068, 1e-4)
 	assertNear(t, "sample CMI", last.CMI, 73.3333, 1e-4)
 	assertNear(t, "sample BIAS6", last.BIAS.BIAS6, 2.9536, 1e-4)
 	assertNear(t, "sample CHOP", last.CHOP, 42.5969, 1e-4)

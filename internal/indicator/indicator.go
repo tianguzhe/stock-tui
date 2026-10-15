@@ -266,47 +266,59 @@ func fillWR(candles []Candle, results []Result) {
 }
 
 func fillDMI(candles []Candle, results []Result) {
-	// Wilder DMI (original RMA smoothing): +DM/-DM/TR are smoothed by a
-	// 14-period RMA, ADX = RMA(DX,14), and ADXR averages ADX with its value 14
-	// bars ago. The RMA is recursively seeded from the first bar (SMA(X,N,1)
-	// convention), consistent with the other indicators. The first bar has no
-	// prior candle, so its directional movement is undefined and left zero.
-	const period = 14
-	var trRMA, pdmRMA, mdmRMA, adx float64
-	for i := range candles {
-		if i == 0 {
-			results[i].DMI = DMI{}
-			continue
-		}
+	// 通达信/同花顺 DMI(N=14, M=6), so values match what the user sees in the app:
+	//   PDI = SUM(+DM,14)/SUM(TR,14)×100, MDI likewise
+	//   ADX = MA(DX,6), ADXR = (ADX + REF(ADX,6))/2
+	// Not Wilder's RMA(14) original: on 2026-10 real data (10 stocks × 500 days)
+	// Wilder ADX ran 9.7 points below the app on average and disagreed on the
+	// ADX>25 / >38 gates on 33–35% of days. Thresholds (20/25/35/38) are kept
+	// numerically and now read on the app's scale.
+	//
+	// The first bar has no prior candle, so its DM/TR are undefined and excluded
+	// from every window; shorter-than-N windows use what exists ("every bar
+	// yields a value" warmup, like the other indicators).
+	const n, m = 14, 6
+	tr := make([]float64, len(candles))
+	pdm := make([]float64, len(candles))
+	mdm := make([]float64, len(candles))
+	dx := make([]float64, len(candles))
+	for i := 1; i < len(candles); i++ {
 		upMove := candles[i].High - candles[i-1].High
 		downMove := candles[i-1].Low - candles[i].Low
-		pdm, mdm := 0.0, 0.0
 		if upMove > downMove && upMove > 0 {
-			pdm = upMove
+			pdm[i] = upMove
 		}
 		if downMove > upMove && downMove > 0 {
-			mdm = downMove
+			mdm[i] = downMove
 		}
-		tr := trueRange(candles[i], candles[i-1].Close)
+		tr[i] = trueRange(candles[i], candles[i-1].Close)
 
-		trRMA = wilderRMA(trRMA, tr, period)
-		pdmRMA = wilderRMA(pdmRMA, pdm, period)
-		mdmRMA = wilderRMA(mdmRMA, mdm, period)
-
+		start := max(1, i-n+1)
+		var trSum, pdmSum, mdmSum float64
+		for j := start; j <= i; j++ {
+			trSum += tr[j]
+			pdmSum += pdm[j]
+			mdmSum += mdm[j]
+		}
 		pdi, mdi := 0.0, 0.0
-		if trRMA > 0 {
-			pdi = pdmRMA / trRMA * 100
-			mdi = mdmRMA / trRMA * 100
+		if trSum > 0 {
+			pdi = pdmSum / trSum * 100
+			mdi = mdmSum / trSum * 100
 		}
-		dx := 0.0
 		if pdi+mdi > 0 {
-			dx = math.Abs(pdi-mdi) / (pdi + mdi) * 100
+			dx[i] = math.Abs(pdi-mdi) / (pdi + mdi) * 100
 		}
-		adx = wilderRMA(adx, dx, period)
+
+		adxStart := max(1, i-m+1)
+		adx := 0.0
+		for j := adxStart; j <= i; j++ {
+			adx += dx[j]
+		}
+		adx /= float64(i - adxStart + 1)
 
 		adxr := adx
-		if i >= period {
-			adxr = (adx + results[i-period].DMI.ADX) / 2
+		if i-m >= 1 {
+			adxr = (adx + results[i-m].DMI.ADX) / 2
 		}
 		results[i].DMI = DMI{PDI: pdi, MDI: mdi, ADX: adx, ADXR: adxr}
 	}
