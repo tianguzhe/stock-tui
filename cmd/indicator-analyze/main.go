@@ -69,7 +69,13 @@ func run(args []string) error {
 			return fmt.Errorf("HTTP 获取失败: %w", err)
 		}
 	}
-	snap := printAnalysis(data)
+	// CYC/CYQ 需要把成交额折算到前复权口径(见 api.QfqAmountCandles)。三个日K源的
+	// Amount/Volume 都未复权，故无论走哪条路径都向腾讯取一次不复权收盘价。
+	rawCloses, err := api.FetchProxyRawCloses(httpClient, code, *bars)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warn: 不复权收盘价获取失败(%v)，跳过 CYC/CYQ\n", err)
+	}
+	snap := printAnalysis(data, rawCloses)
 	if *save && snap.TradeDate == "" {
 		fmt.Fprintf(os.Stderr, "warn: %s 无有效K线,跳过落库\n", code)
 		return nil
@@ -121,7 +127,10 @@ func saveSnapshot(data api.KlineData, snap store.Snapshot) error {
 // store.Snapshot to persist under -save. All computation lives in
 // internal/snapshot.Build, shared with cmd/stockdb batch-save — this
 // function is print-only plumbing over the returned Built.
-func printAnalysis(data api.KlineData) store.Snapshot {
+//
+// rawCloses (unadjusted closes by date) restates amount for CYC/CYQ; nil skips
+// both rather than printing unadjusted VWAPs against forward-adjusted prices.
+func printAnalysis(data api.KlineData, rawCloses map[string]float64) store.Snapshot {
 	b := snapshot.Build(data)
 	if b.N == 0 {
 		fmt.Fprintf(os.Stderr, "warn: %s 返回空K线,跳过分析\n", data.Code)
@@ -176,9 +185,42 @@ func printAnalysis(data api.KlineData) store.Snapshot {
 	fmt.Printf("SCORE total=%d delta=%+d dmi=%+d ma=%+d macd=%+d kdjwr=%+d rsi=%+d bias=%+d chopcmi=%+d volume=%+d div=%+d adj=%d perfadj=%+d late=%+d label=%s\n",
 		score.Total, score.Delta, score.DMI, score.MA, score.MACD, score.KdjWr, score.RSI,
 		score.BIAS, score.CHOPCMI, score.Volume, score.Divergence, b.ScoreAdj, b.PerfAdj, b.LatePen, score.Label)
+	printCYQCYC(data, candles, dates, rawCloses)
+	fmt.Printf("当前策略触发: trendBull=%t(%d/4) trendBear=%t(%d/4) oversold=%t(%d/4) overbought=%t(%d/4) breakBull=%t(%d/3) breakBear=%t(%d/3) revertBull=%t(%d/3) revertBear=%t(%d/3) divBull=%t(%d/1,today=%t) divBear=%t(%d/1,today=%t)\n",
+		score.Signals.TrendBull, score.Signals.TrendBullScore, score.Signals.TrendBear, score.Signals.TrendBearScore,
+		score.Signals.Oversold, score.Signals.OversoldScore, score.Signals.Overbought, score.Signals.OverboughtScore,
+		score.Signals.BreakBull, score.Signals.BreakBullScore, score.Signals.BreakBear, score.Signals.BreakBearScore,
+		score.Signals.RevertBull, score.Signals.RevertBullScore, score.Signals.RevertBear, score.Signals.RevertBearScore,
+		div.Bull, div.BullScore, div.BullToday, div.Bear, div.BearScore, div.BearToday) // score /1
+	printDivergence(div, dates, candles, results)
+	printTD(tds[n-1])
+	printRecentExtremes(candles, dates, results)
+	printStreak(candles)
+	limitPct := market.PriceLimitPct(data.Code, data.Name)
+	verdict := evalBullBear(candles, results, tds, obv, div, perfs, volRatio, score.Signals, limitPct)
+	printBullBear(verdict, score, last)
+	printReading(candles, results, tds, obv, score, div, perfs, volRatio, verdict)
+	printPerf(perfs)
+	printRecentRows(candles, dates, results, tds)
+
+	return b.Snap
+}
+
+// printCYQCYC prints the chip-distribution (CYQ) and cost-MA (CYC) lines. Both
+// derive VWAP from Amount/Volume, so they run on amount restated to the
+// forward-adjusted price level; see api.QfqAmountCandles for why.
+func printCYQCYC(data api.KlineData, candles []indicator.Candle, dates []string, rawCloses map[string]float64) {
+	if rawCloses == nil {
+		fmt.Println("CYQ/CYC 跳过: 缺不复权收盘价, 无法把成交额折算到前复权口径(直接算会得到不复权 VWAP)")
+		return
+	}
+	cyqCandles, missing := api.QfqAmountCandles(candles, dates, rawCloses)
+	if missing > 0 {
+		fmt.Printf("SAMPLE_WARN CYQ/CYC 有 %d 日缺不复权价, 这些日子的 VWAP 未复权\n", missing)
+	}
 	// CYQ 筹码指标(换手率数据不足时跳过)
 	if n := len(data.Turnovers); n == len(candles) && n > 0 {
-		cyq := indicator.CalcCYQ(candles, data.Turnovers)
+		cyq := indicator.CalcCYQ(cyqCandles, data.Turnovers)
 		if len(cyq) > 0 {
 			if len(candles) < indicator.MinCYQBars {
 				fmt.Printf("SAMPLE_WARN CYQ 日K根数=%d (<%d), 筹码分布权重偏近期, WINNER/ASR/PRY1 参考价值降低\n",
@@ -208,8 +250,8 @@ func printAnalysis(data api.KlineData) store.Snapshot {
 		}
 	}
 	// CYC 成本均线(筹码面): 成交量加权均价,无需换手率
-	cyc := indicator.CalcCYC(candles)
-	if len(cyc) > 0 {
+	cyc := indicator.CalcCYC(cyqCandles)
+	if n := len(cyc); n > 0 {
 		lastC := cyc[n-1]
 		note := ""
 		if candles[n-1].Amount <= 0 {
@@ -218,24 +260,6 @@ func printAnalysis(data api.KlineData) store.Snapshot {
 		fmt.Printf("CYC CYC5=%.3f  CYC13=%.3f  CYC34=%.3f  CYC∞=%.3f%s\n",
 			lastC.CYC5, lastC.CYC13, lastC.CYC34, lastC.CYCInf, note)
 	}
-	fmt.Printf("当前策略触发: trendBull=%t(%d/4) trendBear=%t(%d/4) oversold=%t(%d/4) overbought=%t(%d/4) breakBull=%t(%d/3) breakBear=%t(%d/3) revertBull=%t(%d/3) revertBear=%t(%d/3) divBull=%t(%d/1,today=%t) divBear=%t(%d/1,today=%t)\n",
-		score.Signals.TrendBull, score.Signals.TrendBullScore, score.Signals.TrendBear, score.Signals.TrendBearScore,
-		score.Signals.Oversold, score.Signals.OversoldScore, score.Signals.Overbought, score.Signals.OverboughtScore,
-		score.Signals.BreakBull, score.Signals.BreakBullScore, score.Signals.BreakBear, score.Signals.BreakBearScore,
-		score.Signals.RevertBull, score.Signals.RevertBullScore, score.Signals.RevertBear, score.Signals.RevertBearScore,
-		div.Bull, div.BullScore, div.BullToday, div.Bear, div.BearScore, div.BearToday) // score /1
-	printDivergence(div, dates, candles, results)
-	printTD(tds[n-1])
-	printRecentExtremes(candles, dates, results)
-	printStreak(candles)
-	limitPct := market.PriceLimitPct(data.Code, data.Name)
-	verdict := evalBullBear(candles, results, tds, obv, div, perfs, volRatio, score.Signals, limitPct)
-	printBullBear(verdict, score, last)
-	printReading(candles, results, tds, obv, score, div, perfs, volRatio, verdict)
-	printPerf(perfs)
-	printRecentRows(candles, dates, results, tds)
-
-	return b.Snap
 }
 
 func printDivergence(d analysis.DivergenceState, dates []string, candles []indicator.Candle, results []indicator.Result) {

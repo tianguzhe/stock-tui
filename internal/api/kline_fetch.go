@@ -76,40 +76,9 @@ func FetchDailyKline(client *http.Client, code string, bars int) (KlineData, err
 // FetchProxyKline 从腾讯 proxy.finance.qq.com newfqkline 拉前复权日K。
 // 字段单位换算见 ParseProxyDailyBars(万元→元、换手%→小数、振幅本地算)。
 func FetchProxyKline(client *http.Client, code string, bars int) (KlineData, error) {
-	c := httpClientOrDefault(client)
-	url := fmt.Sprintf(
-		"https://proxy.finance.qq.com/ifzqgtimg/appstock/app/newfqkline/get?_var=kline_dayqfq&param=%s,day,,,%d,qfq",
-		code, bars,
-	)
-	req, err := newTencentRequest(url)
+	raw, err := fetchProxyQuote(httpClientOrDefault(client), code, bars, "qfq")
 	if err != nil {
 		return KlineData{}, err
-	}
-
-	resp, err := c.Do(req)
-	if err != nil {
-		return KlineData{}, fmt.Errorf("fetch %s: %w", code, err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return KlineData{}, fmt.Errorf("fetch %s: HTTP %s", code, resp.Status)
-	}
-
-	rawBody, err := io.ReadAll(io.LimitReader(resp.Body, 10<<20))
-	if err != nil {
-		return KlineData{}, err
-	}
-
-	body := StripJSONP(rawBody)
-
-	var parsed proxyResponse
-	if err := json.Unmarshal(body, &parsed); err != nil {
-		return KlineData{}, err
-	}
-
-	raw, ok := parsed.Data[code]
-	if !ok {
-		return KlineData{}, fmt.Errorf("no klines for %s", code)
 	}
 
 	rows := raw.Qfqday
@@ -145,6 +114,95 @@ func FetchProxyKline(client *http.Client, code string, bars int) (KlineData, err
 		Turnovers: turnovers, Amplitudes: amplitudes,
 		VolRatioRT: volRatioRT, InsideVol: insideVol, OutsideVol: outsideVol,
 	}, nil
+}
+
+// fetchProxyQuote requests one newfqkline page; fq is "qfq" (forward-adjusted,
+// rows under Qfqday) or "bfq" (unadjusted, rows under Day).
+func fetchProxyQuote(c *http.Client, code string, bars int, fq string) (proxyQuote, error) {
+	url := fmt.Sprintf(
+		"https://proxy.finance.qq.com/ifzqgtimg/appstock/app/newfqkline/get?_var=kline_day%s&param=%s,day,,,%d,%s",
+		fq, code, bars, fq,
+	)
+	req, err := newTencentRequest(url)
+	if err != nil {
+		return proxyQuote{}, err
+	}
+
+	resp, err := c.Do(req)
+	if err != nil {
+		return proxyQuote{}, fmt.Errorf("fetch %s: %w", code, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return proxyQuote{}, fmt.Errorf("fetch %s: HTTP %s", code, resp.Status)
+	}
+
+	rawBody, err := io.ReadAll(io.LimitReader(resp.Body, 10<<20))
+	if err != nil {
+		return proxyQuote{}, err
+	}
+
+	var parsed proxyResponse
+	if err := json.Unmarshal(StripJSONP(rawBody), &parsed); err != nil {
+		return proxyQuote{}, err
+	}
+
+	raw, ok := parsed.Data[code]
+	if !ok {
+		return proxyQuote{}, fmt.Errorf("no klines for %s", code)
+	}
+	return raw, nil
+}
+
+// FetchProxyRawCloses 拉腾讯**不复权**日K收盘价，按日期(YYYY-MM-DD)索引。
+// 用途见 QfqAmountCandles：三个日K源(腾讯/东财/TDX)的前复权都只复权 OHLC，
+// 成交额与成交量仍是原始值，需借不复权收盘价算出每日复权因子。
+func FetchProxyRawCloses(client *http.Client, code string, bars int) (map[string]float64, error) {
+	raw, err := fetchProxyQuote(httpClientOrDefault(client), code, bars, "bfq")
+	if err != nil {
+		return nil, err
+	}
+	return rawClosesFromRows(raw.Day)
+}
+
+func rawClosesFromRows(rows [][]json.RawMessage) (map[string]float64, error) {
+	parsed, err := ParseProxyDailyBars(rows)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]float64, len(parsed))
+	for _, b := range parsed {
+		out[b.Date] = b.Close
+	}
+	return out, nil
+}
+
+// QfqAmountCandles 返回成交额折算为前复权口径的 K 线副本，供 CYC/CYQ 求 VWAP。
+//
+// 为什么需要：三个日K源的前复权都只调整 OHLC，Amount/Volume 仍是原始值，直接
+// 相除得到的是**不复权** VWAP。2026-10 实测 9 只标的有 419~771/801 日 VWAP 落在
+// 前复权 [Low, High] 之外；512480 在 2026-07-03 一拆二后 CYC∞ 因此偏高 82%。
+//
+// 折算口径：Amount × 前复权收盘 / 不复权收盘，Volume 不动。单日 VWAP 由此回到
+// 前复权价位。不折算成交量是因为分红远比拆分常见：分红不改变股数，若按
+// 不复权/前复权 放大成交量，每次分红都会把旧日子的权重抬高(实测招行/格力约 30%)。
+// 代价是跨拆分/送转的多日窗口(CYC34/CYC∞)里，拆分前的日子仍按旧份额加权，权重
+// 偏低；单日 VWAP 不受影响，CYQ 权重来自换手率也不受影响。
+//
+// 缺不复权价的日子保持原值并计入 missing，由调用方提示。输入切片不被修改。
+func QfqAmountCandles(candles []indicator.Candle, dates []string, rawCloses map[string]float64) ([]indicator.Candle, int) {
+	out := make([]indicator.Candle, len(candles))
+	copy(out, candles)
+	missing := 0
+	for i := range out {
+		rc := rawCloses[dates[i]]
+		if rc <= 0 {
+			missing++
+			continue
+		}
+		out[i].Amount = out[i].Amount * out[i].Close / rc
+	}
+	return out, missing
 }
 
 // qt 数组索引。proxy.qq.com 的实时盘口摘要，2026-07-25 用六只标的实测确认

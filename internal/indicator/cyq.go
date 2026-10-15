@@ -21,6 +21,8 @@ import "math"
 //   - 至少 60 根日K(WINNER 显著衰减的窗口),推荐 250+
 //   - 换手率须与 K 线对应日,单位:小数(0.0646 = 6.46%)
 //   - 价格须为前复权(否则除权跳空让成本分布错位)
+//   - Amount 须折算到前复权价位(api.QfqAmountCandles):日K源只复权 OHLC,
+//     原始 Amount/Volume 求出的是不复权 VWAP,会与前复权收盘价错位比较
 
 // MinCYQBars 是 CYQ 有意义的最低日K根数。少于该值时权重集中于近期几日,
 // WINNER/ASR/PRY1 参考价值大幅降低(短样本问题是权重挤在近期,不能单靠

@@ -1,6 +1,8 @@
 package main
 
 import (
+	"io"
+	"os"
 	"strings"
 	"testing"
 
@@ -34,7 +36,7 @@ func TestRunRejectsMalformedCodeBeforeNetwork(t *testing.T) {
 }
 
 func TestPrintAnalysisEmptyCandlesNoPanic(t *testing.T) {
-	snap := printAnalysis(api.KlineData{Code: "sh600000"})
+	snap := printAnalysis(api.KlineData{Code: "sh600000"}, nil)
 	if snap.Code != "sh600000" {
 		t.Fatalf("printAnalysis(empty).Code = %q, want sh600000", snap.Code)
 	}
@@ -655,4 +657,44 @@ func TestEvalSignalsSameSourceNoDoubleVote(t *testing.T) {
 			t.Fatalf("Overbought fired at score=2 — same-source merge must apply symmetrically")
 		}
 	})
+}
+
+func captureStdout(t *testing.T, fn func()) string {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	orig := os.Stdout
+	os.Stdout = w
+	defer func() { os.Stdout = orig }()
+	fn()
+	w.Close()
+	out, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(out)
+}
+
+// 一拆二前的成交额必须折算到前复权价位再求 VWAP，否则 CYC 按不复权价(2 倍)输出。
+func TestPrintCYQCYCRestatesVolumeAndSkipsWithoutRawCloses(t *testing.T) {
+	candles := []indicator.Candle{
+		{High: 0.92, Low: 0.90, Close: 0.91, Volume: 1000, Amount: 1820},
+		{High: 0.95, Low: 0.93, Close: 0.94, Volume: 2000, Amount: 1880},
+	}
+	dates := []string{"2026-07-02", "2026-07-03"}
+	data := api.KlineData{Code: "sh512480", Dates: dates, Candles: candles}
+
+	skipped := captureStdout(t, func() { printCYQCYC(data, candles, dates, nil) })
+	if !strings.Contains(skipped, "CYQ/CYC 跳过") || strings.Contains(skipped, "CYC5=") {
+		t.Fatalf("nil rawCloses must skip CYC/CYQ, got:\n%s", skipped)
+	}
+
+	raw := map[string]float64{"2026-07-02": 1.82, "2026-07-03": 0.94}
+	out := captureStdout(t, func() { printCYQCYC(data, candles, dates, raw) })
+	// (910+1880)/(1000+2000) = 0.930；未折算时为 3700/3000 = 1.233
+	if !strings.Contains(out, "CYC5=0.930") {
+		t.Fatalf("CYC must use restated amount, got:\n%s", out)
+	}
 }

@@ -1,8 +1,11 @@
 package api
 
 import (
+	"encoding/json"
 	"math"
 	"testing"
+
+	"stock-tui/internal/indicator"
 )
 
 func TestCodeToSecid(t *testing.T) {
@@ -123,5 +126,48 @@ func TestAlignEMTurnovers(t *testing.T) {
 	// 空 dates → nil
 	if got := alignEMTurnovers(klines, nil); got != nil {
 		t.Errorf("empty dates should return nil, got %v", got)
+	}
+}
+
+// 512480 于 2026-07-03 一拆二: 拆分前不复权价是前复权的 2 倍。折算后单日 VWAP
+// 必须落回前复权 [Low, High]；成交量保持原值(分红不改变股数)。
+func TestQfqAmountCandlesRestatesVWAP(t *testing.T) {
+	candles := []indicator.Candle{
+		{High: 0.92, Low: 0.90, Close: 0.91, Volume: 1000, Amount: 1820}, // 拆分前: 不复权 1.82
+		{High: 0.95, Low: 0.93, Close: 0.94, Volume: 2000, Amount: 1880}, // 拆分后: 不复权 = 前复权
+		{High: 0.96, Low: 0.94, Close: 0.95, Volume: 500, Amount: 475},   // 缺不复权价
+	}
+	dates := []string{"2026-07-02", "2026-07-03", "2026-07-06"}
+	raw := map[string]float64{"2026-07-02": 1.82, "2026-07-03": 0.94}
+
+	got, missing := QfqAmountCandles(candles, dates, raw)
+	if missing != 1 {
+		t.Fatalf("missing = %d, want 1", missing)
+	}
+	if got[0].Amount != 910 || got[1].Amount != 1880 || got[2].Amount != 475 {
+		t.Fatalf("amounts = %v/%v/%v, want 910/1880/475", got[0].Amount, got[1].Amount, got[2].Amount)
+	}
+	if got[0].Volume != 1000 {
+		t.Fatalf("volume must stay raw, got %v", got[0].Volume)
+	}
+	if vwap := got[0].Amount / got[0].Volume; vwap < got[0].Low || vwap > got[0].High {
+		t.Fatalf("restated VWAP %.3f outside [%.2f, %.2f]", vwap, got[0].Low, got[0].High)
+	}
+	if candles[0].Amount != 1820 {
+		t.Fatal("input candles must not be mutated")
+	}
+}
+
+func TestRawClosesFromRows(t *testing.T) {
+	rows := [][]json.RawMessage{
+		{json.RawMessage(`"2026-07-02"`), json.RawMessage(`"1.80"`), json.RawMessage(`"1.82"`), json.RawMessage(`"1.84"`), json.RawMessage(`"1.79"`), json.RawMessage(`"10"`)},
+		{json.RawMessage(`"2026-07-03"`), json.RawMessage(`"0.93"`), json.RawMessage(`"0.94"`), json.RawMessage(`"0.95"`), json.RawMessage(`"0.93"`), json.RawMessage(`"20"`)},
+	}
+	got, err := rawClosesFromRows(rows)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got["2026-07-02"] != 1.82 || got["2026-07-03"] != 0.94 || len(got) != 2 {
+		t.Fatalf("rawClosesFromRows = %v", got)
 	}
 }

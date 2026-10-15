@@ -28,6 +28,8 @@ type CYCResult struct {
 // 参数:
 //   - candles: 日K序列,需含 Amount(元)/Volume(股数)
 //     Volume=0 时该日跳过(不参与加权,保持与 MA 等长)
+//     ⚠ 价格前复权时 Amount 须先折算到同一价位(api.QfqAmountCandles),
+//     否则 Amount/Volume 是不复权 VWAP,CYC34/CYC∞ 会跨除权日错位
 //
 // 返回:
 //   - 每根日K对应的 CYCResult,前 N 日窗口不满时仍用已有数据计算(无 NaN)
