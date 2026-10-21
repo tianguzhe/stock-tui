@@ -548,6 +548,16 @@ func TestCloseAfterUsesGlobalTradingDayAndRequiresExactCodeSnapshot(t *testing.T
 	if close != 25 || date != "2026-06-05" {
 		t.Fatalf("expected exact fourth global day close=25 date=2026-06-05, got close=%v date=%q", close, date)
 	}
+
+	// CloseWithinWindow falls back to the latest snapshot in (startDate, targetDate]
+	// when the stock dropped out of the hot list on the exact Nth global day.
+	close, date, exact, err := s.CloseWithinWindow("sz000002", "2026-06-01", 3)
+	if err != nil {
+		t.Fatalf("CloseWithinWindow fallback: %v", err)
+	}
+	if close != 23 || date != "2026-06-03" || exact {
+		t.Fatalf("expected fallback close=23 date=2026-06-03 exact=false, got close=%v date=%q exact=%v", close, date, exact)
+	}
 }
 
 // TestDecisionLogLifecycle covers the decision-log round trip: SaveDecision dedup

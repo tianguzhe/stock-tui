@@ -4,7 +4,7 @@
 # 时间：每个交易日收盘后执行（建议 15:30 或之后）
 # ⚠️ 流程顺序不可调整：热榜必须第一步执行
 
-set -e  # 遇到错误立即退出
+set -euo pipefail  # 遇到错误、未定义变量或管道失败立即退出
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -55,16 +55,13 @@ go run ./cmd/stockdb check-data 2>&1 | head -25
 echo "（完整报告：go run ./cmd/stockdb check-data）"
 echo ""
 
-# 6. 生成选股表（如果有持仓）
+# 6. 生成选股表（screen-stocks.sh 原生读取 .holdings）
 echo "=== 6/6 生成选股表 ==="
 if [ -f "$PROJECT_ROOT/.holdings" ]; then
-  HOLDINGS=$(grep -v "^#" "$PROJECT_ROOT/.holdings" | tr "\n" "," | sed "s/,\+/,/g; s/^,//; s/,$//")
-  echo "持仓配置: $HOLDINGS"
-  ./scripts/screen-stocks.sh --holdings "$HOLDINGS"
+  ./scripts/screen-stocks.sh --capital 80000
 else
-  echo "未配置持仓文件 (.holdings)，跳过选股表生成"
-  echo "提示：可创建 .holdings 文件，格式如（代码:成本:手数,1手=100股）："
-  echo "  sh601138:72.825:4,sh600522:50.876:2"
+  echo "未配置持仓文件 (.holdings)，仅生成选股推荐表"
+  ./scripts/screen-stocks.sh --capital 80000
 fi
 echo ""
 

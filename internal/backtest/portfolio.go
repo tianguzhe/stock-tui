@@ -125,6 +125,20 @@ func (e *PortfolioEngine) simulate() (trades []Trade, dailyEquity []float64, cap
 	if err != nil {
 		return nil, nil, 0, err
 	}
+	dayIdx := make(map[string]int, len(tradingDays))
+	for idx, d := range tradingDays {
+		dayIdx[d] = idx
+	}
+
+	// 一次性预加载区间内所有信号并按日期分组，避免按日重复执行 SQL
+	allSignals, err := NewEngine(e.db, e.store, e.config.Config).findSignals()
+	if err != nil {
+		return nil, nil, 0, fmt.Errorf("预加载信号: %w", err)
+	}
+	signalsByDate := make(map[string][]Signal, len(tradingDays))
+	for _, sig := range allSignals {
+		signalsByDate[sig.Date] = append(signalsByDate[sig.Date], sig)
+	}
 
 	fmt.Printf("总交易日: %d 天\n", len(tradingDays))
 
@@ -178,10 +192,7 @@ func (e *PortfolioEngine) simulate() (trades []Trade, dailyEquity []float64, cap
 				return nil, nil, 0, fmt.Errorf("查询 %s@%s 行情: %w", pos.Code, date, err)
 			}
 
-			daysHeld, err := e.countTradingDays(pos.EntryDate, date)
-			if err != nil {
-				return nil, nil, 0, fmt.Errorf("统计 %s 持有天数: %w", pos.Code, err)
-			}
+			daysHeld := i - dayIdx[pos.EntryDate]
 
 			// 退出条件按优先级：盘中止损（看当日最低）> 盘中止盈（看当日最高）> 到期（收盘）。
 			// 持仓为多头，成交价取触发价（止损线，跳空穿越时见 stopFillPrice；止盈线）或到期收盘价。
@@ -211,10 +222,7 @@ func (e *PortfolioEngine) simulate() (trades []Trade, dailyEquity []float64, cap
 		}
 		// 2. 检查新信号（如果有空闲仓位）
 		if len(positions) < e.config.MaxPositions {
-			signals, err := e.getSignals(date)
-			if err != nil {
-				return nil, nil, 0, fmt.Errorf("查询 %s 信号: %w", date, err)
-			}
+			signals := signalsByDate[date]
 
 			for _, sig := range signals {
 				if len(positions) >= e.config.MaxPositions {

@@ -23,8 +23,10 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
+	"stock-tui/internal/analysis"
 	"stock-tui/internal/api"
 	"stock-tui/internal/holdings"
 	"stock-tui/internal/market"
@@ -132,15 +134,26 @@ func run() error {
 		return fmt.Errorf("获取实时行情失败: %w", err)
 	}
 
-	// 4. K线量能分析 (用于量比对比)
+	// 4. K线量能分析 (并发拉取，用于5日量比对比)
 	client := &http.Client{Timeout: 8 * time.Second}
-	klineCache := make(map[string]*klineVolResult)
+	klineCache := make(map[string]*klineVolResult, len(hs))
+	var (
+		klineMu sync.Mutex
+		klineWg sync.WaitGroup
+	)
 	for _, h := range hs {
-		v, err := calcVolume(client, h.Code)
-		if err == nil {
-			klineCache[h.Code] = v
-		}
+		klineWg.Add(1)
+		go func(code string) {
+			defer klineWg.Done()
+			v, err := calcVolume(client, code)
+			if err == nil {
+				klineMu.Lock()
+				klineCache[code] = v
+				klineMu.Unlock()
+			}
+		}(h.Code)
 	}
+	klineWg.Wait()
 
 	// 5. 拉取 SQLite 技术面快照
 	snapCache := make(map[string]*deepSnapshot)
@@ -464,7 +477,7 @@ func printDeepCard(r stockReport) {
 
 	scoreShow := snap.ScoreTotal
 	adjNote := ""
-	if snap.ScoreAdj != 0 && snap.ScoreAdj != snap.ScoreTotal {
+	if snap.ScoreAdj != snap.ScoreTotal {
 		scoreShow = snap.ScoreAdj
 		adjNote = fmt.Sprintf("(adj%d)", snap.ScoreAdj)
 	}
@@ -573,37 +586,29 @@ func calcVolume(client *http.Client, code string) (*klineVolResult, error) {
 		return nil, err
 	}
 	candles := kdata.Candles
-	if len(candles) < 5 {
-		return nil, fmt.Errorf("K线不足5根")
+	if len(candles) < 6 {
+		return nil, fmt.Errorf("K线不足6根")
 	}
 	// candles: [0]=最旧, [len-1]=最新
-	// 用最新20根完整K线(exclude today)
-	n := 20
-	if len(candles) < n+1 {
-		n = len(candles) - 1
-	}
+	// 统一使用前5根完整K线均值计算量比 (与 analysis.VolRatio / CLAUDE.md 口径一致)
 	end := len(candles) - 1
-	start := end - n
-	if start < 0 {
-		start = 0
-	}
-
 	var sumVol float64
-	cnt := 0
-	for i := start; i < end; i++ {
+	for i := end - 5; i < end; i++ {
 		sumVol += candles[i].Volume
-		cnt++
 	}
-	avgVol := sumVol / float64(cnt)
+	avgVol := sumVol / 5.0
 	if avgVol <= 0 {
-		return nil, fmt.Errorf("近%d日均量为0(疑似停牌)", cnt)
+		return nil, fmt.Errorf("近5日均量为0(疑似停牌)")
 	}
 
 	todayVol := candles[end].Volume
 	if todayVol < 1 {
 		return nil, fmt.Errorf("今日量0")
 	}
-	ratio := todayVol / avgVol
+	ratio := analysis.VolRatio(candles, end)
+	if kdata.VolRatioRT > 0 {
+		ratio = kdata.VolRatioRT
+	}
 
 	label := "平量"
 	switch {
@@ -623,13 +628,16 @@ func calcVolume(client *http.Client, code string) (*klineVolResult, error) {
 		todayVol: todayVol,
 		avgVol:   avgVol,
 	}
-	for i := end - 1; i >= 0 && i >= end-6; i-- {
+	for i := end - 1; i >= 0 && i >= end-5; i-- {
 		d := ""
 		if i < len(kdata.Dates) {
 			d = kdata.Dates[i]
 		}
 		v := candles[i].Volume
-		r := v / avgVol
+		r := analysis.VolRatio(candles, i)
+		if r == 0 && avgVol > 0 {
+			r = v / avgVol
+		}
 		res.recent = append(res.recent, struct {
 			date  string
 			vol   float64
@@ -645,7 +653,7 @@ func queryDeepSnapshot(db *sql.DB, code string) (*deepSnapshot, error) {
 	q := `
 	SELECT trade_date, close,
 	       COALESCE(score_total,0), COALESCE(score_delta,0),
-	       COALESCE(score_adj,0), COALESCE(score_label,''),
+	       COALESCE(score_adj, score_total, 0), COALESCE(score_label,''),
 	       COALESCE(kdj_j,0), COALESCE(rsi6,0), COALESCE(wr14,0),
 	       COALESCE(adx,0), COALESCE(cmi,0), COALESCE(chop,0),
 	       COALESCE(macd_dif,0), COALESCE(macd_hist,0),

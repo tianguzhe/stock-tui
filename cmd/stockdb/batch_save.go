@@ -51,6 +51,10 @@ func batchSaveCmd(args []string) error {
 	}
 	fmt.Fprintf(os.Stderr, "batch-save: %d stocks, %d workers\n", len(codes), *workers)
 
+	// 预批量拉取实时行情（基本面：换手率、总市值、市盈率），每批 50 只，
+	// 避免在 worker 内部对每只股票单独发起 1 次 HTTP 请求（~415 次 → ~9 次）。
+	quoteMap := prefetchQuotes(codes, 50)
+
 	// 任务管道 + 结果管道
 	type result struct {
 		code string
@@ -75,7 +79,7 @@ func batchSaveCmd(args []string) error {
 				},
 			}
 			for code := range tasks {
-				err := saveOneStock(st, client, &storeLock, code, *bars)
+				err := saveOneStock(st, client, &storeLock, quoteMap, code, *bars)
 				results <- result{code: code, err: err}
 			}
 		}()
@@ -131,9 +135,34 @@ func allCodes(db *sql.DB) ([]string, error) {
 	return codes, rows.Err()
 }
 
+// prefetchQuotes 分批拉取实时行情，供落库时补充换手率、总市值、PE。
+func prefetchQuotes(codes []string, batchSize int) map[string]api.Stock {
+	out := make(map[string]api.Stock, len(codes))
+	if batchSize <= 0 {
+		batchSize = 50
+	}
+	normCodes := make([]string, 0, len(codes))
+	for _, c := range codes {
+		if ck, ok := market.NormalizeCode(c); ok {
+			normCodes = append(normCodes, ck)
+		}
+	}
+	for i := 0; i < len(normCodes); i += batchSize {
+		end := i + batchSize
+		if end > len(normCodes) {
+			end = len(normCodes)
+		}
+		stocks, _ := api.FetchStocks(normCodes[i:end])
+		for _, s := range stocks {
+			out[s.Code] = s
+		}
+	}
+	return out
+}
+
 // saveOneStock 抓取单只股票日 K + 换手率，计算指标，保存快照。
 // storeLock 串行化 SQLite 写操作（避免 SQLITE_BUSY）。
-func saveOneStock(st *store.Store, client *http.Client, storeLock *sync.Mutex, code string, bars int) error {
+func saveOneStock(st *store.Store, client *http.Client, storeLock *sync.Mutex, quoteMap map[string]api.Stock, code string, bars int) error {
 	ck, ok := market.NormalizeCode(code)
 	if !ok {
 		return fmt.Errorf("invalid code: %s", code)
@@ -149,8 +178,12 @@ func saveOneStock(st *store.Store, client *http.Client, storeLock *sync.Mutex, c
 		return fmt.Errorf("无有效K线,跳过落库")
 	}
 
-	// 补市盈率等基本面
-	if stocks, err := api.FetchStocks([]string{ck}); err == nil && len(stocks) > 0 {
+	// 补市盈率等基本面（优先复用预批量拉取结果，缺失时回退单只拉取）
+	if s, ok := quoteMap[ck]; ok {
+		snap.TurnoverRate = s.TurnoverRate
+		snap.MarketCap = s.MarketCap
+		snap.PE = s.PE
+	} else if stocks, err := api.FetchStocks([]string{ck}); err == nil && len(stocks) > 0 {
 		s := stocks[0]
 		snap.TurnoverRate = s.TurnoverRate
 		snap.MarketCap = s.MarketCap

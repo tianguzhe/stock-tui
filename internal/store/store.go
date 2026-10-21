@@ -244,6 +244,7 @@ CREATE TABLE IF NOT EXISTS snapshot (
   obv_up3 INTEGER,
   PRIMARY KEY (code, trade_date)
 );
+CREATE INDEX IF NOT EXISTS idx_snapshot_trade_date ON snapshot(trade_date);
 CREATE TABLE IF NOT EXISTS metadata (
   key   TEXT PRIMARY KEY,
   value TEXT NOT NULL
@@ -276,8 +277,12 @@ CREATE INDEX IF NOT EXISTS idx_decision_log_pending ON decision_log(outcome_pct)
 	if err := s.dropInstrumentForeignKeys(); err != nil {
 		return err
 	}
-	// Add new columns to existing databases; SQLite does not support IF NOT EXISTS
-	// in ALTER TABLE, so we ignore the "duplicate column name" error.
+	// Add new columns to existing databases; inspect PRAGMA table_info first so
+	// routine opens do not issue 30 failing ALTER TABLE statements.
+	existingCols, err := s.tableColumns("snapshot")
+	if err != nil {
+		return err
+	}
 	for _, col := range []string{
 		"low REAL",
 		"high REAL",
@@ -309,35 +314,63 @@ CREATE INDEX IF NOT EXISTS idx_decision_log_pending ON decision_log(outcome_pct)
 		"low20 REAL",
 		"obv_up3 INTEGER",
 	} {
+		colName := strings.Fields(col)[0]
+		if existingCols[colName] {
+			continue
+		}
 		if _, err := s.db.Exec("ALTER TABLE snapshot ADD COLUMN " + col); err != nil && !isDuplicateColumnErr(err) {
 			return err
 		}
 	}
 	// Add hot_score to instrument table
-	if _, err := s.db.Exec("ALTER TABLE instrument ADD COLUMN hot_score INTEGER NOT NULL DEFAULT 0"); err != nil && !isDuplicateColumnErr(err) {
+	instCols, err := s.tableColumns("instrument")
+	if err != nil {
 		return err
 	}
-
-	// Clear ret values that are all-zero but were written as Go zero-values before
-	// the nDayReturn computation existed. All three being exactly 0 is impossible
-	// for real market data across 20/60/120 days.
-	s.db.Exec(`UPDATE snapshot SET ret20=NULL, ret60=NULL, ret120=NULL
-		WHERE ret20=0 AND ret60=0 AND ret120=0`) //nolint:errcheck
-
-	// Clear rs values ONLY if all three are 0 AND never been set by rs-rank.
-	// Check if rs20/60/120 were just zero-initialized but never computed.
-	// If rs-rank has run, at least one should be non-zero or some should be NULL.
-	// Only clear when they look like stale defaults: all exactly 0.
-	var hasRealRS int
-	s.db.QueryRow(`SELECT COUNT(*) FROM snapshot WHERE rs20 > 0 OR rs20 IS NULL`).Scan(&hasRealRS)
-	if hasRealRS == 0 {
-		// No RS data at all, safe to clear all-zero as stale
-		s.db.Exec(`UPDATE snapshot SET rs20=NULL, rs60=NULL, rs120=NULL
-			WHERE rs20=0 AND rs60=0 AND rs120=0`) //nolint:errcheck
+	if !instCols["hot_score"] {
+		if _, err := s.db.Exec("ALTER TABLE instrument ADD COLUMN hot_score INTEGER NOT NULL DEFAULT 0"); err != nil && !isDuplicateColumnErr(err) {
+			return err
+		}
 	}
-	// If rs-rank has run (hasRealRS > 0), leave rs=0 as-is (valid bottom percentile)
+
+	// One-time cleanup of legacy zero-initialized ret/rs columns (gated by
+	// metadata so every subsequent store.Open avoids a full-table UPDATE scan).
+	var zeroCleaned string
+	_ = s.db.QueryRow(`SELECT value FROM metadata WHERE key = 'legacy_zero_ret_rs_cleaned'`).Scan(&zeroCleaned)
+	if zeroCleaned != "1" {
+		s.db.Exec(`UPDATE snapshot SET ret20=NULL, ret60=NULL, ret120=NULL
+			WHERE ret20=0 AND ret60=0 AND ret120=0`) //nolint:errcheck
+
+		var hasRealRS int
+		s.db.QueryRow(`SELECT COUNT(*) FROM snapshot WHERE rs20 > 0 OR rs20 IS NULL`).Scan(&hasRealRS)
+		if hasRealRS == 0 {
+			s.db.Exec(`UPDATE snapshot SET rs20=NULL, rs60=NULL, rs120=NULL
+				WHERE rs20=0 AND rs60=0 AND rs120=0`) //nolint:errcheck
+		}
+		s.db.Exec(`INSERT INTO metadata (key, value) VALUES ('legacy_zero_ret_rs_cleaned', '1')
+			ON CONFLICT(key) DO UPDATE SET value = '1'`) //nolint:errcheck
+	}
 
 	return nil
+}
+
+func (s *Store) tableColumns(table string) (map[string]bool, error) {
+	rows, err := s.db.Query(`PRAGMA table_info(` + table + `)`)
+	if err != nil {
+		return nil, fmt.Errorf("inspect %s columns: %w", table, err)
+	}
+	defer rows.Close()
+	cols := make(map[string]bool)
+	for rows.Next() {
+		var cid, notnull, pk int
+		var name, ctype string
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			return nil, fmt.Errorf("scan %s column info: %w", table, err)
+		}
+		cols[name] = true
+	}
+	return cols, rows.Err()
 }
 
 // instrumentFKRe matches the inline `REFERENCES instrument(code) ON DELETE CASCADE`
@@ -367,7 +400,9 @@ func (s *Store) dropInstrumentForeignKeys() error {
 		name    string
 		indexes []string
 	}{
-		{name: "snapshot"},
+		{name: "snapshot", indexes: []string{
+			`CREATE INDEX IF NOT EXISTS idx_snapshot_trade_date ON snapshot(trade_date)`,
+		}},
 		{name: "decision_log", indexes: []string{
 			`CREATE INDEX IF NOT EXISTS idx_decision_log_date ON decision_log(log_date)`,
 			`CREATE INDEX IF NOT EXISTS idx_decision_log_pending ON decision_log(outcome_pct) WHERE outcome_pct IS NULL`,
@@ -911,18 +946,31 @@ WHERE trade_date = ?
 
 	// Reuse the trade_date selected above instead of recomputing MAX(trade_date)
 	// per row: the SELECT already pinned each code to its latest snapshot.
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, fmt.Errorf("begin rs rank tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	stmt, err := tx.Prepare(`UPDATE snapshot SET rs20=?, rs60=?, rs120=? WHERE code=? AND trade_date=?`)
+	if err != nil {
+		return 0, fmt.Errorf("prepare rs rank update: %w", err)
+	}
+	defer stmt.Close()
+
 	updated := 0
 	var lastErr error
 	for i, e := range entries {
-		_, err := s.db.Exec(
-			`UPDATE snapshot SET rs20=?, rs60=?, rs120=? WHERE code=? AND trade_date=?`,
-			rank20[i], rank60[i], rank120[i], e.code, e.tradeDate)
+		_, err := stmt.Exec(rank20[i], rank60[i], rank120[i], e.code, e.tradeDate)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "warn: update rs rank failed for %s@%s: %v\n", e.code, e.tradeDate, err)
 			lastErr = err
 		} else {
 			updated++
 		}
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("commit rs rank tx: %w", err)
 	}
 	return updated, lastErr
 }
@@ -1059,6 +1107,46 @@ WHERE code = ? AND trade_date = (SELECT trade_date FROM target)`, startDate, n-1
 		return 0, "", fmt.Errorf("close after %s+%d for %s: %w", startDate, n, code, err)
 	}
 	return close, tradeDate, nil
+}
+
+// CloseWithinWindow returns the latest close price and trade_date for code in
+// (startDate, targetDate], where targetDate is the Nth global trading day after
+// startDate. If fewer than N global trading days have elapsed since startDate,
+// or if code has no snapshot in (startDate, targetDate], it returns 0, "", false.
+// exact is true when the returned tradeDate equals targetDate.
+//
+// This avoids survivor bias in decision_log backfill when a stock drops out of
+// the daily hot list before the 10th trading day.
+func (s *Store) CloseWithinWindow(code, startDate string, n int) (float64, string, bool, error) {
+	if n < 1 {
+		return 0, "", false, fmt.Errorf("CloseWithinWindow: n must be >= 1, got %d", n)
+	}
+	var close float64
+	var tradeDate, targetDate string
+	err := s.db.QueryRow(`
+WITH target AS (
+  SELECT trade_date
+  FROM (
+    SELECT DISTINCT trade_date
+    FROM snapshot
+    WHERE trade_date > ?
+    ORDER BY trade_date ASC
+    LIMIT 1 OFFSET ?
+  )
+)
+SELECT s.close, s.trade_date, t.trade_date
+FROM snapshot s
+JOIN target t ON s.trade_date <= t.trade_date
+WHERE s.code = ? AND s.trade_date > ?
+ORDER BY s.trade_date DESC
+LIMIT 1`, startDate, n-1, code, startDate).Scan(&close, &tradeDate, &targetDate)
+	if err == sql.ErrNoRows {
+		return 0, "", false, nil
+	}
+	if err != nil {
+		return 0, "", false, fmt.Errorf("close within window %s+%d for %s: %w", startDate, n, code, err)
+	}
+	return close, tradeDate, tradeDate == targetDate, nil
 }
 
 // StatsByTier returns aggregated decision statistics grouped by tier.

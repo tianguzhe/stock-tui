@@ -182,7 +182,7 @@ func (e *Engine) findSignals() ([]Signal, error) {
 		SELECT
 			trade_date, code, close, COALESCE(change_pct, 0),
 			COALESCE((SELECT name FROM instrument i WHERE i.code = snapshot.code), ''),
-			COALESCE(score_total, 0), COALESCE(adx, 0), 0 as rs_rank_pct,
+			COALESCE(score_total, 0), COALESCE(adx, 0), COALESCE(rs20, 0) as rs_rank_pct,
 			CASE WHEN sar_long = 1 THEN '多' ELSE '空' END as sar_stance,
 			COALESCE(td_setup, ''),
 			COALESCE(sig_trend_bull, 0), 0 as trendBear,
@@ -198,23 +198,28 @@ func (e *Engine) findSignals() ([]Signal, error) {
 	// 添加筛选条件（列名白名单防注入）
 	allowedFilterCols := map[string]bool{
 		"code": true, "trade_date": true, "close": true,
-		"score_total": true, "adx": true, "sar_long": true,
-		"st_long": true, "obv_up": true, "div_bull": true, "div_bear": true,
+		"score_total": true, "score_adj": true, "adx": true, "sar_long": true,
+		"st_long": true, "supertrend_long": true, "obv_up": true, "obv_up3": true,
+		"div_bull": true, "div_bear": true, "rs20": true, "rs60": true, "rs120": true,
 		"sig_trend_bull": true, "sig_overbought": true, "sig_oversold": true,
 	}
 	for key, val := range e.config.Filters {
 		if !allowedFilterCols[key] {
 			return nil, fmt.Errorf("不允许的筛选列: %q", key)
 		}
+		col := key
+		if col == "st_long" {
+			col = "supertrend_long"
+		}
 		switch v := val.(type) {
 		case string:
-			query += fmt.Sprintf(" AND %s = ?", key)
+			query += fmt.Sprintf(" AND %s = ?", col)
 			args = append(args, v)
 		case float64:
-			query += fmt.Sprintf(" AND %s >= ?", key)
+			query += fmt.Sprintf(" AND %s >= ?", col)
 			args = append(args, v)
 		case int:
-			query += fmt.Sprintf(" AND %s >= ?", key)
+			query += fmt.Sprintf(" AND %s >= ?", col)
 			args = append(args, v)
 		}
 	}

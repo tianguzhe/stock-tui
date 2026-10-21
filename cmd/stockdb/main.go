@@ -262,7 +262,7 @@ func cmdBackfill(_ []string) error {
 
 	updated, skipped := 0, 0
 	for _, d := range pending {
-		close10, date10, err := st.CloseAfter(d.Code, d.LogDate, 10)
+		close10, date10, _, err := st.CloseWithinWindow(d.Code, d.LogDate, 10)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "warn: %s: %v\n", d.Code, err)
 			skipped++

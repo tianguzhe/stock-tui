@@ -186,7 +186,7 @@ func printAnalysis(data api.KlineData, rawCloses map[string]float64) store.Snaps
 		score.Total, score.Delta, score.DMI, score.MA, score.MACD, score.KdjWr, score.RSI,
 		score.BIAS, score.CHOPCMI, score.Volume, score.Divergence, b.ScoreAdj, b.PerfAdj, b.LatePen, score.Label)
 	printCYQCYC(data, candles, dates, rawCloses)
-	fmt.Printf("当前策略触发: trendBull=%t(%d/4) trendBear=%t(%d/4) oversold=%t(%d/4) overbought=%t(%d/4) breakBull=%t(%d/3) breakBear=%t(%d/3) revertBull=%t(%d/3) revertBear=%t(%d/3) divBull=%t(%d/1,today=%t) divBear=%t(%d/1,today=%t)\n",
+	fmt.Printf("当前策略触发: trendBull=%t(%d/3) trendBear=%t(%d/3) oversold=%t(%d/3) overbought=%t(%d/3) breakBull=%t(%d/3) breakBear=%t(%d/3) revertBull=%t(%d/3) revertBear=%t(%d/3) divBull=%t(%d/1,today=%t) divBear=%t(%d/1,today=%t)\n",
 		score.Signals.TrendBull, score.Signals.TrendBullScore, score.Signals.TrendBear, score.Signals.TrendBearScore,
 		score.Signals.Oversold, score.Signals.OversoldScore, score.Signals.Overbought, score.Signals.OverboughtScore,
 		score.Signals.BreakBull, score.Signals.BreakBullScore, score.Signals.BreakBear, score.Signals.BreakBearScore,
@@ -740,13 +740,23 @@ func printReading(candles []indicator.Candle, results []indicator.Result, tds []
 
 	var caveats []string
 	if score.Signals.Overbought {
-		if w, nn := analysis.PerfWin10(perfs, "超买反转"); nn >= 10 && w < 35 {
-			caveats = append(caveats, fmt.Sprintf("超买本股win10=%.0f%%(<35%%),已降权", w))
+		if w, nn := analysis.PerfWin10(perfs, "超买反转"); nn > 0 {
+			lower, upper := analysis.WilsonBounds(w, nn)
+			if upper < 35 {
+				caveats = append(caveats, fmt.Sprintf("超买本股win10=%.0f%%(N=%d,CI上界%.0f%%<35%%),已降权", w, nn, upper))
+			} else if lower > 55 {
+				caveats = append(caveats, fmt.Sprintf("超买本股win10=%.0f%%(N=%d,CI下界%.0f%%>55%%),已升权", w, nn, lower))
+			}
 		}
 	}
-	if div.Bear {
-		if w, nn := analysis.PerfWin10(perfs, "顶背离"); nn >= 10 && w < 40 {
-			caveats = append(caveats, fmt.Sprintf("顶背离本股win10=%.0f%%(<40%%),已降权", w))
+	if div.BearToday {
+		if w, nn := analysis.PerfWin10(perfs, "顶背离"); nn > 0 {
+			lower, upper := analysis.WilsonBounds(w, nn)
+			if upper < 40 {
+				caveats = append(caveats, fmt.Sprintf("顶背离本股win10=%.0f%%(N=%d,CI上界%.0f%%<40%%),已降权", w, nn, upper))
+			} else if lower > 55 {
+				caveats = append(caveats, fmt.Sprintf("顶背离本股win10=%.0f%%(N=%d,CI下界%.0f%%>55%%),已升权", w, nn, lower))
+			}
 		}
 	}
 	caveatText := "无"
