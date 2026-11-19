@@ -65,6 +65,8 @@ func run(args []string) error {
 		return repairVolRatioCmd(rest)
 	case "repair-scores":
 		return repairScoresCmd(rest)
+	case "exright":
+		return cmdExRight(rest)
 	default:
 		return usageErr()
 	}
@@ -78,8 +80,8 @@ func usageErr() error {
   stockdb history <code> [-n 15]
   stockdb rs-rank [--date D]              compute RS20/RS60/RS120 percentile ranks
   stockdb backfill                        backfill decision_log outcomes from snapshots
-  stockdb backtest [options]              run strategy backtest
-  stockdb backtest-portfolio [options]    run portfolio backtest with position management
+  stockdb backtest [options]              run strategy backtest (--price-source snapshot|fuyao)
+  stockdb backtest-portfolio [options]    run portfolio backtest with position management (--price-source snapshot|fuyao)
   stockdb screen [options]                multi-factor stock screening (replaces screen-stocks.py)
   stockdb hot [--top N]                   fetch THS hot list and import into instrument table
   stockdb check-data                      data quality checks (RS coverage, continuity, backfill progress)
@@ -87,6 +89,8 @@ func usageErr() error {
   stockdb backfill-date --date D        backfill snapshots for a missed trading day
   stockdb repair-volratio [--dry-run]   重算历史 snapshot 的 vol_ratio(修 qt[46] 误取市净率)
   stockdb repair-scores [--dry-run]     按完整日K重算历史 snapshot 的全部指标与评分
+  stockdb exright [--days 7] [--from D --to D] [--codes a,b] [--pool]
+                                        除权除息预警与区间应收红利(需 FUYAO_API_KEY)
 `)
 }
 
@@ -315,6 +319,7 @@ func cmdBacktest(args []string) error {
 	holdingDays := fs.Int("days", 10, "持有天数")
 	stopLoss := fs.Float64("stop-loss", 0, "止损百分比（0=不止损）")
 	verbose := fs.Bool("verbose", false, "详细日志")
+	priceSource := fs.String("price-source", "snapshot", "价格来源：snapshot（热榜快照）| fuyao（扶摇连续前复权日K，需 FUYAO_API_KEY）")
 
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -354,7 +359,11 @@ func cmdBacktest(args []string) error {
 		Verbose:     *verbose,
 	}
 
-	engine := backtest.NewEngine(st.DB(), st, config)
+	prices, err := resolvePriceSource(*priceSource, *startDate)
+	if err != nil {
+		return err
+	}
+	engine := backtest.NewEngine(st.DB(), st, config).WithPrices(prices)
 	runID, err := engine.Run()
 	if err != nil {
 		return err
@@ -380,6 +389,7 @@ func cmdBacktestPortfolio(args []string) error {
 	maxPos := fs.Int("max-positions", 5, "最大持仓数")
 	posSize := fs.Float64("position-size", 0.2, "单笔仓位比例（0.2=20%）")
 	verbose := fs.Bool("verbose", false, "详细日志")
+	priceSource := fs.String("price-source", "snapshot", "价格来源：snapshot（热榜快照）| fuyao（扶摇连续前复权日K，需 FUYAO_API_KEY）")
 
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -418,8 +428,11 @@ func cmdBacktestPortfolio(args []string) error {
 		TakeProfit:     *takeProfit,
 	}
 
-	engine := backtest.NewPortfolioEngine(st.DB(), st, config)
-	return engine.Run()
+	prices, err := resolvePriceSource(*priceSource, *startDate)
+	if err != nil {
+		return err
+	}
+	return backtest.NewPortfolioEngine(st.DB(), st, config).WithPrices(prices).Run()
 }
 
 // minHotStocksForImport 是热榜导入的最小样本数。低于它视为接口异常，

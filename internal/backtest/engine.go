@@ -66,6 +66,7 @@ type Engine struct {
 	db     *sql.DB
 	store  *store.Store
 	config Config
+	prices PriceSource // nil = snapshot 口径
 }
 
 // NewEngine 创建回测引擎
@@ -128,6 +129,9 @@ func (e *Engine) Run() (string, error) {
 
 	if len(signals) == 0 {
 		return "", fmt.Errorf("未找到符合条件的信号")
+	}
+	if e.prices != nil {
+		prefetchSignals(e.prices, signals)
 	}
 
 	// 2. 对每个信号计算 T+N 收益
@@ -368,15 +372,21 @@ func entryBlocked(sig Signal) bool {
 }
 
 // stopFillPrice 返回触发止损当日的成交价。盘中才穿过止损价时按止损价成交；
-// 整日都在止损价外侧(跳空穿越)时实际成交在开盘价，按止损价会低估亏损。
-// snapshot 无 open 列，多头取当日最高价、空头取最低价——它们是开盘价的边界，
-// 结果仍略偏乐观，但比止损价接近真实成交。
-func stopFillPrice(entry, stopPct, low, high float64, long bool) float64 {
+// 开盘就已在止损价外侧(跳空穿越)时实际成交在开盘价，按止损价会低估亏损。
+// open > 0 时直接用开盘价判定；open 未知(snapshot 无 open 列)时退回用当日最高价
+// (空头为最低价)作开盘价的边界——结果仍略偏乐观，但比止损价接近真实成交。
+func stopFillPrice(entry, stopPct, open, low, high float64, long bool) float64 {
 	if long {
 		stop := entry * (1 - stopPct/100)
+		if open > 0 {
+			return math.Min(stop, open)
+		}
 		return math.Min(stop, high)
 	}
 	stop := entry * (1 + stopPct/100)
+	if open > 0 {
+		return math.Max(stop, open)
+	}
 	return math.Max(stop, low)
 }
 
@@ -395,6 +405,9 @@ func (e *Engine) simulateTrade(sig Signal) (store.BacktestResult, tradeOutcome) 
 	}
 	if entryBlocked(sig) {
 		return result, outcomeLimitLocked
+	}
+	if e.prices != nil {
+		return e.simulateTradeBars(sig, result)
 	}
 
 	// 持有窗口按**全市场**交易日计，而非该标的的行数：snapshot 只覆盖热榜池，
@@ -462,7 +475,7 @@ func (e *Engine) simulateTrade(sig Signal) (store.BacktestResult, tradeOutcome) 
 			long := sig.Direction == "多头"
 			result.ExitDate = date
 			result.HoldingDays = dayCount
-			result.ExitPrice = stopFillPrice(sig.Close, e.config.StopLoss, low, high, long)
+			result.ExitPrice = stopFillPrice(sig.Close, e.config.StopLoss, 0, low, high, long)
 			if long {
 				result.ReturnPct = (result.ExitPrice - sig.Close) / sig.Close * 100
 			} else {
@@ -505,6 +518,107 @@ func (e *Engine) simulateTrade(sig Signal) (store.BacktestResult, tradeOutcome) 
 		result.Win = 1
 	}
 	return result, outcome
+}
+
+// simulateTradeBars 是 PriceSource 口径的 simulateTrade：入场价、窗口内价格、止损
+// 开盘价全部取自同一条序列。窗口仍按 snapshot 的全市场交易日计（与快照口径同长）。
+// 标的掉出热榜不再截断持有期；只有真正停牌（序列里无该日）才跳过当日。
+func (e *Engine) simulateTradeBars(sig Signal, result store.BacktestResult) (store.BacktestResult, tradeOutcome) {
+	bars, err := e.prices.Bars(sig.Code)
+	if err != nil {
+		return result, outcomeNoData
+	}
+	entryBar, ok := bars[sig.Date]
+	if !ok || entryBar.Close <= 0 {
+		return result, outcomeNoData
+	}
+	entry := entryBar.Close
+	result.EntryPrice = entry
+
+	days, complete, err := e.marketDays(sig.Date)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: 查询交易日失败 %s %s: %v\n", sig.Code, sig.Date, err)
+		return result, outcomeNoData
+	}
+	long := sig.Direction == "多头"
+	dayCount := 0
+	maxAdverse := 0.0
+	var lastDate string
+	var lastClose float64
+	for _, d := range days {
+		b, ok := bars[d]
+		if !ok {
+			continue // 停牌
+		}
+		dayCount++
+		lastDate, lastClose = d, b.Close
+		var adverse float64
+		if long {
+			adverse = (b.Low - entry) / entry * 100
+		} else {
+			adverse = (entry - b.High) / entry * 100
+		}
+		if adverse < maxAdverse {
+			maxAdverse = adverse
+		}
+		if e.config.StopLoss > 0 && adverse <= -e.config.StopLoss {
+			result.ExitDate = d
+			result.HoldingDays = dayCount
+			result.ExitPrice = stopFillPrice(entry, e.config.StopLoss, b.Open, b.Low, b.High, long)
+			if long {
+				result.ReturnPct = (result.ExitPrice - entry) / entry * 100
+			} else {
+				result.ReturnPct = (entry - result.ExitPrice) / entry * 100
+			}
+			result.MaxAdversePct = maxAdverse
+			return result, outcomeStop
+		}
+	}
+	result.HoldingDays = dayCount
+	result.MaxAdversePct = maxAdverse
+	switch {
+	case !complete:
+		return result, outcomePending
+	case dayCount == 0:
+		return result, outcomeNoData
+	}
+	outcome := outcomeExpired
+	if lastDate != days[len(days)-1] {
+		outcome = outcomeDataGap // 窗口末尾停牌
+	}
+	result.ExitDate = lastDate
+	result.ExitPrice = lastClose
+	if long {
+		result.ReturnPct = (lastClose - entry) / entry * 100
+	} else {
+		result.ReturnPct = (entry - lastClose) / entry * 100
+	}
+	if result.ReturnPct > 0 {
+		result.Win = 1
+	}
+	return result, outcome
+}
+
+// marketDays 返回信号日之后的前 HoldingDays 个全市场交易日；不足 N 天时 complete=false。
+func (e *Engine) marketDays(signalDate string) (days []string, complete bool, err error) {
+	rows, err := e.db.Query(`
+		SELECT DISTINCT trade_date FROM snapshot
+		WHERE trade_date > ?
+		ORDER BY trade_date ASC
+		LIMIT ?
+	`, signalDate, e.config.HoldingDays)
+	if err != nil {
+		return nil, false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var d string
+		if err := rows.Scan(&d); err != nil {
+			return nil, false, err
+		}
+		days = append(days, d)
+	}
+	return days, len(days) == e.config.HoldingDays, rows.Err()
 }
 
 // marketWindowEnd 返回信号日之后第 HoldingDays 个全市场交易日；不足 N 天时返回

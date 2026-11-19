@@ -2,11 +2,11 @@
 
 ## 目录结构
 - `cmd/indicator-analyze` — 单标的深度技术面分析 CLI（tdx.go 调用 TDX HTTP 网关，-tdx 标志显式启用）
-- `cmd/stockdb` — 数据库管理（screen/batch-save/rs-rank/backfill/backfill-date/backtest/backtest-portfolio/check-data/repair-volratio/repair-scores/tag/list/history/hot）
+- `cmd/stockdb` — 数据库管理（screen/batch-save/rs-rank/backfill/backfill-date/backtest/backtest-portfolio/check-data/exright/repair-volratio/repair-scores/tag/list/history/hot）
 - `cmd/watch` — 盘中实时监控 TUI（BubbleTea，读 `.holdings` 自动展示持仓行情）
 - `cmd/verify-apis` — 行情接口连通性与字段校验工具
 - `main.go` — TUI 自选股行情入口（`go run .`）
-- `internal/api` — 行情 API（`FetchStocks`/`FetchMinute`/`FetchDailyKline`/`proxy_kline` 解析 + 东财反限流）
+- `internal/api` — 行情 API（`FetchStocks`/`FetchMinute`/`FetchDailyKline`/`proxy_kline` 解析 + 东财反限流；`fuyao.go` 同花顺扶摇客户端：除权事件/交易日历/异动原因/回测日K）
 - `internal/analysis` — 技术面评分/信号/背离/PERF 引擎（cmd 共享，勿在 cmd 内再复制一套）
 - `internal/backtest` — 回测引擎（`engine.go` 单信号回测 + `portfolio.go` 组合回测）
 - `internal/indicator` — 技术指标计算引擎（`Calculate` 核心集 + CYQ 筹码分布 / CYC 成本均线 / TD Sequential 衍生指标）
@@ -57,6 +57,15 @@
 	- TDX HTTP 网关无需 Token 即可调用 PBHQInfo/PBFXT 基础行情接口。
 	- tdx 网关支持港股：setcode=31（`Code` 裸码，不加 `hk` 前缀）。
 	- Proxy 与 TDX 网关交叉验证：OHLC 完全一致(max diff=0.00%)，个股换手率偏差 <0.01%。
+
+### 同花顺扶摇 API（`internal/api/fuyao.go`，2026-11-19 接入）
+- **Key 只读环境变量 `FUYAO_API_KEY`**（`~/.zshrc` 里 export），绝不写进代码/配置/日志/Git；未设置时各功能打印「跳过」而不报错。文档 `github.com/Hithink-Tech-Org/Financial-API`
+- **只做补充，不替换腾讯主链路**：日K 800 根与腾讯逐根一致（偏差 ≤0.23% 来自腾讯前复权价四舍五入到 0.01），但**没有换手率、内外盘、流通股本**，也没有港股
+- 用途：① `stockdb exright` 除权预警 + 区间应收红利 + snapshot 基准断点复核；② `check-data` §7 交易日历全区间完整性；③ CLI `NEWS_EVENT`/`NEWS_ANOMALY` 当日异动原因；④ `backtest --price-source fuyao` 连续日K
+- ⚠️ **前复权是差值法**（前复权价 = 不复权价 − 累计每股分红），**腾讯 proxy 也是**，不是等比：招行 2023-08 价格比等比法低 3.4%，茅台 2015 为负数。10 日窗口可忽略，长窗口/高分红标的的收益率会被高估
+- ⚠️ 个股 `adjust=forward` **按送转调整成交量、不调整成交额**，`Amount/Volume` 不能直接当前复权 VWAP（与 `QfqAmountCandles` 前提不同）
+- ⚠️ **ETF/LOF 必须走基金接口**（A 股接口报 `Unknown thscode`），且**基金接口忽略 `adjust=none`**；复权事件接口不含基金
+- ⚠️ 复权事件接口在区间内无事件时回 `3002 No adjustment events`，是合法空结果；异动解读**只有当日快照**；交易日历只覆盖近一年；历史热榜每日只有前 30 名，**重建不了约 400 只的股票池**
 
 ## 技术指标
 - `indicator.Calculate([]Candle) []Result`(KDJ/MACD/RSI/StochRSI/WR/DMI/CMI/BIAS/CHOP/ATR/BOLL/Donchian/MFI/SAR/Keltner/SuperTrend);`WR` 为正值口径(**值越大越超卖**,与标准威廉符号相反)。`StochRSI` 挂在 `Result.RSI` 旁(`StochRSI.K/D`),在 `fillRSI` 之后填充,用于 RSI6 钝化时重新展开极端区间(CLI `analysis.StochStagnation`、score、PERF 均引用)。
@@ -151,7 +160,7 @@
 - 纯技术指标在此类走势下解释力明显下降——陡峭斜率+历史级放量+区间极值，往往对应业绩/诉讼/股权质押/减持/概念炒作等公告事件，而非常规技术信号（超买超卖、背离等）自发触发
 - 命中任一条件时，技术面结论必须明确建议核实基本面/消息面，并注明可靠性因消息面未知而打折扣，不能替代基本面判断
 - 已验证案例：亨通光电（20/60日区间分位2%，单边深跌）、德明利（20日内跌幅59%+量比13.70）均建议核实基本面；百合花（量比12.90+PRY1=87.5%近年高位）核实后确认为"光刻胶"概念炒作、与业绩（增收不增利）严重背离，且伴随股东/高管密集减持——技术面单独分析会漏掉这类核心驱动因素
-- `cmd/indicator-analyze` 本身不查询基本面/新闻，命中此类信号时需额外用 WebSearch 核实（indicator-analyst agent 仅 Bash+Read 工具，负责标注建议，实际核实由主对话补充）
+- CLI 命中任一条件时打印 `NEWS_EVENT 命中疑似消息面=[...]`；配置了 `FUYAO_API_KEY` 且最新K线是今天时，紧跟一行 `NEWS_ANOMALY tag=… keywords=… | 解读`（扶摇当日异动原因，2026-11-19 实测恒为跌停给出「算力租赁板块下跌、此前5日累计上涨」）。**该行只解释盘面联动，不含公告原文**——业绩/诉讼/减持仍需 WebSearch 核实；`当日无异动解读记录` 不代表没有消息面（indicator-analyst agent 仅 Bash+Read 工具，负责标注建议，实际核实由主对话补充）
 
 **多指标交叉检验极端行情优先级**：
 0. 消息面排查：命中上方"疑似消息面/事件驱动"任一条件时，优先核实基本面/消息面，再展开技术面优先级判断
@@ -199,6 +208,7 @@
 
 ## 月度对账（`docs/monthly-review/YYYY-MM.md`）
 > 时点口径、市值法、多路径交叉验证三条见上「分析输出口径」（通用，不限对账）；此处只列对账专属项。
+- **应收红利用 `go run ./cmd/stockdb exright --from YYYY-MM-01 --to YYYY-MM-末 --codes <红利仓代码>`**：按 `.holdings` 股数 × 每股分红列出区间内除权（2026-08 漏记的大唐 46.50 ＝ 500 × 0.093、08-26 除权即此类）。⚠️ 股数取 `.holdings` **当前值**，区间内有买卖须按除权日前一交易日实际股数重算；红利入账日与除权日可能差一天
 - **期初持仓从 git 历史取，禁止用记忆或反推**：`git log --format='%h %ad %s' --date=short -- .holdings` 找月初提交，`git show <commit>:.holdings` 取内容。记忆文件是时点快照会过期；券商成本更不可用公式倒算（见上「持仓格式」章节）
 - ⚠️ **券商加权口径下「已实现 + 浮动变化」会重复计算**：卖出亏损已摊回剩余持仓成本（实测 8-5 华安 9.465→10.110 即此），再加一次即重复。只有 FIFO 口径可相加
 - 成交价核验：比对当日 `low`/`high`，落区间外即流水记录有误；顺带算日内分位（`(价−low)/(high−low)`）可分离"日内执行质量"与"跨日方向判断"
@@ -283,6 +293,7 @@
   - 检测：`sqlite3 data/stock.db "ATTACH '备份.db' AS old; SELECT COUNT(*) FROM snapshot s JOIN old.snapshot o ON o.code=s.code AND o.trade_date=s.trade_date WHERE s.close != o.close;"` —— 但**只能查出重叠行**，补跑新增行引发的不一致查不到（实测备份对比只发现 6 只，全库重算实际修正了 17 只），故不要依赖检测，直接全量重算
   - **免备份检测**（无需旧库、可覆盖全部行）：`LAG(close) OVER (PARTITION BY code ORDER BY trade_date)` 算出的环比涨幅与 `change_pct` 相减，差值即漂移量。⚠️ **它测的是「基准是否一致」，不是「有没有除权」**——全为 0 只能说明该期间**没有混合基准**，**不能推出无除权**。原因：若 close 是统一基准的前复权序列，除权日的历史价整体下移 D，`(close[i]−close[i−1])/close[i−1]` 与交易所口径的 `change_pct` **恒等**，drift 天然为 0。2026-08-25 曾据此误判「大唐 8 月无除权」，属方法误用
     - ⚠️ **该检测有伪阳性**：snapshot 逐日累积、股票池逐日变动，某只标的中间缺日时 `LAG` 会**跨日取值**，涨幅天然对不上。**须用交易日序号过滤**——`ROW_NUMBER() OVER (ORDER BY trade_date)` 之差为 1 才是相邻交易日。2026-08-27 全库统一后初查 **467 行「漂移」，过滤后真漂移 0 行**
+  - **首选 `go run ./cmd/stockdb exright --pool`**：列出 snapshot 区间内发生除权的标的，并逐个按「除权日 vs 前一相邻交易日」复核漂移，只报真实跳空（2026-11-19 实测：区间内除权 218 只，复核后仍有跳空 7 处，全部在 10-15 全库统一之后，如大洋电机 10-30 序列 −10.99% vs 实际 −10.01%）。下面的手工方法仅在无 Key 时使用
   - **验证有无除权用不复权 vs 前复权对比**（腾讯 proxy，`qfq` 与 `bfq` 各拉一次，比较同日收盘价之差；差额发生跳变的那天即除权日，跳变量 ＝ 每股分红/送转影响）：
     ```bash
     for fq in qfq bfq; do curl -s "https://proxy.finance.qq.com/ifzqgtimg/appstock/app/newfqkline/get?_var=k&param=sh601991,day,,,60,${fq}" | sed 's/^[^=]*=//' > /tmp/tx_$fq.json; done
@@ -303,6 +314,7 @@
 - 命令：`go run ./cmd/stockdb backtest-portfolio [--capital 100000] [--max-positions 5]`（组合回测）
 - 表结构：`backtest_result`（单次信号结果）、`backtest_summary`（汇总统计）
 - 有效结果过滤：`WHERE exit_date IS NOT NULL AND exit_date != ''`（全市场交易日不足 N 天的待结算、或窗口内该标的无任何行情时为空）
+- **`--price-source fuyao`**（2026-11-19 起，两个回测命令都支持；默认 `snapshot` 行为不变）：入场价、持有窗口、止损开盘价全部取自**同一次拉取**的扶摇前复权日K，消除两个快照偏差——① 出池截断：同参数 A/B 实测快照口径 **50% 的交易（16,904/33,941）被提前平仓**，扶摇口径只剩 34 笔真停牌；② 跳空止损按真实开盘价成交。修正后趋势跟随多头 avg10 −3.58% → **−4.45%**、组合总收益 6.25% → **5.00%**、平均亏损 −4.88% → −5.86%（掉榜多为走弱标的，快照口径系统性低估亏损）。预取约 1,950 只需 80 秒；少数已退市代码（如 601198/000016/002731）报 `Unknown thscode`，计为「窗口内无行情」
 - **持有窗口按全市场交易日计**（2026-10 起）：snapshot 只覆盖热榜池，标的掉出热榜后不再有行情。旧实现按标的行数凑 N 天，掉榜标的凑不满就整笔丢弃（单信号）或冻结持仓、按入场价结算且不计入交易（组合）——掉榜多为走弱标的，亏损从统计中消失。现两者都按**最后一条收盘平仓并计入**，单信号回测末尾打印「行情中断」笔数，组合回测退出原因单列「出池平仓」
 - **成交可行性**（2026-10 起，单信号与组合共用 `entryBlocked`/`stopFillPrice`）：信号日封板不入场——多头涨停买不到、空头跌停卖不出，阈值同选股闸门（`market.PriceLimitPct` − 0.5），单信号回测在「未计入」里单列「信号日封板无法成交」；止损日整日在止损价外侧（跳空穿越）时按当日最高价（空头为最低价）成交而非止损价。snapshot 无 `open` 列，最高价只是开盘价的上界，**跳空止损亏损仍略被低估**
 - 组合回测费用：佣金双边（默认万3）+ **卖出印花税 0.05%**（基金/ETF/LOF 按代码段 `sh51/56/58`、`sz15/16` 免征）；单信号回测衡量信号本身，不计费用
@@ -367,9 +379,14 @@ go run ./cmd/stockdb backfill
 go run ./cmd/stockdb check-data
 # ⚠️ **盲区**：RS 覆盖率只查最新日、连续性只看最近 3 个交易日，**查不出更早的空洞**。
 #    2026-07-20 全池缺失就是这样长期未被发现的，最终靠对账单核对时才暴露。
+#    ✅ 配置 FUYAO_API_KEY 后 §7 按官方交易日历查全区间（近一年）：缺失日 / 快照数
+#    < 相邻 6 日中位数 60% 的残缺日 / 非交易日却有快照（06-19 端午不会再被误报）。
 #    排查历史空洞用：
 #    sqlite3 data/stock.db "SELECT trade_date, COUNT(*) FROM snapshot GROUP BY trade_date ORDER BY trade_date;"
 #    快照数远低于相邻日 = 当天 batch-save 部分失败。
+
+# 3.2（可选，需 FUYAO_API_KEY）持仓除权预警：未来 7 日除权 + 本月已除权与应收红利
+go run ./cmd/stockdb exright --codes sh601166,sh600036   # --codes 补上不在 .holdings 的红利仓
 
 # 4. 生成选股表（持仓置顶 + 优质候选，合计≤持仓数+7；--max 可手动指定上限）
 #    自动读取 .holdings 并按手数加权合并多账户重复持仓，无需手工拼参数

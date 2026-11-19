@@ -36,7 +36,7 @@ func TestRunRejectsMalformedCodeBeforeNetwork(t *testing.T) {
 }
 
 func TestPrintAnalysisEmptyCandlesNoPanic(t *testing.T) {
-	snap := printAnalysis(api.KlineData{Code: "sh600000"}, nil)
+	snap, _ := printAnalysis(api.KlineData{Code: "sh600000"}, nil)
 	if snap.Code != "sh600000" {
 		t.Fatalf("printAnalysis(empty).Code = %q, want sh600000", snap.Code)
 	}

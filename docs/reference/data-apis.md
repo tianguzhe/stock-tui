@@ -283,6 +283,21 @@ GET https://datacenter-web.eastmoney.com/api/data/v1/get
 
 ---
 
+## 五、同花顺扶摇 (fuyao.aicubes.cn) — 除权 / 日历 / 异动 / 回测日K
+
+Header `X-api-key: $FUYAO_API_KEY`，成功判据 HTTP 200 且 `code == 0`（信封 `{code,message,request_id,data}`）。客户端 `internal/api/fuyao.go`。
+
+| 用途 | 端点 | 关键参数 | 实测要点（2026-11-19） |
+|---|---|---|---|
+| 除权除息 | `/api/a-share/corporate-actions/adjustment-factors` | `thscode`、`from`/`to`(YYYY-MM-DD) | 按除权日**降序**；区间无事件回 `3002`（空结果）；不含基金 |
+| 交易日历 | `/api/a-share/calendar/trading-days` | `start_date`+`end_date`(**yyyyMMdd**，须成对) | 只覆盖近一年；06-19 端午正确缺席 |
+| 当日异动原因 | `/api/a-share/special-data/anomaly-analysis-stock` | `thscodes`（≤50 个） | 只有当日快照；无异动的标的不返回 |
+| 个股日K | `/api/a-share/prices/historical` | `thscode`、`interval=1d`、`start`/`end`(ms)、`adjust` | 单次 ≤10 年；`forward` 为**差值法**，成交量按送转调整、成交额不调 |
+| 场内基金日K | `/api/fund/market/historical` | 同上 | ETF 必须走这里；**忽略 `adjust=none`** |
+| 全市场导出 | `/api/dump/market-dumps/{daily-k,daily-k-10d,adjustment-factors}/download-url` | — | Parquet，10 年不复权日K（含开盘价）；**无 ETF**；预签名 URL 约 5 分钟失效 |
+
+thscode 映射：`sh600519`→`600519.SH`、`sz000063`→`000063.SZ`、`bj920819`→`920819.BJ`；港股不覆盖。
+
 ## 字段顺序速查(避坑)
 
 把同一根 K 的 OHLC 顺序并排，跨源时照此对应：

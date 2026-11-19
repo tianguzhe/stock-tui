@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"stock-tui/internal/analysis"
@@ -75,7 +76,16 @@ func run(args []string) error {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "warn: 不复权收盘价获取失败(%v)，跳过 CYC/CYQ\n", err)
 	}
-	snap := printAnalysis(data, rawCloses)
+	snap, newsHits := printAnalysis(data, rawCloses)
+	if len(newsHits) > 0 {
+		var fetch anomalyFetcher
+		client, ferr := api.NewFuyaoClient(httpClient)
+		if ferr == nil {
+			fetch = client.AnomalyReasons
+		}
+		today := time.Now().In(time.FixedZone("CST", 8*3600)).Format("2006-01-02")
+		printNewsAnomaly(code, snap.TradeDate, today, newsHits, fetch, ferr)
+	}
 	if *save && snap.TradeDate == "" {
 		fmt.Fprintf(os.Stderr, "warn: %s 无有效K线,跳过落库\n", code)
 		return nil
@@ -130,11 +140,14 @@ func saveSnapshot(data api.KlineData, snap store.Snapshot) error {
 //
 // rawCloses (unadjusted closes by date) restates amount for CYC/CYQ; nil skips
 // both rather than printing unadjusted VWAPs against forward-adjusted prices.
-func printAnalysis(data api.KlineData, rawCloses map[string]float64) store.Snapshot {
+//
+// The second return value lists the 疑似消息面 thresholds the latest bar hits
+// (see newsEventTriggers); the caller decides whether to look up news for them.
+func printAnalysis(data api.KlineData, rawCloses map[string]float64) (store.Snapshot, []string) {
 	b := snapshot.Build(data)
 	if b.N == 0 {
 		fmt.Fprintf(os.Stderr, "warn: %s 返回空K线,跳过分析\n", data.Code)
-		return b.Snap
+		return b.Snap, nil
 	}
 	candles, dates, n := b.Candles, b.Dates, b.N
 	results, tds := b.Results, b.TDs
@@ -203,7 +216,13 @@ func printAnalysis(data api.KlineData, rawCloses map[string]float64) store.Snaps
 	printPerf(perfs)
 	printRecentRows(candles, dates, results, tds)
 
-	return b.Snap
+	hits := newsEventTriggers(b.ChangePct, volRatio,
+		analysis.Position(lastCandle.Close, b.Low20, b.High20),
+		analysis.Position(lastCandle.Close, b.Low60, b.High60))
+	if len(hits) > 0 {
+		fmt.Printf("NEWS_EVENT 命中疑似消息面=[%s] → 技术面结论可靠性打折，须核实基本面/消息面\n", strings.Join(hits, ","))
+	}
+	return b.Snap, hits
 }
 
 // printCYQCYC prints the chip-distribution (CYQ) and cost-MA (CYC) lines. Both

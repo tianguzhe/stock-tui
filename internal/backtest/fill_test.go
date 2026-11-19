@@ -39,10 +39,10 @@ func TestSimulateTradeShortGapThroughStopFillsAtLow(t *testing.T) {
 
 // 盘中才穿过止损价(最高价 ≥ 止损价)：仍按止损价成交。
 func TestStopFillPriceIntradayTouchUsesStopPrice(t *testing.T) {
-	if got := stopFillPrice(100, 5, 94, 99, true); !near(got, 95) {
+	if got := stopFillPrice(100, 5, 0, 94, 99, true); !near(got, 95) {
 		t.Errorf("long intraday touch fill = %v, want 95", got)
 	}
-	if got := stopFillPrice(100, 5, 101, 106, false); !near(got, 105) {
+	if got := stopFillPrice(100, 5, 0, 101, 106, false); !near(got, 105) {
 		t.Errorf("short intraday touch fill = %v, want 105", got)
 	}
 }

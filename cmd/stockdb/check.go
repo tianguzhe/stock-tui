@@ -1,8 +1,11 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
+
+	"stock-tui/internal/api"
 )
 
 // cmdCheckData runs data quality checks on the snapshot database.
@@ -208,6 +211,19 @@ func cmdCheckData(args []string) error {
 		}
 		fmt.Printf("\n✅ 热榜池总数: %d 只\n", totalStocks)
 		fmt.Println()
+	}
+
+	// 7. Full-range completeness against the official trading calendar.
+	// Sections 2 only looks at the latest 3 days, which is how the 2026-07-20
+	// whole-pool gap went unnoticed for weeks; and without a calendar a holiday
+	// (06-19 端午) is indistinguishable from a missed day.
+	fmt.Println("## 7. 交易日历完整性（全区间，扶摇交易日历）")
+	if err := checkCalendar(st.DB()); err != nil {
+		if errors.Is(err, api.ErrNoFuyaoKey) {
+			fmt.Printf("ℹ️  跳过：%v\n\n", err)
+		} else {
+			fmt.Printf("❌ 检查失败: %v\n\n", err)
+		}
 	}
 
 	fmt.Println("=== 检查完成 ===")

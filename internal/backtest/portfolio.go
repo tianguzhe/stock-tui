@@ -54,6 +54,7 @@ type PortfolioEngine struct {
 	db     *sql.DB
 	store  *store.Store
 	config PortfolioConfig
+	prices PriceSource // nil = snapshot 口径
 }
 
 // NewPortfolioEngine 创建组合回测引擎
@@ -135,6 +136,9 @@ func (e *PortfolioEngine) simulate() (trades []Trade, dailyEquity []float64, cap
 	if err != nil {
 		return nil, nil, 0, fmt.Errorf("预加载信号: %w", err)
 	}
+	if e.prices != nil {
+		prefetchSignals(e.prices, allSignals)
+	}
 	signalsByDate := make(map[string][]Signal, len(tradingDays))
 	for _, sig := range allSignals {
 		signalsByDate[sig.Date] = append(signalsByDate[sig.Date], sig)
@@ -169,7 +173,8 @@ func (e *PortfolioEngine) simulate() (trades []Trade, dailyEquity []float64, cap
 		// 1. 检查现有持仓（止损/止盈/到期）
 		for j := len(positions) - 1; j >= 0; j-- {
 			pos := positions[j]
-			closePrice, low, high, err := e.getPriceRange(pos.Code, date)
+			bar, err := e.bar(pos.Code, date)
+			closePrice, low, high := bar.Close, bar.Low, bar.High
 			if errors.Is(err, sql.ErrNoRows) {
 				// 当日无行情：之后再无行情 = 已掉出热榜，按最后一条收盘平仓；
 				// 之后还有行情 = 停牌/暂时出池，继续持有。
@@ -204,7 +209,7 @@ func (e *PortfolioEngine) simulate() (trades []Trade, dailyEquity []float64, cap
 			case e.config.StopLoss > 0 && (low-pos.EntryPrice)/pos.EntryPrice*100 <= -e.config.StopLoss:
 				shouldExit = true
 				exitReason = "止损"
-				exitPrice = stopFillPrice(pos.EntryPrice, e.config.StopLoss, low, high, true)
+				exitPrice = stopFillPrice(pos.EntryPrice, e.config.StopLoss, bar.Open, low, high, true)
 			case e.config.TakeProfit > 0 && (high-pos.EntryPrice)/pos.EntryPrice*100 >= e.config.TakeProfit:
 				shouldExit = true
 				exitReason = "止盈"
@@ -251,12 +256,23 @@ func (e *PortfolioEngine) simulate() (trades []Trade, dailyEquity []float64, cap
 					continue
 				}
 
+				// 入场价必须与后续估值同一条序列：PriceSource 口径下不能用 snapshot.close，
+				// 否则入场与出场分属两套前复权基准。
+				entryPrice := sig.Close
+				if e.prices != nil {
+					b, err := e.bar(sig.Code, date)
+					if err != nil || b.Close <= 0 {
+						continue
+					}
+					entryPrice = b.Close
+				}
+
 				// 计算买入股数
 				positionValue := capital * e.config.PositionSize
-				shares := int(positionValue/sig.Close/100) * 100 // 向下取整到100股
+				shares := int(positionValue/entryPrice/100) * 100 // 向下取整到100股
 
 				if shares >= 100 {
-					cost := float64(shares)*sig.Close + float64(shares)*sig.Close*e.config.Commission
+					cost := float64(shares)*entryPrice + float64(shares)*entryPrice*e.config.Commission
 
 					if capital >= cost {
 						// 开仓
@@ -266,7 +282,7 @@ func (e *PortfolioEngine) simulate() (trades []Trade, dailyEquity []float64, cap
 							EntryDate:  date,
 							Code:       sig.Code,
 							SignalType: sig.SignalType,
-							EntryPrice: sig.Close,
+							EntryPrice: entryPrice,
 							Shares:     shares,
 							Cost:       cost,
 						})
@@ -319,8 +335,16 @@ func isFund(code string) bool {
 	return false
 }
 
-// hasRowAfter 判断标的在 date 之后是否还有快照(用于区分停牌与掉出热榜)。
+// hasRowAfter 判断标的在 date 之后是否还有行情(用于区分停牌与掉出热榜)。
+// PriceSource 口径只看回测区间内：区间之后才复牌的仍按「之后再无行情」处理。
 func (e *PortfolioEngine) hasRowAfter(code, date string) (bool, error) {
+	if e.prices != nil {
+		bars, err := e.prices.Bars(code)
+		if err != nil {
+			return false, err
+		}
+		return hasBarIn(bars, date, e.config.EndDate), nil
+	}
 	var n int
 	err := e.db.QueryRow(`SELECT COUNT(*) FROM snapshot WHERE code = ? AND trade_date > ?`, code, date).Scan(&n)
 	return n > 0, err
@@ -329,6 +353,17 @@ func (e *PortfolioEngine) hasRowAfter(code, date string) (bool, error) {
 // lastClose 返回标的在 date(含)之前最后一条快照的日期与收盘价。持仓标的至少
 // 有建仓日那一行，故正常情况下不会 ErrNoRows。
 func (e *PortfolioEngine) lastClose(code, date string) (string, float64, error) {
+	if e.prices != nil {
+		bars, err := e.prices.Bars(code)
+		if err != nil {
+			return "", 0, fmt.Errorf("查询 %s 截至 %s 的最后收盘价: %w", code, date, err)
+		}
+		d, c, ok := lastBarOnOrBefore(bars, date)
+		if !ok {
+			return "", 0, fmt.Errorf("查询 %s 截至 %s 的最后收盘价: %w", code, date, sql.ErrNoRows)
+		}
+		return d, c, nil
+	}
 	var d string
 	var c float64
 	err := e.db.QueryRow(`
@@ -388,10 +423,28 @@ func (e *PortfolioEngine) getPriceRange(code, date string) (close, low, high flo
 	return close, low, high, err
 }
 
-// getPrice 获取指定日期的收盘价（用于建仓与逐日权益估值）。
+// getPrice 获取指定日期的收盘价（打印未平仓持仓用）。
 func (e *PortfolioEngine) getPrice(code, date string) (float64, error) {
-	close, _, _, err := e.getPriceRange(code, date)
-	return close, err
+	b, err := e.bar(code, date)
+	return b.Close, err
+}
+
+// bar 返回 code 在 date 的K线；当日无行情时返回 sql.ErrNoRows（两种口径一致，
+// 调用方据此区分停牌与出池）。snapshot 口径 Open 为 0（无 open 列）。
+func (e *PortfolioEngine) bar(code, date string) (Bar, error) {
+	if e.prices == nil {
+		c, l, h, err := e.getPriceRange(code, date)
+		return Bar{Close: c, Low: l, High: h}, err
+	}
+	bars, err := e.prices.Bars(code)
+	if err != nil {
+		return Bar{}, fmt.Errorf("%s 价格序列: %w", code, err)
+	}
+	b, ok := bars[date]
+	if !ok {
+		return Bar{}, sql.ErrNoRows
+	}
+	return b, nil
 }
 
 // countTradingDays 计算两个日期之间的交易日数
