@@ -3,7 +3,11 @@ package screener
 import (
 	"database/sql"
 	"math"
+	"path/filepath"
+	"strings"
 	"testing"
+
+	_ "modernc.org/sqlite"
 )
 
 // baseCandidate returns a candidate that passes all filters (⭐⭐⭐).
@@ -744,42 +748,33 @@ func TestTDFunctions(t *testing.T) {
 	})
 }
 
-// TestAddOnBlocked covers the add-on gate's score path: an unrealized loss with
-// both stances bearish and the score below AddOnMinScore. The deep-loss path is
-// covered separately by TestAddOnDeepLossOverride.
+// TestAddOnBlocked covers the blanket no-averaging-down rule: any unrealized
+// loss bars an add-on, whatever the trend stance or score.
 func TestAddOnBlocked(t *testing.T) {
-	// blocked returns a candidate that trips the score path. The 15% loss sits
-	// clear of AddOnDeepLossPct so these cases exercise the score floor alone.
-	blocked := func() Candidate {
-		c := baseCandidate()
-		c.Close = 8.5
-		c.SARLong = false
-		c.SuperTrendLong = false
-		c.ScoreTotal = 33
-		return c
-	}
 	const cost = 10.0
-
 	tests := []struct {
 		name string
 		mod  func(*Candidate)
 		cost float64
 		want bool
 	}{
-		{"loss + double bearish + low score - blocked", func(c *Candidate) {}, cost, true},
+		{"shallow loss, trend and score healthy - blocked", func(c *Candidate) {
+			c.Close = 9.9
+			c.SARLong, c.SuperTrendLong, c.ScoreTotal = true, true, 80
+		}, cost, true},
+		{"deep loss double bearish - blocked", func(c *Candidate) {
+			c.Close = 6.9
+			c.SARLong, c.SuperTrendLong, c.ScoreTotal = false, false, 20
+		}, cost, true},
 		{"unrealized profit - allowed", func(c *Candidate) { c.Close = 12.0 }, cost, false},
 		{"break-even is not a loss - allowed", func(c *Candidate) { c.Close = cost }, cost, false},
-		{"SAR still long - allowed", func(c *Candidate) { c.SARLong = true }, cost, false},
-		{"SuperTrend still long - allowed", func(c *Candidate) { c.SuperTrendLong = true }, cost, false},
-		{"score at threshold - allowed", func(c *Candidate) { c.ScoreTotal = AddOnMinScore }, cost, false},
-		{"score just below threshold - blocked", func(c *Candidate) { c.ScoreTotal = AddOnMinScore - 1 }, cost, true},
-		{"no cost means not a holding - allowed", func(c *Candidate) {}, 0, false},
-		{"negative cost - allowed", func(c *Candidate) {}, -1, false},
+		{"no cost means not a holding - allowed", func(c *Candidate) { c.Close = 8.0 }, 0, false},
+		{"negative cost - allowed", func(c *Candidate) { c.Close = 8.0 }, -1, false},
 		{"no close price - allowed", func(c *Candidate) { c.Close = 0 }, cost, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			c := blocked()
+			c := baseCandidate()
 			tt.mod(&c)
 			got, reason := AddOnBlocked(&c, tt.cost)
 			if got != tt.want {
@@ -795,10 +790,10 @@ func TestAddOnBlocked(t *testing.T) {
 	}
 }
 
-// TestAddOnBlockedHistoricalCases replays real add-on events from the 2026-06~08
-// trade log. The seven blocked cases are the deepest averaging-down trades on
-// record; the allowed ones are pullback add-ons with the trend or score intact
-// and must not be caught.
+// TestAddOnBlockedHistoricalCases replays real add-on events. Under the old
+// trend/score gate the three "trend intact" or "score healthy" cases passed; the
+// 2026-06~11 replay showed averaging down as a whole cost −11,145, so every
+// loss-making add-on is now barred and only adding into a winner passes.
 func TestAddOnBlockedHistoricalCases(t *testing.T) {
 	tests := []struct {
 		name            string
@@ -807,18 +802,13 @@ func TestAddOnBlockedHistoricalCases(t *testing.T) {
 		sarLong, stLong bool
 		want            bool
 	}{
-		// Blocked: averaging down with trend broken and score collapsed.
 		{"06-25 泛微网络 -21.8%", 10.0, 7.82, 33, false, false, true},
-		{"07-23 半导体ETF -18.1%", 1.371, 1.123, 44, false, false, true},
 		{"07-30 华天科技 -17.0%", 20.0, 16.60, 31, false, false, true},
-		{"07-29 工业富联 -7.2%", 50.0, 46.40, 23, false, false, true},
-		// Allowed: score still healthy despite the double-bearish stance.
-		{"07-13 华安证券 -9.3% score57", 10.0, 9.07, 57, false, false, false},
-		// Allowed: trend intact.
-		{"07-07 创新药ETF -7.4% 双多", 0.766, 0.709, 69, true, true, false},
-		{"08-11 中天科技 -5.8% SAR多", 34.0, 32.03, 49, true, false, false},
-		// Allowed: adding into a winner.
-		{"06-22 中天科技 +16.7%", 10.0, 11.67, 69, true, true, false},
+		{"07-13 华安证券 -9.3% score57", 10.0, 9.07, 57, false, false, true},
+		{"07-07 创新药ETF -7.4% 双多", 0.766, 0.709, 69, true, true, true},
+		{"08-11 中天科技 -5.8% SAR多", 34.0, 32.03, 49, true, false, true},
+		{"11-16 工业富联 -27.6%", 51.448, 37.25, 29, false, false, true},
+		{"06-22 中天科技 +16.7% adding into a winner", 10.0, 11.67, 69, true, true, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -835,43 +825,88 @@ func TestAddOnBlockedHistoricalCases(t *testing.T) {
 	}
 }
 
-// TestAddOnDeepLossOverride covers the deep-loss backstop: past
-// AddOnDeepLossPct the score floor is waived, but the trend exemption still
-// applies — a position that deep underwater with either stance long is a
-// post-reversal refill, not averaging down.
-func TestAddOnDeepLossOverride(t *testing.T) {
+// TestExitRules covers the two data-backed exit rules for held positions: the
+// LossCapPct hard loss cap and the TimeStopDays time stop.
+func TestExitRules(t *testing.T) {
 	const cost = 10.0
 	tests := []struct {
-		name            string
-		close           float64
-		score           int
-		sarLong, stLong bool
-		want            bool
+		name     string
+		close    float64
+		cost     float64
+		heldDays int
+		wantLoss bool
+		wantTime bool
 	}{
-		// Deep loss waives the score floor.
-		{"loss 21% healthy score - blocked by backstop", 7.9, 80, false, false, true},
-		{"loss 31% healthy score - blocked by backstop", 6.9, 59, false, false, true},
-		// Exactly at the threshold is not past it; falls back to the score floor.
-		{"loss exactly 20% healthy score - allowed", 8.0, 80, false, false, false},
-		{"loss exactly 20% low score - blocked by score floor", 8.0, 33, false, false, true},
-		// Trend exemption survives the backstop.
-		{"loss 31% but SAR long - allowed", 6.9, 80, true, false, false},
-		{"loss 31% but SuperTrend long - allowed", 6.9, 33, false, true, false},
+		{"loss exactly at cap - triggers", 9.2, cost, 1, true, false},
+		{"loss just inside cap - no loss trigger", 9.21, cost, 1, false, false},
+		{"deep loss held long - both trigger", 7.0, cost, 30, true, true},
+		{"small loss held exactly TimeStopDays - time stop", 9.9, cost, TimeStopDays, false, true},
+		{"small loss held one day short - nothing", 9.9, cost, TimeStopDays - 1, false, false},
+		{"break-even held long counts as not profitable", cost, cost, TimeStopDays, false, true},
+		{"profit held long - nothing", 10.5, cost, 40, false, false},
+		{"candidate row without cost - nothing", 5.0, 0, 40, false, false},
+		{"no close price - nothing", 0, cost, 40, false, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			c := baseCandidate()
 			c.Close = tt.close
-			c.ScoreTotal = tt.score
-			c.SARLong = tt.sarLong
-			c.SuperTrendLong = tt.stLong
-			got, reason := AddOnBlocked(&c, cost)
-			if got != tt.want {
-				t.Errorf("AddOnBlocked() = %v, want %v (reason %q)", got, tt.want, reason)
+			got := ExitRules(&c, tt.cost, tt.heldDays)
+			var hasLoss, hasTime bool
+			for _, r := range got {
+				hasLoss = hasLoss || strings.Contains(r, "亏损上限")
+				hasTime = hasTime || strings.Contains(r, "未盈利")
 			}
-			if got && reason == "" {
-				t.Error("AddOnBlocked() blocked but gave no reason")
+			if hasLoss != tt.wantLoss || hasTime != tt.wantTime {
+				t.Errorf("ExitRules() = %q, want loss=%v time=%v", got, tt.wantLoss, tt.wantTime)
 			}
 		})
+	}
+}
+
+// TestHoldingDays checks the time-stop clock: an unbroken run of holdings-tier
+// rows in decision_log, counted in snapshot trading days.
+func TestHoldingDays(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "t.db")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	mustExec := func(q string, args ...any) {
+		t.Helper()
+		if _, err := db.Exec(q, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mustExec(`CREATE TABLE snapshot (code TEXT, trade_date TEXT)`)
+	mustExec(`CREATE TABLE decision_log (code TEXT, log_date TEXT, tier TEXT)`)
+	// Trading days 11-02..11-13 (10 days). The screen skipped 11-04 and 11-10.
+	days := []string{"2026-11-02", "2026-11-03", "2026-11-04", "2026-11-05", "2026-11-06",
+		"2026-11-09", "2026-11-10", "2026-11-11", "2026-11-12", "2026-11-13"}
+	for _, d := range days {
+		mustExec(`INSERT INTO snapshot VALUES ('sh000001', ?)`, d)
+	}
+	screenDays := []string{"2026-11-02", "2026-11-03", "2026-11-05", "2026-11-06", "2026-11-09",
+		"2026-11-11", "2026-11-12", "2026-11-13"}
+	for _, d := range screenDays {
+		mustExec(`INSERT INTO decision_log VALUES ('sh600001', ?, '持仓')`, d) // held throughout
+		if d >= "2026-11-06" {
+			mustExec(`INSERT INTO decision_log VALUES ('sh600002', ?, '持仓')`, d) // opened 11-06
+		}
+		if d != "2026-11-09" {
+			mustExec(`INSERT INTO decision_log VALUES ('sh600003', ?, '持仓')`, d) // gap on 11-09: run restarts 11-11
+		}
+		mustExec(`INSERT INTO decision_log VALUES ('sh600004', ?, '⭐⭐')`, d) // candidate only, never held
+	}
+	got, err := HoldingDays(dbPath, []string{"sh600001", "sh600002", "sh600003", "sh600004"}, "2026-11-13")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]int{"sh600001": 9, "sh600002": 5, "sh600003": 2, "sh600004": 0}
+	for code, w := range want {
+		if got[code] != w {
+			t.Errorf("HoldingDays[%s] = %d, want %d", code, got[code], w)
+		}
 	}
 }

@@ -439,54 +439,130 @@ func PositionHint(c *Candidate, capital float64) string {
 	return fmt.Sprintf("建议≤%d股", shares)
 }
 
-// AddOnMinScore is the score floor below which an add-on is barred once the
-// trend has already broken. Set at 50 from the 2026-06~08 add-on audit: every
-// blocked event scored 23–44, while the loss-making add-ons that stayed worth
-// making (华安证券 −9.3%) scored 57.
-const AddOnMinScore = 50
-
-// AddOnDeepLossPct is the unrealized-loss depth past which the score floor is
-// waived. The score floor alone leaves a tail open: a position can sit 30%+
-// underwater with a broken trend and still clear the gate on score alone, which
-// is precisely the hole averaging-down falls through. The trend exemption is
-// deliberately NOT waived — that deep underwater with SAR or SuperTrend back
-// long is a post-reversal refill, not averaging down.
-const AddOnDeepLossPct = 20.0
-
 // AddOnBlocked reports whether adding to an existing position is barred, and why.
 //
-// Averaging down into a broken trend is the costliest habit in the trade log:
-// 15 of 22 add-ons went in at a loss (mean −9.5%, worst −21.8%), and the money
-// went in hardest exactly when the system was screaming — score 23–44 with SAR
-// and SuperTrend both bearish.
+// Any unrealized loss bars the add-on, whatever the trend stance or score. The
+// earlier gate (loss + SAR/ST both bearish + low score or >20% loss) still let
+// "pullback" add-ons through; the full 2026-06~11 trade log showed those were
+// the habit, not the exception: 48 of 93 buys (44% of buy money) went in below
+// average cost, median −5.0% underwater, and those lots total −11,145 realized
+// plus marked-to-market. October–November had 10 buys and all 10 were
+// averaging down. Caveat kept for honesty: in the June–July half of the sample
+// skipping the add-ons would have been −441 worse, so the rule is a discipline
+// choice backed by the full sample, not a universally positive edge.
 //
-// The gate needs an unrealized loss and both stances bearish. Past that, either
-// a score below AddOnMinScore or a loss deeper than AddOnDeepLossPct bars the
-// add-on. So a pullback add-on with the trend intact, or a shallow loss with the
-// score still healthy, passes untouched. Replayed over the audit window this
-// catches 7 of 21 add-ons — the six deepest averaging-down trades among them —
-// with no false positives.
-//
-// cost is the holder's average cost. A non-positive cost means the row is not a
-// held position (a candidate row), so the gate does not apply.
+// Adding into a winner (close at or above cost) is not averaging down and passes.
+// cost is the holder's average cost; a non-positive cost means the row is a
+// candidate, not a holding, so the gate does not apply.
 func AddOnBlocked(c *Candidate, cost float64) (blocked bool, reason string) {
+	if cost <= 0 || c.Close <= 0 || c.Close >= cost {
+		return false, ""
+	}
+	return true, fmt.Sprintf("🚫禁止加仓(浮亏%.1f%%)", (1-c.Close/cost)*100)
+}
+
+// LossCapPct is the hard loss cap on a held position, in percent below average
+// cost. Chosen from a counterfactual replay of every FIFO lot in the 2026-06~11
+// ledger exiting at the first close past the cap: −8% improves the outcome in
+// both halves of the sample (06–07 +3,503, 08–11 +11,750) and cut only 3 of the
+// 44 eventually-profitable lots — winners in this log almost never went 8%
+// underwater first. 86% of realized losses came from lots closed past −10%.
+const LossCapPct = 8.0
+
+// TimeStopDays is the time stop: a position held this many trading days that is
+// still not above cost should be exited. Same replay: N=7 improves both halves
+// (+2,975 / +12,708) and clipped 4 winners for −1,293; N=3 replayed stronger but
+// is more aggressive and more likely overfit to a falling market, so 7 was kept.
+// In the log, lots held 8+ trading days won only ~30% of the time.
+const TimeStopDays = 7
+
+// lossCapEpsilon absorbs float error so a loss of exactly LossCapPct triggers.
+const lossCapEpsilon = 1e-9
+
+// ExitRules returns the exit-rule breaches for a held position, most severe
+// first; an empty result means no rule fires. heldDays is the number of trading
+// days the position has been held (see HoldingDays). Rows without a positive
+// cost are candidates and never trigger.
+func ExitRules(c *Candidate, cost float64, heldDays int) []string {
 	if cost <= 0 || c.Close <= 0 {
-		return false, ""
+		return nil
 	}
-	if c.Close >= cost {
-		return false, ""
-	}
-	if c.SARLong || c.SuperTrendLong {
-		return false, ""
-	}
+	var out []string
 	lossPct := (1 - c.Close/cost) * 100
-	if lossPct > AddOnDeepLossPct {
-		return true, fmt.Sprintf("🚫禁止加仓(深亏%.1f%%,SAR/ST双空)", lossPct)
+	if lossPct >= LossCapPct-lossCapEpsilon {
+		out = append(out, fmt.Sprintf("🔴亏损上限(−%.1f%%≥%.0f%%)→离场", lossPct, LossCapPct))
 	}
-	if c.ScoreTotal >= AddOnMinScore {
-		return false, ""
+	if heldDays >= TimeStopDays && c.Close <= cost {
+		out = append(out, fmt.Sprintf("⏱️持有%d日未盈利→离场", heldDays))
 	}
-	return true, fmt.Sprintf("🚫禁止加仓(浮亏%.1f%%,SAR/ST双空,score%d)", lossPct, c.ScoreTotal)
+	return out
+}
+
+// HoldingDays returns, for each code, how many trading days the current
+// position has been held as of asOf.
+//
+// .holdings carries no entry date, so the clock is reconstructed from
+// decision_log: the position starts at the earliest log_date of its unbroken run
+// of '持仓'-tier rows, where "unbroken" is judged only over dates on which a
+// formal screen wrote holdings rows (days the screen was not run are not gaps).
+// The span is then counted in snapshot trading days, start excluded.
+//
+// Limitations: a position closed and reopened between two screen runs looks
+// continuous, and a position bought before its first logged screen starts late.
+// Codes with no holdings-tier row get 0, so a brand-new position never trips
+// the time stop on its first screen.
+func HoldingDays(dbPath string, codes []string, asOf string) (map[string]int, error) {
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		return nil, err
+	}
+	defer db.Close()
+
+	rows, err := db.Query(`SELECT log_date, code FROM decision_log WHERE tier = '持仓' AND log_date <= ? ORDER BY log_date DESC`, asOf)
+	if err != nil {
+		return nil, fmt.Errorf("query decision_log: %w", err)
+	}
+	held := map[string]map[string]bool{} // log_date -> codes held that day
+	var dates []string                   // screen dates, newest first
+	for rows.Next() {
+		var d, code string
+		if err := rows.Scan(&d, &code); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("scan decision_log: %w", err)
+		}
+		if held[d] == nil {
+			held[d] = map[string]bool{}
+			dates = append(dates, d)
+		}
+		held[d][code] = true
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	rows.Close()
+
+	out := make(map[string]int, len(codes))
+	for _, code := range codes {
+		start := ""
+		for _, d := range dates {
+			if !held[d][code] {
+				break
+			}
+			start = d
+		}
+		if start == "" {
+			out[code] = 0
+			continue
+		}
+		var n int
+		if err := db.QueryRow(`SELECT COUNT(DISTINCT trade_date) FROM snapshot WHERE trade_date > ? AND trade_date <= ?`,
+			start, asOf).Scan(&n); err != nil {
+			return nil, fmt.Errorf("count trading days: %w", err)
+		}
+		out[code] = n
+	}
+	return out, nil
 }
 
 // LoadSnapshots loads latest snapshot data from database.

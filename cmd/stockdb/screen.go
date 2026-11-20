@@ -116,6 +116,21 @@ func runScreen(holdings []screener.Holding, maxResults int, capital float64, dry
 		fmt.Print("）\n\n")
 	}
 
+	// Holding clock for the time stop. A failure here must not hide the rest of
+	// the table, but it must be visible: without it the time stop silently never fires.
+	heldDays := map[string]int{}
+	if len(holdings) > 0 {
+		codes := make([]string, 0, len(holdings))
+		for _, h := range holdings {
+			codes = append(codes, h.Code)
+		}
+		if hd, err := screener.HoldingDays(store.DefaultPath(), codes, date); err != nil {
+			fmt.Fprintf(os.Stderr, "warn: 持有天数计算失败，时间止损本次不生效: %v\n", err)
+		} else {
+			heldDays = hd
+		}
+	}
+
 	// Holdings table
 	if len(holdings) > 0 {
 		fmt.Println("### 持仓")
@@ -136,7 +151,7 @@ func runScreen(holdings []screener.Holding, maxResults int, capital float64, dry
 				continue
 			}
 			label := "持仓"
-			fmt.Print(formatRow(label, &c, h.Cost, h.Shares, 0))
+			fmt.Print(formatRow(label, &c, h.Cost, h.Shares, 0, heldDays[h.Code]))
 		}
 		fmt.Println()
 	}
@@ -149,7 +164,7 @@ func runScreen(holdings []screener.Holding, maxResults int, capital float64, dry
 		fmt.Println("|------|------|------|-------|------|-----|------|------|-------|------|----------|------------|----------|")
 
 		for _, c := range selected {
-			fmt.Print(formatRow(string(c.Tier), &c, 0, 0, capital))
+			fmt.Print(formatRow(string(c.Tier), &c, 0, 0, capital, 0))
 		}
 		fmt.Println()
 	} else {
@@ -167,7 +182,7 @@ func runScreen(holdings []screener.Holding, maxResults int, capital float64, dry
 		}
 		defer st.Close()
 
-		upsertedHoldings, upsertedSelected, skippedHoldings := saveDecisions(st, date, candidates, holdings, selected)
+		upsertedHoldings, upsertedSelected, skippedHoldings := saveDecisions(st, date, candidates, holdings, selected, heldDays)
 		fmt.Printf("\n> 📝 已写入 decision_log（更新/新增 %d 持仓 + %d 候选；无快照持仓 %d）\n",
 			upsertedHoldings, upsertedSelected, skippedHoldings)
 
@@ -189,7 +204,7 @@ func runScreen(holdings []screener.Holding, maxResults int, capital float64, dry
 	return nil
 }
 
-func formatRow(label string, c *screener.Candidate, cost float64, shares int, capital float64) string {
+func formatRow(label string, c *screener.Candidate, cost float64, shares int, capital float64, heldDays int) string {
 	sa := fmt.Sprintf("%d / %.1f", c.ScoreTotal, c.ADX)
 	chg := fmt.Sprintf("%+.2f%%", c.ChangePct)
 	vr := "—"
@@ -224,16 +239,17 @@ func formatRow(label string, c *screener.Candidate, cost float64, shares int, ca
 	}
 
 	stop := screener.StopText(c)
-	signals := formatSignals(c, cost, shares, capital)
+	signals := formatSignals(c, cost, shares, capital, heldDays)
 
 	return fmt.Sprintf("| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |\n",
 		label, c.Code, c.Name, chg, vr, sa, rs20, mc, tr, hot, perf, stop, signals)
 }
 
-func formatSignals(c *screener.Candidate, cost float64, shares int, capital float64) string {
+func formatSignals(c *screener.Candidate, cost float64, shares int, capital float64, heldDays int) string {
 	var parts []string
 
-	// 加仓闸门排在最前：它是操作禁令，跟在十几个信号后面就等于没有。
+	// 离场规则与加仓闸门排在最前：它们是操作指令，跟在十几个信号后面就等于没有。
+	parts = append(parts, screener.ExitRules(c, cost, heldDays)...)
 	if blocked, reason := screener.AddOnBlocked(c, cost); blocked {
 		parts = append(parts, reason)
 	}
@@ -315,7 +331,7 @@ func formatSignals(c *screener.Candidate, cost float64, shares int, capital floa
 }
 
 func saveDecisions(st *store.Store, date string, candidates []screener.Candidate,
-	holdings []screener.Holding, selected []screener.Candidate) (upsertedHoldings, upsertedSelected, skippedHoldings int) {
+	holdings []screener.Holding, selected []screener.Candidate, heldDays map[string]int) (upsertedHoldings, upsertedSelected, skippedHoldings int) {
 
 	// Build candidate map
 	candMap := make(map[string]screener.Candidate)
@@ -340,7 +356,7 @@ func saveDecisions(st *store.Store, date string, candidates []screener.Candidate
 				sar_long=excluded.sar_long, st_long=excluded.st_long, obv_up=excluded.obv_up,
 				macd_hist=excluded.macd_hist, td_countdown=excluded.td_countdown, signals=excluded.signals
 		`, c.Code, date, c.ScoreTotal, c.ADX, boolToInt(c.SARLong), boolToInt(c.SuperTrendLong),
-			boolToInt(c.OBVUp), c.MACDHist, c.TDCountdown, formatSignals(&c, h.Cost, h.Shares, 0), now)
+			boolToInt(c.OBVUp), c.MACDHist, c.TDCountdown, formatSignals(&c, h.Cost, h.Shares, 0, heldDays[h.Code]), now)
 		if err != nil {
 			// Never swallow — report which holding failed so the user sees misses,
 			// since the summary count otherwise hides dropped rows.
@@ -360,7 +376,7 @@ func saveDecisions(st *store.Store, date string, candidates []screener.Candidate
 				sar_long=excluded.sar_long, st_long=excluded.st_long, obv_up=excluded.obv_up,
 				macd_hist=excluded.macd_hist, td_countdown=excluded.td_countdown, signals=excluded.signals
 		`, c.Code, date, c.Tier, c.ScoreTotal, c.ADX, boolToInt(c.SARLong), boolToInt(c.SuperTrendLong),
-			boolToInt(c.OBVUp), c.MACDHist, c.TDCountdown, formatSignals(&c, 0, 0, 0), now)
+			boolToInt(c.OBVUp), c.MACDHist, c.TDCountdown, formatSignals(&c, 0, 0, 0, 0), now)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "warning: 候选 %s 写入 decision_log 失败: %v\n", c.Code, err)
 			continue
