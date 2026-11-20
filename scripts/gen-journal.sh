@@ -8,6 +8,12 @@
 set -euo pipefail
 
 TODAY=${1:-$(date +%Y-%m-%d)}
+# TODAY is interpolated into SQL below, so only a plain date is accepted.
+if [[ ! "$TODAY" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+  echo "ERROR: 日期格式须为 YYYY-MM-DD：$TODAY" >&2
+  exit 1
+fi
+DB=${STOCK_DB:-data/stock.db}
 YESTERDAY=$(date -v-1d -j -f "%Y-%m-%d" "$TODAY" +%Y-%m-%d 2>/dev/null \
   || date -d "$TODAY - 1 day" +%Y-%m-%d)
 
@@ -73,6 +79,28 @@ if [[ -z "$PREV_TABLE" ]]; then
   PREV_TABLE="| — | — | — | — | — | — |\n"
 fi
 
+# ── 纪律检查表：读当日正式 screen 写入 decision_log 的持仓行 ─────────────────
+# screen 把三条持仓纪律（screener.ExitRules / AddOnBlocked）放在 signals 首位，这里只做
+# 解析不重算，保证日志与选股表同一口径。dry-run 不写库，因此当日必须跑过正式 screen。
+DISC_TABLE=""
+if [[ -f "$DB" ]]; then
+  while IFS=$'\t' read -r code name sar st score sig; do
+    [[ -z "$code" ]] && continue
+    loss="—"; tstop="—"; addon="—"
+    if [[ "$sig" =~ 亏损上限\(([^≥]+)≥ ]]; then loss="🔴 触发（${BASH_REMATCH[1]}）"; fi
+    if [[ "$sig" =~ 持有([0-9]+)日未盈利 ]]; then tstop="🔴 ${BASH_REMATCH[1]} 日"; fi
+    [[ "$sig" == *"禁止加仓"* ]] && addon="🚫"
+    stance="$([[ $sar == 1 ]] && echo 多 || echo 空)/$([[ $st == 1 ]] && echo 多 || echo 空)"
+    DISC_TABLE+="| ${name:-$code} | ${code} | ${loss} | ${tstop} | ${addon} | ${stance} · ${score} |\n"
+  done < <(sqlite3 -separator $'\t' "$DB" "SELECT d.code, COALESCE(i.name,''), d.sar_long, d.st_long, d.score_total, d.signals
+      FROM decision_log d LEFT JOIN instrument i ON i.code = d.code
+      WHERE d.log_date = '${TODAY}' AND d.tier = '持仓' ORDER BY d.code;")
+fi
+if [[ -z "$DISC_TABLE" ]]; then
+  echo "WARN: decision_log 无 ${TODAY} 持仓行（未跑正式 screen，或 dry-run），纪律检查表留空" >&2
+  DISC_TABLE="| — | — | — | — | — | — |\n"
+fi
+
 # ── 写文件 ────────────────────────────────────────────────────────────────────
 cat > "$OUT" << TEMPLATE
 # 日志 · ${TODAY}（${WEEKDAY}）
@@ -91,6 +119,12 @@ $(echo -e "$PREV_TABLE")
 ---
 
 ## 二、持仓（${TODAY} 收盘）
+
+**纪律检查**（\`stockdb screen\` 自动生成；任一触发即按纪律离场 / 不加仓，规则依据见 \`CLAUDE.md\`「持仓纪律三条」）：
+
+| 名称 | 代码 | 🔴 亏损上限 −8% | ⏱️ 时间止损 7 日 | 🚫 禁止加仓 | SAR/ST · score |
+|------|------|------|------|------|------|
+$(echo -e "$DISC_TABLE")
 
 | 代码 | 名称 | 今收 | 今日% | 浮盈 | score | 状态 | 止损 |
 |------|------|------|-------|------|-------|------|------|
